@@ -1,6 +1,9 @@
 package com.example.nfcdoorcard;
 
 import android.app.Activity;
+import android.content.ClipData;
+import android.content.ClipboardManager;
+import android.content.Context;
 import android.graphics.Typeface;
 import android.nfc.NfcAdapter;
 import android.nfc.Tag;
@@ -12,6 +15,7 @@ import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
+import android.widget.Toast;
 
 import com.example.nfcdoorcard.data.CardSnapshot;
 import com.example.nfcdoorcard.nfc.TagInspector;
@@ -25,6 +29,8 @@ public class MainActivity extends Activity implements NfcAdapter.ReaderCallback 
     private NfcAdapter nfcAdapter;
     private TextView status;
     private TextView details;
+    private String currentUid;
+    private String savedUid;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -40,9 +46,9 @@ public class MainActivity extends Activity implements NfcAdapter.ReaderCallback 
         root.setOrientation(LinearLayout.VERTICAL);
         root.setPadding(pad, pad, pad, pad);
 
-        TextView title = text("NFC 门禁 · v0.1", 26, true);
+        TextView title = text("NFC 门禁 · v0.2", 26, true);
         root.addView(title);
-        TextView sub = text("支持 Android 12–17（API 31–37）。先读取并判断卡类型，再决定是否适合标准 HCE。不会修改系统 NFC HAL。", 14, false);
+        TextView sub = text("支持 Android 12–17（API 31–37）。读取并分析卡类型、Classic 结构与 UID-only 候选状态；不会修改系统 NFC HAL，也不会伪装真实门禁 UID。", 14, false);
         sub.setPadding(0, dp(6), 0, dp(18));
         root.addView(sub);
 
@@ -53,6 +59,31 @@ public class MainActivity extends Activity implements NfcAdapter.ReaderCallback 
         scan.setText("开始读取门禁卡");
         scan.setOnClickListener(v -> enableReader());
         root.addView(scan, lp(-1, dp(52), 12));
+
+        Button saveUid = new Button(this);
+        saveUid.setText("保存当前 UID 作为对比基准");
+        saveUid.setOnClickListener(v -> {
+            if (currentUid == null || "—".equals(currentUid)) {
+                Toast.makeText(this, "请先读取一张卡", Toast.LENGTH_SHORT).show();
+                return;
+            }
+            savedUid = currentUid;
+            Toast.makeText(this, "已保存 UID: " + savedUid, Toast.LENGTH_SHORT).show();
+        });
+        root.addView(saveUid, lp(-1, dp(52), 12));
+
+        Button copyUid = new Button(this);
+        copyUid.setText("复制当前 UID");
+        copyUid.setOnClickListener(v -> copyCurrentUid());
+        root.addView(copyUid, lp(-1, dp(52), 12));
+
+        Button clearSaved = new Button(this);
+        clearSaved.setText("清除 UID 对比基准");
+        clearSaved.setOnClickListener(v -> {
+            savedUid = null;
+            Toast.makeText(this, "已清除 UID 对比基准", Toast.LENGTH_SHORT).show();
+        });
+        root.addView(clearSaved, lp(-1, dp(52), 12));
 
         Button stop = new Button(this);
         stop.setText("停止读取");
@@ -131,7 +162,7 @@ public class MainActivity extends Activity implements NfcAdapter.ReaderCallback 
                 NfcAdapter.FLAG_READER_NFC_V |
                 NfcAdapter.FLAG_READER_SKIP_NDEF_CHECK;
         nfcAdapter.enableReaderMode(this, this, flags, null);
-        details.setText("读取模式已开启。请把门禁卡贴近手机。\n\n读取完成后会显示 UID、Tech、ATQA、SAK、Classic 容量/扇区/块数量和 HCE 支持状态。 ");
+        details.setText("读取模式已开启。请把门禁卡贴近手机。\n\n读取完成后会显示 UID、Tech、ATQA、SAK、Classic 容量/扇区/块数量、HCE 支持状态和 UID-only 候选判断。 ");
     }
 
     private void disableReader() {
@@ -139,16 +170,42 @@ public class MainActivity extends Activity implements NfcAdapter.ReaderCallback 
         details.setText("读取模式已停止。 ");
     }
 
+    private void copyCurrentUid() {
+        if (currentUid == null || "—".equals(currentUid)) {
+            Toast.makeText(this, "请先读取一张卡", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        ClipboardManager clipboard = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+        clipboard.setPrimaryClip(ClipData.newPlainText("NFC UID", currentUid));
+        Toast.makeText(this, "UID 已复制", Toast.LENGTH_SHORT).show();
+    }
+
+    private String uidOnlyAssessment(CardSnapshot s) {
+        if (!"MIFARE Classic / NFC-A".equals(s.classification())) {
+            return "暂不判断：当前卡不是 MIFARE Classic。";
+        }
+        return "候选：仅凭卡片本身不能证明门禁只认 UID。若多份可用卡/镜像在扇区内容不同的情况下仍可通过，或测试读卡器只上报 UID，则 UID-only 可能性较高。";
+    }
+
+    private String comparisonText(String uid) {
+        if (savedUid == null) return "未设置对比基准";
+        if (savedUid.equals(uid)) return "与已保存 UID 完全相同";
+        return "与已保存 UID 不同\n基准: " + savedUid + "\n当前: " + uid;
+    }
+
     @Override
     public void onTagDiscovered(Tag tag) {
         CardSnapshot s = TagInspector.inspect(tag);
+        currentUid = s.uid();
         String tech = s.techList().stream().collect(Collectors.joining(", "));
         String out = "UID\n" + s.uid() +
                 "\n\nUID 长度\n" + s.uidLength() +
+                "\n\nUID 对比\n" + comparisonText(s.uid()) +
                 "\n\nTech\n" + tech +
                 "\n\nATQA\n" + s.atqa() +
                 "\n\nSAK\n" + s.sak() +
                 "\n\n判断\n" + s.classification() +
+                "\n\nUID-only 候选\n" + uidOnlyAssessment(s) +
                 "\n\nClassic 容量\n" + s.classicSize() +
                 "\n\n扇区数\n" + s.classicSectors() +
                 "\n\n块数\n" + s.classicBlocks() +
