@@ -131,7 +131,7 @@ public class MainActivity extends Activity implements NfcAdapter.ReaderCallback 
                 NfcAdapter.FLAG_READER_NFC_V |
                 NfcAdapter.FLAG_READER_SKIP_NDEF_CHECK;
         nfcAdapter.enableReaderMode(this, this, flags, null);
-        details.setText("读取模式已开启。请把门禁卡贴近手机。\n\n读取完成后会显示 UID、Tech、ATQA、SAK 和协议分类。 ");
+        details.setText("读取模式已开启。请把门禁卡贴近手机。\n\n读取完成后会显示 UID、Tech、ATQA、SAK、Classic 容量/扇区/块数量和 HCE 支持状态。 ");
     }
 
     private void disableReader() {
@@ -144,10 +144,15 @@ public class MainActivity extends Activity implements NfcAdapter.ReaderCallback 
         CardSnapshot s = TagInspector.inspect(tag);
         String tech = s.techList().stream().collect(Collectors.joining(", "));
         String out = "UID\n" + s.uid() +
+                "\n\nUID 长度\n" + s.uidLength() +
                 "\n\nTech\n" + tech +
                 "\n\nATQA\n" + s.atqa() +
                 "\n\nSAK\n" + s.sak() +
                 "\n\n判断\n" + s.classification() +
+                "\n\nClassic 容量\n" + s.classicSize() +
+                "\n\n扇区数\n" + s.classicSectors() +
+                "\n\n块数\n" + s.classicBlocks() +
+                "\n\n标准 HCE\n" + s.hceSupport() +
                 "\n\n说明\n" + s.note();
         runOnUiThread(() -> details.setText(out));
     }
