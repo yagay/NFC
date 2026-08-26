@@ -1,0 +1,14 @@
+# Project-wide ignore rules
+*.iml
+.gradle
+/local.properties
+/.idea/
+/build
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+
+# Module-specific ignore rules
+/app/build
+/experimental-lsposed/build

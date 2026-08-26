@@ -4,6 +4,8 @@ import android.app.Activity;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
+import android.content.Intent;
+import android.content.SharedPreferences;
 import android.graphics.Typeface;
 import android.nfc.NfcAdapter;
 import android.nfc.Tag;
@@ -19,6 +21,7 @@ import android.widget.Toast;
 
 import com.example.nfcdoorcard.data.CardSnapshot;
 import com.example.nfcdoorcard.nfc.TagInspector;
+import com.example.nfcdoorcard.utils.RootShell;
 
 import java.util.stream.Collectors;
 
@@ -31,6 +34,24 @@ public class MainActivity extends Activity implements NfcAdapter.ReaderCallback 
     private TextView details;
     private String currentUid;
     private String savedUid;
+
+    /**
+     * 此方法会被 LSPosed 模块 Hook，如果模块已激活且作用域包含本 App，则返回 true。
+     */
+    public static boolean isModuleActive() {
+        return false;
+    }
+
+    private void openLSPosedManager() {
+        try {
+            Intent intent = new Intent("org.lsposed.manager.LAUNCH_MODULE");
+            intent.putExtra("pkg", getPackageName());
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            startActivity(intent);
+        } catch (Exception e) {
+            Toast.makeText(this, "未找到 LSPosed 管理器，请手动开启并检查作用域", Toast.LENGTH_SHORT).show();
+        }
+    }
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -55,6 +76,19 @@ public class MainActivity extends Activity implements NfcAdapter.ReaderCallback 
         status = text("", 16, true);
         root.addView(status);
 
+        Button requestRoot = new Button(this);
+        requestRoot.setText("请求 Root 权限 / 检查状态");
+        requestRoot.setOnClickListener(v -> {
+            RootStatus.clearCache();
+            if (RootStatus.hasRoot()) {
+                Toast.makeText(this, "Root 权限已获取", Toast.LENGTH_SHORT).show();
+            } else {
+                Toast.makeText(this, "未获得 Root 权限，请在授权管理中允许", Toast.LENGTH_LONG).show();
+            }
+            refreshStatus();
+        });
+        root.addView(requestRoot, lp(-1, dp(52), 12));
+
         Button scan = new Button(this);
         scan.setText("开始读取门禁卡");
         scan.setOnClickListener(v -> enableReader());
@@ -76,6 +110,11 @@ public class MainActivity extends Activity implements NfcAdapter.ReaderCallback 
         copyUid.setText("复制当前 UID");
         copyUid.setOnClickListener(v -> copyCurrentUid());
         root.addView(copyUid, lp(-1, dp(52), 12));
+
+        Button simulateBtn = new Button(this);
+        simulateBtn.setText("模拟当前读取的 UID");
+        simulateBtn.setOnClickListener(v -> simulateCurrentUid());
+        root.addView(simulateBtn, lp(-1, dp(52), 12));
 
         Button clearSaved = new Button(this);
         clearSaved.setText("清除 UID 对比基准");
@@ -115,10 +154,19 @@ public class MainActivity extends Activity implements NfcAdapter.ReaderCallback 
         String androidVersion = androidVersionName(sdk);
         String support = isSupportedSdk(sdk) ? "系统受支持" : "系统版本超出支持范围";
 
+        String moduleStatus = isModuleActive() ? "LSPosed: 已激活" : "LSPosed: 未激活 (点击管理)";
+
         status.setText(
                 androidVersion + " / API " + sdk + "   ·   " + support +
-                "\n" + nfc + "   ·   Root: " + (root ? "可用" : "未检测到/未授权")
+                "\n" + nfc + "   ·   Root: " + (root ? "可用" : "未检测到/未授权") +
+                "\n" + moduleStatus
         );
+
+        status.setOnClickListener(v -> {
+            if (!isModuleActive()) {
+                openLSPosedManager();
+            }
+        });
     }
 
     private boolean isSupportedSdk(int sdk) {
@@ -178,6 +226,31 @@ public class MainActivity extends Activity implements NfcAdapter.ReaderCallback 
         ClipboardManager clipboard = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
         clipboard.setPrimaryClip(ClipData.newPlainText("NFC UID", currentUid));
         Toast.makeText(this, "UID 已复制", Toast.LENGTH_SHORT).show();
+    }
+
+    private void simulateCurrentUid() {
+        if (currentUid == null || "—".equals(currentUid)) {
+            Toast.makeText(this, "请先读取一张卡", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        // 保存 UID 到 SharedPreferences
+        SharedPreferences prefs = getSharedPreferences("sim_prefs", Context.MODE_PRIVATE);
+        prefs.edit().putString("target_uid", currentUid).apply();
+
+        Toast.makeText(this, "已设为模拟目标：" + currentUid + "\n正在尝试重启 NFC...", Toast.LENGTH_LONG).show();
+
+        // 使用 RootShell 重启 NFC 并设置权限
+        new Thread(() -> {
+            boolean success = RootShell.run(
+                "chmod 644 /data/data/com.example.nfcdoorcard/shared_prefs/sim_prefs.xml",
+                "svc nfc disable",
+                "sleep 1",
+                "svc nfc enable"
+            );
+            if (!success) {
+                runOnUiThread(() -> Toast.makeText(this, "Root 执行失败，请检查授权", Toast.LENGTH_SHORT).show());
+            }
+        }).start();
     }
 
     private String uidOnlyAssessment(CardSnapshot s) {
