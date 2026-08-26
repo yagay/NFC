@@ -1,27 +1,47 @@
 package com.example.nfcdoorcard.xposed;
 
+<<<<<<< HEAD
 import android.content.Context;
 import android.database.Cursor;
 import android.net.Uri;
+=======
+>>>>>>> d77de3d (feat: 增加实时日志控制台、硬件诊断功能及 LSPosed API 102 架构优化)
 import android.util.Log;
 
 import java.lang.reflect.Method;
 import java.util.Locale;
 
 import io.github.libxposed.api.XposedModule;
+<<<<<<< HEAD
 import io.github.libxposed.api.XposedModuleInterface;
+=======
+import java.lang.reflect.Method;
+>>>>>>> d77de3d (feat: 增加实时日志控制台、硬件诊断功能及 LSPosed API 102 架构优化)
 
+/**
+ * LibXposed API 102 架构
+ * 注意：必须保留无参构造函数，框架会通过 attachFramework 注入接口。
+ */
 public class NfcDiagnosticsModule extends XposedModule {
 
     private static final String TAG = "NfcUIDSim";
+<<<<<<< HEAD
     private static final Uri UID_CONFIG_URI =
             Uri.parse("content://com.example.nfcdoorcard.uidconfig/target");
+=======
+    private static final String UID_PROP = "persist.nfcuidsim.uid";
+    private static String lastInjectedUid = "NONE";
+>>>>>>> d77de3d (feat: 增加实时日志控制台、硬件诊断功能及 LSPosed API 102 架构优化)
 
     @Override
-    public void onPackageLoaded(XposedModuleInterface.PackageLoadedParam lp) {
+    public void onPackageLoaded(PackageLoadedParam lp) {
         super.onPackageLoaded(lp);
         String packageName = lp.getPackageName();
+        
+        // 关键：在模块级日志打印，确认加载
+        Log.e(TAG, "LSPosed Hook 介入: " + packageName);
 
+<<<<<<< HEAD
         if ("com.example.nfcdoorcard".equals(packageName)) {
             installSelfHook(lp);
             return;
@@ -170,6 +190,116 @@ public class NfcDiagnosticsModule extends XposedModule {
         byte[] data = new byte[clean.length() / 2];
         for (int i = 0; i < clean.length(); i += 2) {
             data[i / 2] = (byte) Integer.parseInt(clean.substring(i, i + 2), 16);
+=======
+        // 针对本 App 进程
+        if (packageName.equals("com.example.nfcdoorcard")) {
+            try {
+                ClassLoader cl = lp.getDefaultClassLoader();
+                Class<?> mainActivity = cl.loadClass("com.example.nfcdoorcard.MainActivity");
+                for (Method m : mainActivity.getDeclaredMethods()) {
+                    if ("isModuleLoaded".equals(m.getName())) {
+                        hook(m).intercept(c -> true);
+                    }
+                    if ("getHardwareActualUid".equals(m.getName())) {
+                        hook(m).intercept(c -> {
+                            String currentProp = getSystemProperty(UID_PROP, "OFF");
+                            if ("OFF".equalsIgnoreCase(currentProp) || currentProp.isEmpty()) {
+                                return "系统原生 (随机 UID)";
+                            }
+                            return lastInjectedUid;
+                        });
+                    }
+                }
+                Log.e(TAG, "App 进程 Hook 成功");
+            } catch (Exception e) {
+                Log.e(TAG, "App 进程注入异常: " + e.getMessage());
+            }
+        }
+
+        // 针对 NFC 系统进程 (核心逻辑)
+        if (packageName.equals("com.android.nfc")) {
+            Log.e(TAG, "发现目标 NFC 进程，正在注入 Hook...");
+            try {
+                ClassLoader cl = lp.getDefaultClassLoader();
+                Class<?> nativeManager = cl.loadClass("com.android.nfc.dhimpl.NativeNfcManager");
+                Method initMethod = nativeManager.getDeclaredMethod("doInitialize");
+                
+                hook(initMethod).intercept(chain -> {
+                    Object result = chain.proceed();
+                    Log.e(TAG, "NFC 服务初始化，正在同步硬件 UID...");
+                    syncHardwareUidState(chain.getThisObject());
+                    return result;
+                });
+
+                // 屏蔽智能切卡
+                Class<?> featureManager = cl.loadClass("com.android.nfc.NfcFeatureManager");
+                Method featureMethod = featureManager.getDeclaredMethod("isFeatureEnable", String.class);
+                hook(featureMethod).intercept(chain -> {
+                    String feature = (String) chain.getArgs().get(0);
+                    if ("SMART_SWITCH_CARD".equals(feature) || "REALTIME_SWITCH_CARD".equals(feature)) {
+                        String target = getSystemProperty(UID_PROP, "OFF");
+                        if (!"OFF".equalsIgnoreCase(target) && !target.isEmpty()) {
+                            Log.e(TAG, "已拦截系统干扰功能: " + feature);
+                            return false;
+                        }
+                    }
+                    return chain.proceed();
+                });
+            } catch (Exception e) {
+                Log.e(TAG, "NFC Hook 失败: " + e.getMessage());
+            }
+        }
+    }
+
+    private void syncHardwareUidState(Object managerInstance) {
+        try {
+            String targetUidHex = getSystemProperty(UID_PROP, "OFF");
+            if (targetUidHex == null || targetUidHex.isEmpty() || "OFF".equalsIgnoreCase(targetUidHex)) {
+                Log.e(TAG, "重置硬件 UID 至随机模式");
+                lastInjectedUid = "NONE";
+                Method writeConfig = managerInstance.getClass().getDeclaredMethod("doWriteNciConfig", int.class, byte[].class);
+                writeConfig.setAccessible(true);
+                writeConfig.invoke(managerInstance, 1, new byte[]{0x01, 0x00});
+                return;
+            }
+
+            byte[] targetUid = hexToBytes(targetUidHex);
+            if (targetUid.length == 0) return;
+            byte[] config = new byte[targetUid.length + 2];
+            config[0] = 0x01; 
+            config[1] = (byte) targetUid.length;
+            System.arraycopy(targetUid, 0, config, 2, targetUid.length);
+
+            Method writeConfig = managerInstance.getClass().getDeclaredMethod("doWriteNciConfig", int.class, byte[].class);
+            writeConfig.setAccessible(true);
+            writeConfig.invoke(managerInstance, 1, config);
+            
+            lastInjectedUid = targetUidHex;
+            Log.e(TAG, "底层 UID 已成功设为: " + targetUidHex);
+        } catch (Exception e) {
+            Log.e(TAG, "硬件同步操作异常: " + e.getMessage());
+        }
+    }
+
+    private String getSystemProperty(String key, String def) {
+        try {
+            Class<?> sp = Class.forName("android.os.SystemProperties");
+            Method get = sp.getDeclaredMethod("get", String.class, String.class);
+            return (String) get.invoke(null, key, def);
+        } catch (Exception e) {
+            return def;
+        }
+    }
+
+    private byte[] hexToBytes(String s) {
+        String clean = s.replace(" ", "").replace(":", "");
+        int len = clean.length();
+        if (len % 2 != 0) return new byte[0];
+        byte[] data = new byte[len / 2];
+        for (int i = 0; i < len; i += 2) {
+            data[i / 2] = (byte) ((Character.digit(clean.charAt(i), 16) << 4)
+                    + Character.digit(clean.charAt(i + 1), 16));
+>>>>>>> d77de3d (feat: 增加实时日志控制台、硬件诊断功能及 LSPosed API 102 架构优化)
         }
         return data;
     }

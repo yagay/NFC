@@ -28,5 +28,8 @@ android {
 }
 
 dependencies {
+    implementation("androidx.appcompat:appcompat:1.7.0")
+    implementation("androidx.core:core:1.15.0")
+    implementation("androidx.activity:activity:1.10.0")
     compileOnly("io.github.libxposed:api:102.0.0")
 }
