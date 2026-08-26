@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">NFC 门禁</string>
+    <string name="hce_service_desc">用于已授权 ISO-DEP 门禁系统的 HCE 服务</string>
+</resources>
