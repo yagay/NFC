@@ -30,22 +30,45 @@ public final class TagInspector {
         }
 
         boolean isoDep = IsoDep.get(tag) != null;
-        boolean classic = MifareClassic.get(tag) != null;
+        MifareClassic mifare = MifareClassic.get(tag);
+        boolean classic = mifare != null;
         String classification;
         String note;
+        String uidLength = tag.getId() == null ? "—" : tag.getId().length + " 字节";
+        String classicSize = "—";
+        String classicSectors = "—";
+        String classicBlocks = "—";
+        String hceSupport;
 
         if (classic) {
             classification = "MIFARE Classic / NFC-A";
-            note = "普通 Android HCE 不能直接模拟 Classic/Crypto1。当前版本只做识别，不执行密钥认证或 UID 复制。";
+            classicSize = describeClassicSize(mifare.getSize());
+            classicSectors = String.valueOf(mifare.getSectorCount());
+            classicBlocks = String.valueOf(mifare.getBlockCount());
+            hceSupport = "不支持（标准 Android HCE）";
+            note = "检测到 MIFARE Classic。普通 Android HCE 不能直接模拟 Classic/Crypto1；当前版本只读取公开卡片元数据，不执行密钥认证、扇区读取或 UID 复制。";
         } else if (isoDep) {
             classification = "ISO-DEP / HCE 候选";
+            hceSupport = "候选支持（需进一步分析 APDU）";
             note = "这类卡可进一步分析 APDU 协议，并用 HostApduService 为你有权限控制的门禁系统实现兼容。";
         } else {
             classification = "NFC-A / 非 ISO-DEP";
+            hceSupport = "通常不支持";
             note = "可能是只读 UID 或厂商私有协议。标准 HCE 无法保证复现固定 UID；需要先确认门禁读卡器实际校验内容。";
         }
 
-        return new CardSnapshot(hex(tag.getId()), tech, atqa, sak, classification, note);
+        return new CardSnapshot(
+                hex(tag.getId()), tech, atqa, sak, classification, note,
+                uidLength, classicSize, classicSectors, classicBlocks, hceSupport
+        );
+    }
+
+    private static String describeClassicSize(int bytes) {
+        if (bytes == MifareClassic.SIZE_1K) return "1 KB (MIFARE Classic 1K)";
+        if (bytes == MifareClassic.SIZE_2K) return "2 KB";
+        if (bytes == MifareClassic.SIZE_4K) return "4 KB (MIFARE Classic 4K)";
+        if (bytes == MifareClassic.SIZE_MINI) return "320 B (MIFARE Mini)";
+        return bytes + " B";
     }
 
     public static String hex(byte[] value) {
