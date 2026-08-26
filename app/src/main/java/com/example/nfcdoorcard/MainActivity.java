@@ -40,7 +40,6 @@ public class MainActivity extends Activity implements NfcAdapter.ReaderCallback 
      * 此方法会被 LSPosed 模块 Hook，如果模块已激活且作用域包含本 App，则返回 true。
      */
     public static boolean isModuleActive() {
-        // 此方法被 Hook 后会返回 true
         return false;
     }
 
@@ -134,7 +133,7 @@ public class MainActivity extends Activity implements NfcAdapter.ReaderCallback 
 
         Button nfcSettings = new Button(this);
         nfcSettings.setText("打开系统 NFC 设置");
-        nfcSettings.setOnClickListener(v -> startActivity(new android.content.Intent(Settings.ACTION_NFC_SETTINGS)));
+        nfcSettings.setOnClickListener(v -> startActivity(new Intent(Settings.ACTION_NFC_SETTINGS)));
         root.addView(nfcSettings, lp(-1, dp(52), 18));
 
         details = text("尚未读取卡片。\n\n把实体门禁卡贴到手机 NFC 区域。", 15, false);
@@ -178,22 +177,14 @@ public class MainActivity extends Activity implements NfcAdapter.ReaderCallback 
 
     private String androidVersionName(int sdk) {
         switch (sdk) {
-            case 31:
-                return "Android 12";
-            case 32:
-                return "Android 12L";
-            case 33:
-                return "Android 13";
-            case 34:
-                return "Android 14";
-            case 35:
-                return "Android 15";
-            case 36:
-                return "Android 16";
-            case 37:
-                return "Android 17";
-            default:
-                return "Android";
+            case 31: return "Android 12";
+            case 32: return "Android 12L";
+            case 33: return "Android 13";
+            case 34: return "Android 14";
+            case 35: return "Android 15";
+            case 36: return "Android 16";
+            case 37: return "Android 17";
+            default: return "Android";
         }
     }
 
@@ -236,19 +227,18 @@ public class MainActivity extends Activity implements NfcAdapter.ReaderCallback 
             Toast.makeText(this, "请先读取一张卡", Toast.LENGTH_SHORT).show();
             return;
         }
-        // 保存 UID 到 SharedPreferences
-        SharedPreferences prefs = getSharedPreferences("sim_prefs", Context.MODE_PRIVATE);
+
+        Context deviceContext = createDeviceProtectedStorageContext();
+        SharedPreferences prefs = deviceContext.getSharedPreferences("sim_prefs", Context.MODE_PRIVATE);
         prefs.edit().putString("target_uid", currentUid).apply();
 
         Toast.makeText(this, "已设为模拟目标：" + currentUid + "\n正在尝试重启 NFC...", Toast.LENGTH_LONG).show();
 
-        // 使用 RootShell 重启 NFC 并设置权限
         new Thread(() -> {
             boolean success = RootShell.run(
-                "chmod 644 /data/data/com.example.nfcdoorcard/shared_prefs/sim_prefs.xml",
-                "svc nfc disable",
-                "sleep 1",
-                "svc nfc enable"
+                    "svc nfc disable",
+                    "sleep 1",
+                    "svc nfc enable"
             );
             if (!success) {
                 runOnUiThread(() -> Toast.makeText(this, "Root 执行失败，请检查授权", Toast.LENGTH_SHORT).show());
