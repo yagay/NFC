@@ -1,114 +1,185 @@
 package com.example.nfcdoorcard.xposed;
 
 import android.content.Context;
-import android.content.SharedPreferences;
+import android.database.Cursor;
+import android.net.Uri;
 import android.util.Log;
+
+import java.lang.reflect.Method;
+import java.util.Locale;
+
 import io.github.libxposed.api.XposedModule;
 import io.github.libxposed.api.XposedModuleInterface;
-import java.lang.reflect.Method;
 
 public class NfcDiagnosticsModule extends XposedModule {
 
     private static final String TAG = "NfcUIDSim";
+    private static final Uri UID_CONFIG_URI =
+            Uri.parse("content://com.example.nfcdoorcard.uidconfig/target");
 
     @Override
     public void onPackageLoaded(XposedModuleInterface.PackageLoadedParam lp) {
         super.onPackageLoaded(lp);
         String packageName = lp.getPackageName();
 
-        // 自 Hook 激活状态
-        if (packageName.equals("com.example.nfcdoorcard")) {
-            Log.i(TAG, "主 App 已被 LSPosed 加载: " + packageName);
-            try {
-                ClassLoader cl = lp.getDefaultClassLoader();
-                Class<?> mainActivity = cl.loadClass("com.example.nfcdoorcard.MainActivity");
-                Method activeMethod = mainActivity.getDeclaredMethod("isModuleActive");
-                Log.i(TAG, "已找到 isModuleActive 方法");
-
-                // 防止 ART 将这个始终返回 false 的小方法内联，导致 Hook 看似成功但调用点仍返回 false。
-                deoptimize(activeMethod);
-                Log.i(TAG, "isModuleActive 已 deoptimize");
-
-                hook(activeMethod).intercept(chain -> {
-                    Log.i(TAG, "isModuleActive 已被拦截 -> true");
-                    return true;
-                });
-                Log.i(TAG, "isModuleActive Hook 已安装");
-            } catch (Throwable e) {
-                Log.e(TAG, "自 Hook 失败", e);
-            }
+        if ("com.example.nfcdoorcard".equals(packageName)) {
+            installSelfHook(lp);
+            return;
         }
 
-        // 针对 NFC 服务进行 Hook
-        if (packageName.equals("com.android.nfc")) {
-            Log.i(TAG, "检测到 NFC 服务加载...");
-            try {
-                ClassLoader cl = lp.getDefaultClassLoader();
-                Class<?> nativeManager = cl.loadClass("com.android.nfc.dhimpl.NativeNfcManager");
-                Method initMethod = nativeManager.getDeclaredMethod("doInitialize");
-
-                hook(initMethod).intercept(chain -> {
-                    Object result = chain.proceed();
-                    injectUid(chain.getThisObject(), cl);
-                    return result;
-                });
-
-                // 屏蔽智能切卡
-                Class<?> featureManager = cl.loadClass("com.android.nfc.NfcFeatureManager");
-                Method featureMethod = featureManager.getDeclaredMethod("isFeatureEnable", String.class);
-                hook(featureMethod).intercept(chain -> {
-                    String feature = (String) chain.getArgs().get(0);
-                    if ("SMART_SWITCH_CARD".equals(feature) || "REALTIME_SWITCH_CARD".equals(feature)) {
-                        Log.i(TAG, "已屏蔽系统功能: " + feature);
-                        return false;
-                    }
-                    return chain.proceed();
-                });
-            } catch (Exception e) {
-                Log.e(TAG, "NFC Hook 失败: " + e.getMessage());
-            }
+        if ("com.android.nfc".equals(packageName)) {
+            installNfcServiceHooks(lp);
         }
     }
 
-    private void injectUid(Object managerInstance, ClassLoader classLoader) {
+    private void installSelfHook(XposedModuleInterface.PackageLoadedParam lp) {
         try {
-            Class<?> activityThreadClass = classLoader.loadClass("android.app.ActivityThread");
-            Method currentApplicationMethod = activityThreadClass.getDeclaredMethod("currentApplication");
-            Context context = (Context) currentApplicationMethod.invoke(null);
+            ClassLoader cl = lp.getDefaultClassLoader();
+            Class<?> mainActivity = cl.loadClass("com.example.nfcdoorcard.MainActivity");
+            Method activeMethod = mainActivity.getDeclaredMethod("isModuleActive");
 
-            if (context == null) {
-                Log.w(TAG, "无法获取 Context，注入失败");
-                return;
-            }
-
-            SharedPreferences prefs = context.getSharedPreferences("sim_prefs", Context.MODE_PRIVATE);
-            String targetUidHex = prefs.getString("target_uid", "AABBCCDD");
-
-            byte[] targetUid = hexToBytes(targetUidHex);
-            byte[] config = new byte[targetUid.length + 2];
-            config[0] = 0x01; // LA_NFCID1
-            config[1] = (byte) targetUid.length;
-            System.arraycopy(targetUid, 0, config, 2, targetUid.length);
-
-            Method writeConfig = managerInstance.getClass().getDeclaredMethod("doWriteNciConfig", int.class, byte[].class);
-            writeConfig.setAccessible(true);
-            writeConfig.invoke(managerInstance, 1, config);
-
-            Log.i(TAG, "UID 物理层注入完成: " + targetUidHex);
-        } catch (Exception e) {
-            Log.e(TAG, "注入 UID 异常: " + e.getMessage());
+            deoptimize(activeMethod);
+            hook(activeMethod).intercept(chain -> true);
+            Log.i(TAG, "LSPosed self-check hook installed");
+        } catch (Throwable e) {
+            Log.e(TAG, "Failed to install self-check hook", e);
         }
     }
 
-    private byte[] hexToBytes(String s) {
-        String clean = s.replace(" ", "");
-        int len = clean.length();
-        if (len % 2 != 0) return new byte[0];
-        byte[] data = new byte[len / 2];
-        for (int i = 0; i < len; i += 2) {
-            data[i / 2] = (byte) ((Character.digit(clean.charAt(i), 16) << 4)
-                    + Character.digit(clean.charAt(i + 1), 16));
+    private void installNfcServiceHooks(XposedModuleInterface.PackageLoadedParam lp) {
+        try {
+            ClassLoader cl = lp.getDefaultClassLoader();
+            Class<?> nativeManager = cl.loadClass("com.android.nfc.dhimpl.NativeNfcManager");
+            Method initMethod = nativeManager.getDeclaredMethod("doInitialize");
+            deoptimize(initMethod);
+
+            hook(initMethod).intercept(chain -> {
+                Object result = chain.proceed();
+
+                if (result instanceof Boolean && !((Boolean) result)) {
+                    Log.w(TAG, "NFC initialization failed; UID injection skipped");
+                    return result;
+                }
+
+                try {
+                    injectConfiguredUid(chain.getThisObject());
+                } catch (Throwable t) {
+                    Log.e(TAG, "UID injection failed after NFC initialization", t);
+                }
+                return result;
+            });
+
+            Log.i(TAG, "NativeNfcManager.doInitialize hook installed");
+        } catch (Throwable e) {
+            Log.e(TAG, "Failed to install NFC service hook", e);
+        }
+    }
+
+    private void injectConfiguredUid(Object managerInstance) throws Exception {
+        Context context = getCurrentApplicationContext();
+        if (context == null) {
+            Log.w(TAG, "Application context unavailable; UID injection skipped");
+            return;
+        }
+
+        String targetUidHex = readTargetUid(context);
+        if (targetUidHex == null || targetUidHex.trim().isEmpty()) {
+            Log.i(TAG, "No configured target UID; nothing to inject");
+            return;
+        }
+
+        byte[] targetUid = hexToBytes(targetUidHex);
+        if (!isSupportedNfcAUidLength(targetUid.length)) {
+            Log.w(TAG, "Unsupported NFC-A UID length: " + targetUid.length + " bytes");
+            return;
+        }
+
+        Method writeConfig;
+        try {
+            writeConfig = managerInstance.getClass()
+                    .getDeclaredMethod("doWriteNciConfig", int.class, byte[].class);
+        } catch (NoSuchMethodException e) {
+            Log.w(TAG, "doWriteNciConfig(int, byte[]) is not present on this NFC stack; " +
+                    "device-specific backend mapping is required");
+            return;
+        }
+
+        writeConfig.setAccessible(true);
+
+        // Experimental vendor-specific payload retained from the prototype. The code now
+        // validates input and only calls it when the expected method actually exists.
+        byte[] config = new byte[targetUid.length + 2];
+        config[0] = 0x01;
+        config[1] = (byte) targetUid.length;
+        System.arraycopy(targetUid, 0, config, 2, targetUid.length);
+
+        Object result = writeConfig.invoke(managerInstance, 1, config);
+        Log.i(TAG, "UID config request sent for " + formatHex(targetUid) +
+                "; return=" + String.valueOf(result));
+    }
+
+    private Context getCurrentApplicationContext() {
+        try {
+            Class<?> activityThreadClass = Class.forName("android.app.ActivityThread");
+            Method currentApplicationMethod = activityThreadClass.getDeclaredMethod("currentApplication");
+            Object app = currentApplicationMethod.invoke(null);
+            return app instanceof Context ? (Context) app : null;
+        } catch (Throwable e) {
+            Log.e(TAG, "Unable to obtain application context", e);
+            return null;
+        }
+    }
+
+    private String readTargetUid(Context context) {
+        try (Cursor cursor = context.getContentResolver().query(
+                UID_CONFIG_URI,
+                new String[]{"uid"},
+                null,
+                null,
+                null)) {
+            if (cursor == null || !cursor.moveToFirst()) {
+                return null;
+            }
+            int index = cursor.getColumnIndex("uid");
+            return index >= 0 && !cursor.isNull(index) ? cursor.getString(index) : null;
+        } catch (Throwable e) {
+            Log.e(TAG, "Unable to read target UID from app provider", e);
+            return null;
+        }
+    }
+
+    private boolean isSupportedNfcAUidLength(int length) {
+        return length == 4 || length == 7 || length == 10;
+    }
+
+    private byte[] hexToBytes(String value) {
+        if (value == null) {
+            return new byte[0];
+        }
+
+        String clean = value
+                .replace(":", "")
+                .replace("-", "")
+                .replace(" ", "")
+                .trim();
+
+        if ((clean.length() & 1) != 0 || !clean.matches("(?i)[0-9a-f]+")) {
+            throw new IllegalArgumentException("Invalid hexadecimal UID: " + value);
+        }
+
+        byte[] data = new byte[clean.length() / 2];
+        for (int i = 0; i < clean.length(); i += 2) {
+            data[i / 2] = (byte) Integer.parseInt(clean.substring(i, i + 2), 16);
         }
         return data;
+    }
+
+    private String formatHex(byte[] value) {
+        StringBuilder out = new StringBuilder(value.length * 3);
+        for (int i = 0; i < value.length; i++) {
+            if (i > 0) out.append(':');
+            out.append(String.format(Locale.US, "%02X", value[i] & 0xFF));
+        }
+        return out.toString();
     }
 }
