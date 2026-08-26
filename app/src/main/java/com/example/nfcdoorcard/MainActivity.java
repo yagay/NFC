@@ -4,6 +4,7 @@ import android.app.Activity;
 import android.graphics.Typeface;
 import android.nfc.NfcAdapter;
 import android.nfc.Tag;
+import android.os.Build;
 import android.os.Bundle;
 import android.provider.Settings;
 import android.view.View;
@@ -18,6 +19,9 @@ import com.example.nfcdoorcard.nfc.TagInspector;
 import java.util.stream.Collectors;
 
 public class MainActivity extends Activity implements NfcAdapter.ReaderCallback {
+    private static final int MIN_SUPPORTED_SDK = 31; // Android 12
+    private static final int MAX_SUPPORTED_SDK = 37; // Android 17
+
     private NfcAdapter nfcAdapter;
     private TextView status;
     private TextView details;
@@ -38,7 +42,7 @@ public class MainActivity extends Activity implements NfcAdapter.ReaderCallback 
 
         TextView title = text("NFC 门禁 · v0.1", 26, true);
         root.addView(title);
-        TextView sub = text("先读取并判断卡类型，再决定是否适合标准 HCE。不会修改系统 NFC HAL。", 14, false);
+        TextView sub = text("支持 Android 12–17（API 31–37）。先读取并判断卡类型，再决定是否适合标准 HCE。不会修改系统 NFC HAL。", 14, false);
         sub.setPadding(0, dp(6), 0, dp(18));
         root.addView(sub);
 
@@ -75,11 +79,48 @@ public class MainActivity extends Activity implements NfcAdapter.ReaderCallback 
         String nfc;
         if (nfcAdapter == null) nfc = "无 NFC 硬件";
         else nfc = nfcAdapter.isEnabled() ? "NFC 已开启" : "NFC 未开启";
-        status.setText(nfc + "   ·   Root: " + (root ? "可用" : "未检测到/未授权"));
+
+        int sdk = Build.VERSION.SDK_INT;
+        String androidVersion = androidVersionName(sdk);
+        String support = isSupportedSdk(sdk) ? "系统受支持" : "系统版本超出支持范围";
+
+        status.setText(
+                androidVersion + " / API " + sdk + "   ·   " + support +
+                "\n" + nfc + "   ·   Root: " + (root ? "可用" : "未检测到/未授权")
+        );
+    }
+
+    private boolean isSupportedSdk(int sdk) {
+        return sdk >= MIN_SUPPORTED_SDK && sdk <= MAX_SUPPORTED_SDK;
+    }
+
+    private String androidVersionName(int sdk) {
+        switch (sdk) {
+            case 31:
+                return "Android 12";
+            case 32:
+                return "Android 12L";
+            case 33:
+                return "Android 13";
+            case 34:
+                return "Android 14";
+            case 35:
+                return "Android 15";
+            case 36:
+                return "Android 16";
+            case 37:
+                return "Android 17";
+            default:
+                return "Android";
+        }
     }
 
     private void enableReader() {
         refreshStatus();
+        if (!isSupportedSdk(Build.VERSION.SDK_INT)) {
+            details.setText("当前 Android 版本不在正式支持范围内。支持 Android 12–17（API 31–37）。");
+            return;
+        }
         if (nfcAdapter == null || !nfcAdapter.isEnabled()) {
             details.setText("请先开启 NFC。\n\n当前没有修改系统设置。 ");
             return;
