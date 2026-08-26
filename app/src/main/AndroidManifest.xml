@@ -21,7 +21,7 @@
             android:value="102" />
         <meta-data
             android:name="xposedscope"
-            android:value="com.android.nfc|com.oplus.nfc|com.android.settings|com.example.nfcdoorcard" />
+            android:value="com.android.nfc|com.android.settings|com.example.nfcdoorcard|com.finshell.wallet|com.heytap.tas|com.nearme.wallet" />
 
         <activity
             android:name=".MainActivity"

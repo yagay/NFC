@@ -3,7 +3,6 @@ package com.example.nfcdoorcard.xposed;
 import android.content.Context;
 import android.content.SharedPreferences;
 import android.util.Log;
-import io.github.libxposed.api.XposedInterface;
 import io.github.libxposed.api.XposedModule;
 import io.github.libxposed.api.XposedModuleInterface;
 import java.lang.reflect.Method;
@@ -12,66 +11,59 @@ public class NfcDiagnosticsModule extends XposedModule {
 
     private static final String TAG = "NfcUIDSim";
 
-    public NfcDiagnosticsModule(XposedInterface base, XposedModuleInterface.ModuleLoadedParam lp) {
-        super();
-    }
-
     @Override
-    public void onPackageReady(XposedModuleInterface.PackageReadyParam lp) {
-        super.onPackageReady(lp);
+    public void onPackageLoaded(XposedModuleInterface.PackageLoadedParam lp) {
+        super.onPackageLoaded(lp);
         String packageName = lp.getPackageName();
-
-        // 任务 0: 自 Hook 激活状态
+        
+        // 自 Hook 激活状态
         if (packageName.equals("com.example.nfcdoorcard")) {
             try {
-                ClassLoader cl = lp.getClassLoader();
+                ClassLoader cl = lp.getDefaultClassLoader();
                 Class<?> mainActivity = cl.loadClass("com.example.nfcdoorcard.MainActivity");
                 Method activeMethod = mainActivity.getDeclaredMethod("isModuleActive");
-                hook(activeMethod).intercept(chain -> true);
-                Log.i(TAG, "已向主 App 证明激活状态");
+                hook(activeMethod).intercept(chain -> {
+                    Log.i(TAG, "已向主 App 证明激活状态");
+                    return true;
+                });
             } catch (Exception e) {
                 Log.e(TAG, "自 Hook 失败: " + e.getMessage());
             }
-            return;
         }
 
-        if (!packageName.equals("com.android.nfc")) return;
+        // 针对 NFC 服务进行 Hook
+        if (packageName.equals("com.android.nfc")) {
+            Log.i(TAG, "检测到 NFC 服务加载...");
+            try {
+                ClassLoader cl = lp.getDefaultClassLoader();
+                Class<?> nativeManager = cl.loadClass("com.android.nfc.dhimpl.NativeNfcManager");
+                Method initMethod = nativeManager.getDeclaredMethod("doInitialize");
+                
+                hook(initMethod).intercept(chain -> {
+                    Object result = chain.proceed();
+                    injectUid(chain.getThisObject(), cl);
+                    return result;
+                });
 
-        Log.i(TAG, "已进入 NFC 进程 (API 102), 正在查找 Hook 目标...");
-
-        try {
-            ClassLoader cl = lp.getClassLoader();
-            // Hook NativeNfcManager.doInitialize
-            Class<?> nativeManager = cl.loadClass("com.android.nfc.dhimpl.NativeNfcManager");
-            Method initMethod = nativeManager.getDeclaredMethod("doInitialize");
-            
-            hook(initMethod).intercept(chain -> {
-                Object result = chain.proceed();
-                injectUid(chain.getThisObject(), cl);
-                return result;
-            });
-
-            // Hook NfcFeatureManager.isFeatureEnable
-            Class<?> featureManager = cl.loadClass("com.android.nfc.NfcFeatureManager");
-            Method featureMethod = featureManager.getDeclaredMethod("isFeatureEnable", String.class);
-            
-            hook(featureMethod).intercept(chain -> {
-                String feature = (String) chain.getArgs().get(0);
-                if ("SMART_SWITCH_CARD".equals(feature) || "REALTIME_SWITCH_CARD".equals(feature)) {
-                    Log.i(TAG, "已强制屏蔽系统功能: " + feature);
-                    return false;
-                }
-                return chain.proceed();
-            });
-
-        } catch (Exception e) {
-            Log.e(TAG, "寻找目标类失败: " + e.getMessage());
+                // 屏蔽智能切卡
+                Class<?> featureManager = cl.loadClass("com.android.nfc.NfcFeatureManager");
+                Method featureMethod = featureManager.getDeclaredMethod("isFeatureEnable", String.class);
+                hook(featureMethod).intercept(chain -> {
+                    String feature = (String) chain.getArgs().get(0);
+                    if ("SMART_SWITCH_CARD".equals(feature) || "REALTIME_SWITCH_CARD".equals(feature)) {
+                        Log.i(TAG, "已屏蔽系统功能: " + feature);
+                        return false;
+                    }
+                    return chain.proceed();
+                });
+            } catch (Exception e) {
+                Log.e(TAG, "NFC Hook 失败: " + e.getMessage());
+            }
         }
     }
 
     private void injectUid(Object managerInstance, ClassLoader classLoader) {
         try {
-            // 通过反射获取当前进程的 Context
             Class<?> activityThreadClass = classLoader.loadClass("android.app.ActivityThread");
             Method currentApplicationMethod = activityThreadClass.getDeclaredMethod("currentApplication");
             Context context = (Context) currentApplicationMethod.invoke(null);
@@ -81,13 +73,12 @@ public class NfcDiagnosticsModule extends XposedModule {
                 return;
             }
 
-            // 读取配置
             SharedPreferences prefs = context.getSharedPreferences("sim_prefs", Context.MODE_PRIVATE);
             String targetUidHex = prefs.getString("target_uid", "AABBCCDD");
 
             byte[] targetUid = hexToBytes(targetUidHex);
             byte[] config = new byte[targetUid.length + 2];
-            config[0] = 0x01; // Parameter ID (LA_NFCID1)
+            config[0] = 0x01; // LA_NFCID1
             config[1] = (byte) targetUid.length;
             System.arraycopy(targetUid, 0, config, 2, targetUid.length);
 

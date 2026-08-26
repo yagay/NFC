@@ -1,6 +1,7 @@
 package com.example.nfcdoorcard;
 
 import android.app.Activity;
+import android.util.Log;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
@@ -39,6 +40,7 @@ public class MainActivity extends Activity implements NfcAdapter.ReaderCallback 
      * 此方法会被 LSPosed 模块 Hook，如果模块已激活且作用域包含本 App，则返回 true。
      */
     public static boolean isModuleActive() {
+        // 此方法被 Hook 后会返回 true
         return false;
     }
 
@@ -58,6 +60,7 @@ public class MainActivity extends Activity implements NfcAdapter.ReaderCallback 
         super.onCreate(savedInstanceState);
         nfcAdapter = NfcAdapter.getDefaultAdapter(this);
         setContentView(buildUi());
+        Log.i("NfcDoorCard", "isModuleActive: " + isModuleActive());
         refreshStatus();
     }
 
