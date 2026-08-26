@@ -8,5 +8,10 @@ public record CardSnapshot(
         String atqa,
         String sak,
         String classification,
-        String note
+        String note,
+        String uidLength,
+        String classicSize,
+        String classicSectors,
+        String classicBlocks,
+        String hceSupport
 ) {}
