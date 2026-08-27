@@ -24,6 +24,7 @@ public final class ActivationActivity extends MainActivity implements NfcDoorApp
 
     private volatile String lastSystemLogReport = "";
     private boolean initialLogCaptureStarted;
+    private Button restartNfcButton;
     private Button readLogButton;
     private Button exportLogButton;
 
@@ -79,11 +80,19 @@ public final class ActivationActivity extends MainActivity implements NfcDoorApp
         panel.setOrientation(LinearLayout.VERTICAL);
         panel.setPadding(dpLocal(8), dpLocal(8), dpLocal(8), dpLocal(8));
 
+        restartNfcButton = new Button(this);
+        restartNfcButton.setText("重载 NFC Hook");
+        restartNfcButton.setAllCaps(false);
+        restartNfcButton.setOnClickListener(v -> restartNfcProcessAndRefresh());
+        panel.addView(restartNfcButton, new LinearLayout.LayoutParams(dpLocal(210), dpLocal(48)));
+
         readLogButton = new Button(this);
         readLogButton.setText("读取 NFC / LSPosed 日志");
         readLogButton.setAllCaps(false);
         readLogButton.setOnClickListener(v -> captureSystemLogs(true));
-        panel.addView(readLogButton, new LinearLayout.LayoutParams(dpLocal(210), dpLocal(48)));
+        LinearLayout.LayoutParams readParams = new LinearLayout.LayoutParams(dpLocal(210), dpLocal(48));
+        readParams.topMargin = dpLocal(6);
+        panel.addView(readLogButton, readParams);
 
         exportLogButton = new Button(this);
         exportLogButton.setText("导出日志");
@@ -99,6 +108,69 @@ public final class ActivationActivity extends MainActivity implements NfcDoorApp
                 Gravity.END | Gravity.BOTTOM);
         params.setMargins(dpLocal(16), dpLocal(16), dpLocal(16), dpLocal(32));
         addContentView(panel, params);
+    }
+
+    private void restartNfcProcessAndRefresh() {
+        setLogButtonsEnabled(false);
+        lastSystemLogReport = "";
+        Toast.makeText(this, "正在重载 NFC Hook…", Toast.LENGTH_SHORT).show();
+        AppLogger.i("Diag", "开始一键重载 com.android.nfc / libxposed Hook");
+
+        new Thread(() -> {
+            RootShell.Result before = RootShell.execute("pidof com.android.nfc || true");
+            String oldPid = before.output().trim();
+
+            RootShell.Result restart = RootShell.execute(
+                    "old=\"$(pidof com.android.nfc 2>/dev/null | awk '{print $1}')\"; " +
+                    "echo old_pid=$old; " +
+                    "if [ -n \"$old\" ]; then kill -TERM \"$old\" 2>/dev/null || true; fi; " +
+                    "sleep 2; " +
+                    "now=\"$(pidof com.android.nfc 2>/dev/null | awk '{print $1}')\"; " +
+                    "if [ -n \"$old\" ] && [ \"$now\" = \"$old\" ]; then kill -KILL \"$old\" 2>/dev/null || true; fi; " +
+                    "i=0; new=\"\"; " +
+                    "while [ $i -lt 6 ]; do " +
+                    "  new=\"$(pidof com.android.nfc 2>/dev/null | awk '{print $1}')\"; " +
+                    "  if [ -n \"$new\" ] && [ \"$new\" != \"$old\" ]; then break; fi; " +
+                    "  sleep 1; i=$((i+1)); " +
+                    "done; " +
+                    "echo new_pid=$new; " +
+                    "[ -n \"$new\" ] && [ \"$new\" != \"$old\" ]");
+
+            String newPid = "";
+            RootShell.Result after = RootShell.execute("pidof com.android.nfc 2>/dev/null | awk '{print $1}' || true");
+            if (!after.output().isEmpty()) newPid = after.output().trim();
+
+            boolean changed = !newPid.isEmpty() && (oldPid.isEmpty() || !newPid.equals(oldPid.split("\\s+")[0]));
+            if (changed) {
+                AppLogger.i("Diag", "NFC 进程已重载: " + oldPid + " -> " + newPid);
+            } else {
+                AppLogger.w("Diag", "NFC 进程重载未确认: " + restart.describe());
+            }
+
+            try {
+                Thread.sleep(1500);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+
+            boolean finalChanged = changed;
+            String finalOldPid = oldPid;
+            String finalNewPid = newPid;
+            runOnUiThread(() -> {
+                refreshStatus();
+                if (finalChanged) {
+                    Toast.makeText(this,
+                            "NFC 已重载: " + finalOldPid + " → " + finalNewPid + "，正在读取最新日志",
+                            Toast.LENGTH_LONG).show();
+                    captureSystemLogs(true);
+                } else {
+                    setLogButtonsEnabled(true);
+                    Toast.makeText(this,
+                            "NFC 重载失败或 PID 未变化，请检查 Root/LSPosed",
+                            Toast.LENGTH_LONG).show();
+                }
+            });
+        }, "nfc-hook-reloader").start();
     }
 
     private void captureSystemLogs(boolean showDialog) {
@@ -138,7 +210,7 @@ public final class ActivationActivity extends MainActivity implements NfcDoorApp
 
             RootShell.Result logcat = RootShell.execute(
                     "logcat -d -v threadtime 2>/dev/null | " +
-                    "grep -i -E 'NfcUIDSim|NFC-SCAN|LSPosed|libxposed|com\\.android\\.nfc' | " +
+                    "grep -i -E 'NfcUIDSim|NFC-SCAN|NFC-TRACE|NFC-RUNTIME|LSPosed|libxposed|com\\.android\\.nfc' | " +
                     "tail -n 2000 || true");
             report.append("【NFC / LSPosed Logcat】\n");
             if (logcat.output().isEmpty()) report.append("未找到匹配日志。\n");
@@ -154,7 +226,7 @@ public final class ActivationActivity extends MainActivity implements NfcDoorApp
                     "for d in /data/adb/lspd/log /data/adb/lsposed/log; do " +
                     "[ -d \"$d\" ] || continue; " +
                     "find \"$d\" -maxdepth 2 -type f -print0 2>/dev/null | " +
-                    "xargs -0 grep -H -i -E 'NfcUIDSim|NFC-SCAN|com\\.example\\.nfcdoorcard|com\\.android\\.nfc' 2>/dev/null; " +
+                    "xargs -0 grep -H -i -E 'NfcUIDSim|NFC-SCAN|NFC-TRACE|NFC-RUNTIME|com\\.example\\.nfcdoorcard|com\\.android\\.nfc' 2>/dev/null; " +
                     "done | tail -n 3000 || true");
             report.append("\n【LSPosed 持久日志匹配内容】\n");
             if (lsposedPersistent.output().isEmpty()) {
@@ -227,6 +299,7 @@ public final class ActivationActivity extends MainActivity implements NfcDoorApp
     }
 
     private void setLogButtonsEnabled(boolean enabled) {
+        if (restartNfcButton != null) restartNfcButton.setEnabled(enabled);
         if (readLogButton != null) readLogButton.setEnabled(enabled);
         if (exportLogButton != null) exportLogButton.setEnabled(enabled);
     }
