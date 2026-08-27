@@ -24,6 +24,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public final class SystemDefaultLauncherActivity extends AppCompatActivity {
     private final AtomicBoolean operationRunning = new AtomicBoolean(false);
     private Button restoreButton;
+    private Button scanConfigButton;
 
     private SharedPreferences simulationPrefs() {
         return createDeviceProtectedStorageContext()
@@ -49,7 +50,7 @@ public final class SystemDefaultLauncherActivity extends AppCompatActivity {
         root.addView(title, lp(-1, -2, 16));
 
         TextView info = new TextView(this);
-        info.setText("“恢复系统默认 UID”不会写入新的 UID。它会先关闭并清除本 App 的 UID 测试配置，再清除旧版 persist.nfcuidsim 属性，最后重启 NFC 服务，让系统按手机原生配置重新初始化。");
+        info.setText("“恢复系统默认 UID”不会写入新的 UID。若恢复后 UID 仍不变，可先使用只读扫描功能查找手机原厂 NFC 配置中的 NFCID1 / LA_NFCID1 候选值。");
         info.setTextSize(15);
         root.addView(info, lp(-1, -2, 20));
 
@@ -58,12 +59,67 @@ public final class SystemDefaultLauncherActivity extends AppCompatActivity {
         openMain.setOnClickListener(v -> startActivity(new Intent(this, ActivationActivity.class)));
         root.addView(openMain, lp(-1, dp(52), 12));
 
+        scanConfigButton = new Button(this);
+        scanConfigButton.setText("扫描手机原厂 NFC UID 配置（只读）");
+        scanConfigButton.setOnClickListener(v -> scanFactoryNfcConfig());
+        root.addView(scanConfigButton, lp(-1, dp(52), 12));
+
         restoreButton = new Button(this);
         restoreButton.setText("恢复系统默认 UID");
         restoreButton.setOnClickListener(v -> confirmRestore());
         root.addView(restoreButton, lp(-1, dp(52), 12));
 
         return root;
+    }
+
+    private void scanFactoryNfcConfig() {
+        if (!operationRunning.compareAndSet(false, true)) {
+            Toast.makeText(this, "NFC 操作正在执行", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        setActionButtonsEnabled(false);
+        Toast.makeText(this, "正在只读扫描原厂 NFC 配置…", Toast.LENGTH_SHORT).show();
+
+        new Thread(() -> {
+            String command =
+                    "set +e\n" +
+                    "echo '=== NFC hardware properties ==='\n" +
+                    "getprop ro.hardware.nfc\n" +
+                    "getprop ro.boot.hardware\n" +
+                    "echo\n" +
+                    "echo '=== NFC config files ==='\n" +
+                    "find /system /vendor /odm /product -type f \\\n" +
+                    "  \( -iname 'libnfc*.conf' -o -iname '*nfc*.conf' -o -iname '*nfc*.cfg' \) 2>/dev/null | sort -u\n" +
+                    "echo\n" +
+                    "echo '=== Candidate NFCID1 / NCI config lines ==='\n" +
+                    "for f in $(find /system /vendor /odm /product -type f \\\n" +
+                    "  \( -iname 'libnfc*.conf' -o -iname '*nfc*.conf' -o -iname '*nfc*.cfg' \) 2>/dev/null | sort -u); do\n" +
+                    "  m=$(grep -Ein 'LA_NFCID1|NFCID1|NXP_CORE_CONF|(^|[^0-9A-Fa-f])0[xX]?33([^0-9A-Fa-f]|$)' \"$f\" 2>/dev/null | head -n 80)\n" +
+                    "  if [ -n \"$m\" ]; then echo \"--- $f ---\"; echo \"$m\"; fi\n" +
+                    "done\n";
+
+            RootShell.Result result = RootShell.execute(command);
+            String report = result.output();
+            if (report == null || report.isBlank()) report = "未找到候选配置，或 Root 无法读取这些目录。\n" + result.describe();
+
+            String finalReport = report;
+            AppLogger.i("UID", "原厂 NFC 配置只读扫描完成: success=" + result.success());
+            operationRunning.set(false);
+            runOnUiThread(() -> {
+                setActionButtonsEnabled(true);
+                TextView view = new TextView(this);
+                view.setText(finalReport);
+                view.setTextIsSelectable(true);
+                view.setPadding(dp(16), dp(8), dp(16), dp(8));
+                android.widget.ScrollView scroll = new android.widget.ScrollView(this);
+                scroll.addView(view);
+                new android.app.AlertDialog.Builder(this)
+                        .setTitle("原厂 NFC 配置扫描结果")
+                        .setView(scroll)
+                        .setPositiveButton("关闭", null)
+                        .show();
+            });
+        }, "scan-oem-nfc-config").start();
     }
 
     private void confirmRestore() {
@@ -80,11 +136,9 @@ public final class SystemDefaultLauncherActivity extends AppCompatActivity {
             Toast.makeText(this, "NFC 操作正在执行", Toast.LENGTH_SHORT).show();
             return;
         }
-        restoreButton.setEnabled(false);
+        setActionButtonsEnabled(false);
 
         new Thread(() -> {
-            // Persist the disabled state BEFORE restarting NFC so the NFC process cannot
-            // observe the previous target UID during its next initialization.
             SharedPreferences.Editor editor = simulationPrefs().edit();
             editor.putBoolean("request_active", false);
             editor.remove("target_uid");
@@ -108,10 +162,10 @@ public final class SystemDefaultLauncherActivity extends AppCompatActivity {
                     ", nfcRestart=" + result.success());
             operationRunning.set(false);
             runOnUiThread(() -> {
-                restoreButton.setEnabled(true);
+                setActionButtonsEnabled(true);
                 if (result.success()) {
                     Toast.makeText(this,
-                            "已清除 UID 模拟配置并重启 NFC，系统将使用手机默认值",
+                            "已清除 UID 模拟配置并重启 NFC；若 UID 仍不变，请先运行原厂配置扫描",
                             Toast.LENGTH_LONG).show();
                 } else {
                     Toast.makeText(this,
@@ -120,6 +174,11 @@ public final class SystemDefaultLauncherActivity extends AppCompatActivity {
                 }
             });
         }, "restore-system-nfc-uid").start();
+    }
+
+    private void setActionButtonsEnabled(boolean enabled) {
+        if (restoreButton != null) restoreButton.setEnabled(enabled);
+        if (scanConfigButton != null) scanConfigButton.setEnabled(enabled);
     }
 
     private LinearLayout.LayoutParams lp(int width, int height, int bottomMargin) {
