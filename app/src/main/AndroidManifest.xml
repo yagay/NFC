@@ -25,6 +25,13 @@
             android:name=".MainActivity"
             android:exported="false" />
 
+        <provider
+            android:name=".data.UidConfigProvider"
+            android:authorities="com.example.nfcdoorcard.uidconfig"
+            android:directBootAware="true"
+            android:exported="true"
+            android:grantUriPermissions="false" />
+
         <service
             android:name=".nfc.DoorHostApduService"
             android:exported="true"
