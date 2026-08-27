@@ -18,13 +18,13 @@
             android:value="true" />
         <meta-data
             android:name="xposeddescription"
-            android:value="NFC 门禁模拟模块" />
+            android:value="NFC 门禁诊断模块" />
         <meta-data
             android:name="xposedminversion"
             android:value="102" />
         <meta-data
             android:name="xposedscope"
-            android:value="com.android.nfc|com.android.settings|com.example.nfcdoorcard|com.finshell.wallet|com.heytap.tas|com.nearme.wallet" />
+            android:value="com.android.nfc|com.example.nfcdoorcard" />
 
         <activity
             android:name=".MainActivity"
