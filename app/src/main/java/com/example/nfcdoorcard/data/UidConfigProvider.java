@@ -10,7 +10,7 @@ import android.net.Uri;
 import android.os.Binder;
 
 /**
- * Read-only bridge used by the LSPosed code running inside com.android.nfc.
+ * Read-only bridge for NFC diagnostics/configuration data.
  *
  * The target UID is stored in device-protected storage so it can be read even when
  * the NFC service is initialized before the user unlocks the device. Access is
@@ -36,7 +36,7 @@ public final class UidConfigProvider extends ContentProvider {
             return null;
         }
 
-        Context context = requireContext().createDeviceProtectedStorageContext();
+        Context context = providerContext().createDeviceProtectedStorageContext();
         String uid = context.getSharedPreferences("sim_prefs", Context.MODE_PRIVATE)
                 .getString("target_uid", null);
 
@@ -51,7 +51,7 @@ public final class UidConfigProvider extends ContentProvider {
             return true;
         }
 
-        PackageManager pm = requireContext().getPackageManager();
+        PackageManager pm = providerContext().getPackageManager();
         String[] packages = pm.getPackagesForUid(callingUid);
         if (packages == null) {
             return false;
@@ -64,7 +64,7 @@ public final class UidConfigProvider extends ContentProvider {
         return false;
     }
 
-    private Context requireContext() {
+    private Context providerContext() {
         Context context = getContext();
         if (context == null) {
             throw new IllegalStateException("ContentProvider context is unavailable");
