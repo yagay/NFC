@@ -25,7 +25,7 @@ Android HCE is intended for ISO-DEP/APDU services and does not provide an applic
 
 ## Build
 
-Use Android 17 / API 37 SDK and JDK 17. The project currently uses AGP 9.2.1 and Gradle 9.4.1.
+Use Android API 36 SDK and JDK 17. The APK supports runtime Android 12–17 (API 31–37); `compileSdk` and `targetSdk` are 36 so the build does not depend on an unavailable API 37 SDK package. The project currently uses AGP 9.2.1 and Gradle 9.4.1.
 
 GitHub Actions workflow: `.github/workflows/build-apk.yml`
 
