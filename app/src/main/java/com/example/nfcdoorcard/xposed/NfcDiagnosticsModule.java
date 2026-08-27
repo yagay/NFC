@@ -7,24 +7,15 @@ import java.lang.reflect.Method;
 import io.github.libxposed.api.XposedModule;
 import io.github.libxposed.api.XposedModuleInterface;
 
-/**
- * LSPosed/libxposed API 102 diagnostics module.
- *
- * This module intentionally does not write controller-specific NFC configuration.
- * It only confirms that the Android NFC service target was loaded and that
- * NativeNfcManager.doInitialize() can be observed on the current NFC stack.
- */
+/** LSPosed/libxposed API 102 diagnostics module. */
 public class NfcDiagnosticsModule extends XposedModule {
-
     private static final String TAG = "NfcUIDSim";
 
     @Override
     public void onPackageLoaded(XposedModuleInterface.PackageLoadedParam lp) {
         super.onPackageLoaded(lp);
-
         String packageName = lp.getPackageName();
         if (!"com.android.nfc".equals(packageName)) return;
-
         Log.i(TAG, "LSPosed loaded NFC target: " + packageName);
         installNfcServiceHooks(lp);
     }
@@ -37,17 +28,23 @@ public class NfcDiagnosticsModule extends XposedModule {
 
             deoptimize(initMethod);
             hook(initMethod).intercept(chain -> {
-                Object result = chain.proceed();
-                if (result instanceof Boolean) {
-                    Log.i(TAG, "NFC doInitialize observed: " + ((Boolean) result ? "success" : "failed"));
-                } else {
-                    Log.i(TAG, "NFC doInitialize observed; return=" + String.valueOf(result));
+                Log.i(TAG, "NFC doInitialize entered");
+                try {
+                    Object result = chain.proceed();
+                    if (result instanceof Boolean) {
+                        Log.i(TAG, "NFC doInitialize returned: " + ((Boolean) result ? "success" : "failed"));
+                    } else {
+                        Log.i(TAG, "NFC doInitialize returned: " + String.valueOf(result));
+                    }
+                    return result;
+                } catch (Throwable t) {
+                    Log.e(TAG, "NFC doInitialize threw: " + t.getClass().getName(), t);
+                    throw t;
                 }
-                return result;
             });
 
             Log.i(TAG, "NativeNfcManager.doInitialize hook installed");
-            reportVendorBackend(nativeManager);
+            reportKnownVendorSignature(nativeManager);
         } catch (ClassNotFoundException e) {
             Log.w(TAG, "NativeNfcManager class not found on this NFC stack", e);
         } catch (NoSuchMethodException e) {
@@ -57,17 +54,15 @@ public class NfcDiagnosticsModule extends XposedModule {
         }
     }
 
-    /**
-     * Only reports whether the prototype vendor method exists. It is never invoked.
-     */
-    private void reportVendorBackend(Class<?> nativeManager) {
+    /** Checks one known signature only; absence does not imply the controller lacks configuration support. */
+    private void reportKnownVendorSignature(Class<?> nativeManager) {
         try {
             nativeManager.getDeclaredMethod("doWriteNciConfig", int.class, byte[].class);
-            Log.i(TAG, "Vendor method doWriteNciConfig(int, byte[]) is present; writes remain disabled");
+            Log.i(TAG, "Known vendor signature doWriteNciConfig(int, byte[]) is present; invocation disabled");
         } catch (NoSuchMethodException e) {
-            Log.i(TAG, "Vendor method doWriteNciConfig(int, byte[]) is absent");
+            Log.i(TAG, "Known vendor signature doWriteNciConfig(int, byte[]) not found; other vendor APIs may differ");
         } catch (Throwable t) {
-            Log.w(TAG, "Unable to inspect vendor NFC backend", t);
+            Log.w(TAG, "Unable to inspect known vendor NFC signature", t);
         }
     }
 }
