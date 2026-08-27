@@ -10,7 +10,9 @@ import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.util.Arrays;
+import java.util.HashSet;
 import java.util.Locale;
+import java.util.Set;
 
 import io.github.libxposed.api.XposedModule;
 import io.github.libxposed.api.XposedModuleInterface;
@@ -20,6 +22,9 @@ public class NfcDiagnosticsModule extends XposedModule {
     private static final String TAG = "NfcUIDSim";
     private static final Uri CONFIG_URI = Uri.parse("content://com.example.nfcdoorcard.uidconfig/target");
     private static final int MAX_MEMBERS_PER_CLASS = 120;
+    private static final int MAX_STACK_FRAMES = 6;
+
+    private final Set<String> installedTraceHooks = new HashSet<>();
 
     private static final String[] SCAN_KEYWORDS = {
             "uid", "config", "nci", "rf", "discover", "routing", "listen", "poll", "set", "write",
@@ -145,8 +150,83 @@ public class NfcDiagnosticsModule extends XposedModule {
         info("NFC-RUNTIME DeviceHost superclass=" + (superClass == null ? "null" : superClass.getName()));
         info("NFC-RUNTIME DeviceHost interfaces=" + joinTypes(runtime.getInterfaces()));
         scanClass(runtime, "NFC-RUNTIME-HOST");
+        installObservationHooks(runtime);
 
         logConfiguredTestRequest();
+    }
+
+    private void installObservationHooks(Class<?> runtime) {
+        installTraceHook(runtime, "changeRfParams", byte[].class, boolean.class);
+        installTraceHook(runtime, "changeRfParamsByConfig", byte[].class);
+        installTraceHook(runtime, "doWriteData", byte[].class, byte[].class);
+        installTraceHook(runtime, "nativeSendRawVendorCmd", int.class, int.class, int.class, byte[].class);
+    }
+
+    private void installTraceHook(Class<?> runtime, String methodName, Class<?>... parameterTypes) {
+        String key = runtime.getName() + "#" + methodName + Arrays.toString(parameterTypes);
+        synchronized (installedTraceHooks) {
+            if (installedTraceHooks.contains(key)) return;
+        }
+
+        try {
+            Method method = runtime.getDeclaredMethod(methodName, parameterTypes);
+            hook(method).intercept(chain -> {
+                String args = summarizeArgs(chain.getArgs().toArray());
+                info("NFC-TRACE ENTER " + methodName + " args=" + args);
+                logShortStack(methodName);
+                try {
+                    Object result = chain.proceed();
+                    info("NFC-TRACE RETURN " + methodName + " result=" + summarizeValue(result));
+                    return result;
+                } catch (Throwable t) {
+                    warn("NFC-TRACE THROW " + methodName + " exception=" + t.getClass().getName());
+                    throw t;
+                }
+            });
+            synchronized (installedTraceHooks) {
+                installedTraceHooks.add(key);
+            }
+            info("NFC-TRACE hook installed: " + formatMethod(method));
+        } catch (NoSuchMethodException e) {
+            info("NFC-TRACE method absent: " + runtime.getName() + "." + methodName);
+        } catch (Throwable t) {
+            warn("NFC-TRACE hook failed for " + methodName + ": " + t.getClass().getSimpleName(), t);
+        }
+    }
+
+    private String summarizeArgs(Object[] args) {
+        if (args == null || args.length == 0) return "[]";
+        StringBuilder sb = new StringBuilder("[");
+        for (int i = 0; i < args.length; i++) {
+            if (i > 0) sb.append(", ");
+            sb.append(i).append('=').append(summarizeValue(args[i]));
+        }
+        return sb.append(']').toString();
+    }
+
+    private String summarizeValue(Object value) {
+        if (value == null) return "null";
+        if (value instanceof byte[]) return "byte[len=" + ((byte[]) value).length + "]";
+        if (value instanceof int[]) return "int[len=" + ((int[]) value).length + "]";
+        if (value instanceof boolean[] ) return "boolean[len=" + ((boolean[]) value).length + "]";
+        if (value instanceof Number || value instanceof Boolean || value instanceof Character) {
+            return String.valueOf(value);
+        }
+        if (value instanceof String) return "String[len=" + ((String) value).length() + "]";
+        return value.getClass().getName();
+    }
+
+    private void logShortStack(String methodName) {
+        StackTraceElement[] stack = Thread.currentThread().getStackTrace();
+        int emitted = 0;
+        for (StackTraceElement frame : stack) {
+            String className = frame.getClassName();
+            if (className.equals(Thread.class.getName()) || className.equals(getClass().getName())) continue;
+            if (className.startsWith("io.github.libxposed.")) continue;
+            info("NFC-TRACE STACK " + methodName + " #" + emitted + " "
+                    + className + "." + frame.getMethodName() + ":" + frame.getLineNumber());
+            if (++emitted >= MAX_STACK_FRAMES) break;
+        }
     }
 
     private void scanInjector(Class<?> injector, Class<?> deviceHost) {
