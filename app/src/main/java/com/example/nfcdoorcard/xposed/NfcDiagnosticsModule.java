@@ -17,19 +17,13 @@ import java.util.Set;
 import io.github.libxposed.api.XposedModule;
 import io.github.libxposed.api.XposedModuleInterface;
 
-/** LSPosed/libxposed API 102 diagnostics module. */
+/** LSPosed/libxposed API 102 diagnostics module. Observation only. */
 public class NfcDiagnosticsModule extends XposedModule {
     private static final String TAG = "NfcUIDSim";
     private static final Uri CONFIG_URI = Uri.parse("content://com.example.nfcdoorcard.uidconfig/target");
-    private static final int MAX_MEMBERS_PER_CLASS = 120;
     private static final int MAX_STACK_FRAMES = 6;
 
     private final Set<String> installedTraceHooks = new HashSet<>();
-
-    private static final String[] SCAN_KEYWORDS = {
-            "uid", "config", "nci", "rf", "discover", "routing", "listen", "poll", "set", "write",
-            "initialize", "enable", "disable", "hal", "vendor", "devicehost", "injector", "create"
-    };
 
     @Override
     public void onModuleLoaded(XposedModuleInterface.ModuleLoadedParam param) {
@@ -42,41 +36,35 @@ public class NfcDiagnosticsModule extends XposedModule {
         super.onPackageLoaded(lp);
         if (!"com.android.nfc".equals(lp.getPackageName())) return;
         info("onPackageLoaded package=com.android.nfc");
-        inspectNfcRuntime(lp.getDefaultClassLoader());
+        installSlimTrace(lp.getDefaultClassLoader());
     }
 
-    private void inspectNfcRuntime(ClassLoader cl) {
-        info("NFC runtime inspection begin; observation only, no vendor command will be invoked");
+    private void installSlimTrace(ClassLoader cl) {
+        info("NFC-TRACE slim mode begin; observation only, no NFC/vendor command will be invoked");
 
         Class<?> deviceHost = loadOptional(cl, "com.android.nfc.DeviceHost");
         Class<?> nfcService = loadOptional(cl, "com.android.nfc.NfcService");
-        Class<?> nfcInjector = loadOptional(cl, "com.android.nfc.NfcInjector");
 
-        if (deviceHost != null) scanClass(deviceHost, "NFC-DEVICEHOST-API");
-        if (nfcInjector != null) scanInjector(nfcInjector, deviceHost);
         if (nfcService != null) {
-            scanClass(nfcService, "NFC-SERVICE");
             installNfcServiceConstructorProbe(nfcService, deviceHost);
-        }
-
-        Class<?> oldNativeManager = loadOptional(cl, "com.android.nfc.dhimpl.NativeNfcManager");
-        if (oldNativeManager != null) {
-            scanClass(oldNativeManager, "NFC-OLD-NATIVE");
+            installServiceTraceHook(nfcService, "getNfcListenTech");
+            installServiceTraceHook(nfcService, "saveNfcListenTech", int.class);
+            installServiceTraceHook(nfcService, "clearListenTech", boolean.class);
         } else {
-            info("Old NativeNfcManager absent; runtime DeviceHost probe is authoritative on this stack");
+            warn("NFC-TRACE NfcService class unavailable");
         }
 
-        info("NFC runtime inspection hooks installed");
+        info("NFC-TRACE slim mode hooks requested");
     }
 
     private Class<?> loadOptional(ClassLoader cl, String name) {
         try {
             return Class.forName(name, false, cl);
         } catch (ClassNotFoundException e) {
-            debug("NFC class absent: " + name);
+            info("NFC-TRACE class absent: " + name);
             return null;
         } catch (Throwable t) {
-            warn("Unable to load NFC class " + name + ": " + t.getClass().getSimpleName());
+            warn("NFC-TRACE unable to load " + name + ": " + t.getClass().getSimpleName());
             return null;
         }
     }
@@ -91,14 +79,13 @@ public class NfcDiagnosticsModule extends XposedModule {
                     try {
                         inspectNfcServiceInstance(thisObject, deviceHost);
                     } catch (Throwable t) {
-                        warn("Runtime DeviceHost inspection failed: " + t.getClass().getSimpleName(), t);
+                        warn("NFC-RUNTIME DeviceHost inspection failed: " + t.getClass().getSimpleName(), t);
                     }
                     return result;
                 });
                 installed++;
-                info("NFC-RUNTIME constructor probe installed: " + formatConstructor(constructor));
             } catch (Throwable t) {
-                warn("Unable to hook NfcService constructor: " + t.getClass().getSimpleName(), t);
+                warn("NFC-RUNTIME constructor hook failed: " + t.getClass().getSimpleName(), t);
             }
         }
         info("NFC-RUNTIME constructor probes installed=" + installed);
@@ -106,14 +93,12 @@ public class NfcDiagnosticsModule extends XposedModule {
 
     private void inspectNfcServiceInstance(Object service, Class<?> deviceHost) {
         if (service == null) {
-            warn("NFC-RUNTIME NfcService thisObject is null after constructor");
+            warn("NFC-RUNTIME NfcService thisObject=null");
             return;
         }
 
-        info("NFC-RUNTIME serviceClass=" + service.getClass().getName());
         Object host = null;
         String hostField = null;
-
         Class<?> cursor = service.getClass();
         while (cursor != null && cursor != Object.class) {
             for (Field field : cursor.getDeclaredFields()) {
@@ -122,16 +107,12 @@ public class NfcDiagnosticsModule extends XposedModule {
                     if (!declaredAsDeviceHost && !field.getName().toLowerCase(Locale.ROOT).contains("devicehost")) continue;
                     field.setAccessible(true);
                     Object value = field.get(service);
-                    info("NFC-RUNTIME field " + cursor.getName() + "." + field.getName()
-                            + " type=" + field.getType().getName()
-                            + " valueClass=" + (value == null ? "null" : value.getClass().getName()));
                     if (value != null && deviceHost != null && deviceHost.isInstance(value)) {
                         host = value;
                         hostField = field.getName();
                         break;
                     }
-                } catch (Throwable t) {
-                    debug("NFC-RUNTIME field read skipped " + field.getName() + " / " + t.getClass().getSimpleName());
+                } catch (Throwable ignored) {
                 }
             }
             if (host != null) break;
@@ -139,27 +120,28 @@ public class NfcDiagnosticsModule extends XposedModule {
         }
 
         if (host == null) {
-            warn("NFC-RUNTIME DeviceHost instance not found in NfcService fields");
+            warn("NFC-RUNTIME DeviceHost instance not found");
             return;
         }
 
         Class<?> runtime = host.getClass();
         info("NFC-RUNTIME DeviceHost field=" + hostField);
         info("NFC-RUNTIME DeviceHost class=" + runtime.getName());
-        Class<?> superClass = runtime.getSuperclass();
-        info("NFC-RUNTIME DeviceHost superclass=" + (superClass == null ? "null" : superClass.getName()));
         info("NFC-RUNTIME DeviceHost interfaces=" + joinTypes(runtime.getInterfaces()));
-        scanClass(runtime, "NFC-RUNTIME-HOST");
-        installObservationHooks(runtime);
 
+        installHostTraceHooks(runtime);
         logConfiguredTestRequest();
     }
 
-    private void installObservationHooks(Class<?> runtime) {
+    private void installHostTraceHooks(Class<?> runtime) {
         installTraceHook(runtime, "changeRfParams", byte[].class, boolean.class);
         installTraceHook(runtime, "changeRfParamsByConfig", byte[].class);
         installTraceHook(runtime, "doWriteData", byte[].class, byte[].class);
         installTraceHook(runtime, "nativeSendRawVendorCmd", int.class, int.class, int.class, byte[].class);
+    }
+
+    private void installServiceTraceHook(Class<?> serviceClass, String methodName, Class<?>... parameterTypes) {
+        installTraceHook(serviceClass, methodName, parameterTypes);
     }
 
     private void installTraceHook(Class<?> runtime, String methodName, Class<?>... parameterTypes) {
@@ -172,14 +154,16 @@ public class NfcDiagnosticsModule extends XposedModule {
             Method method = runtime.getDeclaredMethod(methodName, parameterTypes);
             hook(method).intercept(chain -> {
                 String args = summarizeArgs(chain.getArgs().toArray());
-                info("NFC-TRACE ENTER " + methodName + " args=" + args);
+                info("NFC-TRACE ENTER " + runtime.getSimpleName() + "." + methodName + " args=" + args);
                 logShortStack(methodName);
                 try {
                     Object result = chain.proceed();
-                    info("NFC-TRACE RETURN " + methodName + " result=" + summarizeValue(result));
+                    info("NFC-TRACE RETURN " + runtime.getSimpleName() + "." + methodName
+                            + " result=" + summarizeValue(result));
                     return result;
                 } catch (Throwable t) {
-                    warn("NFC-TRACE THROW " + methodName + " exception=" + t.getClass().getName());
+                    warn("NFC-TRACE THROW " + runtime.getSimpleName() + "." + methodName
+                            + " exception=" + t.getClass().getName());
                     throw t;
                 }
             });
@@ -190,7 +174,8 @@ public class NfcDiagnosticsModule extends XposedModule {
         } catch (NoSuchMethodException e) {
             info("NFC-TRACE method absent: " + runtime.getName() + "." + methodName);
         } catch (Throwable t) {
-            warn("NFC-TRACE hook failed for " + methodName + ": " + t.getClass().getSimpleName(), t);
+            warn("NFC-TRACE hook failed: " + runtime.getName() + "." + methodName
+                    + " / " + t.getClass().getSimpleName(), t);
         }
     }
 
@@ -208,7 +193,7 @@ public class NfcDiagnosticsModule extends XposedModule {
         if (value == null) return "null";
         if (value instanceof byte[]) return "byte[len=" + ((byte[]) value).length + "]";
         if (value instanceof int[]) return "int[len=" + ((int[]) value).length + "]";
-        if (value instanceof boolean[] ) return "boolean[len=" + ((boolean[]) value).length + "]";
+        if (value instanceof boolean[]) return "boolean[len=" + ((boolean[]) value).length + "]";
         if (value instanceof Number || value instanceof Boolean || value instanceof Character) {
             return String.valueOf(value);
         }
@@ -226,60 +211,6 @@ public class NfcDiagnosticsModule extends XposedModule {
             info("NFC-TRACE STACK " + methodName + " #" + emitted + " "
                     + className + "." + frame.getMethodName() + ":" + frame.getLineNumber());
             if (++emitted >= MAX_STACK_FRAMES) break;
-        }
-    }
-
-    private void scanInjector(Class<?> injector, Class<?> deviceHost) {
-        info("NFC-INJECTOR class=" + injector.getName());
-        int matches = 0;
-        for (Method method : injector.getDeclaredMethods()) {
-            boolean returnsDeviceHost = deviceHost != null && deviceHost.isAssignableFrom(method.getReturnType());
-            boolean mentionsDeviceHost = false;
-            for (Class<?> parameter : method.getParameterTypes()) {
-                if (deviceHost != null && deviceHost.isAssignableFrom(parameter)) {
-                    mentionsDeviceHost = true;
-                    break;
-                }
-            }
-            if (!returnsDeviceHost && !mentionsDeviceHost && !matchesKeyword(method.getName())) continue;
-            matches++;
-            if (matches <= MAX_MEMBERS_PER_CLASS) {
-                info("NFC-INJECTOR METHOD " + formatMethod(method)
-                        + (returnsDeviceHost ? " [returns DeviceHost]" : ""));
-            }
-        }
-        for (Field field : injector.getDeclaredFields()) {
-            if ((deviceHost != null && deviceHost.isAssignableFrom(field.getType())) || matchesKeyword(field.getName())) {
-                info("NFC-INJECTOR FIELD " + formatField(field));
-            }
-        }
-        info("NFC-INJECTOR scan complete; methodMatches=" + matches);
-    }
-
-    private void scanClass(Class<?> clazz, String prefix) {
-        try {
-            int methodMatches = 0;
-            for (Method method : clazz.getDeclaredMethods()) {
-                if (!matchesKeyword(method.getName())) continue;
-                methodMatches++;
-                if (methodMatches <= MAX_MEMBERS_PER_CLASS) {
-                    info(prefix + " METHOD " + formatMethod(method));
-                }
-            }
-
-            int fieldMatches = 0;
-            for (Field field : clazz.getDeclaredFields()) {
-                if (!matchesKeyword(field.getName())) continue;
-                fieldMatches++;
-                if (fieldMatches <= MAX_MEMBERS_PER_CLASS) {
-                    info(prefix + " FIELD " + formatField(field));
-                }
-            }
-
-            info(prefix + " CLASS " + clazz.getName()
-                    + " matches: methods=" + methodMatches + ", fields=" + fieldMatches);
-        } catch (Throwable t) {
-            warn("Unable to scan NFC class " + clazz.getName(), t);
         }
     }
 
@@ -320,31 +251,11 @@ public class NfcDiagnosticsModule extends XposedModule {
         }
     }
 
-    private boolean matchesKeyword(String name) {
-        String lower = name.toLowerCase(Locale.ROOT);
-        for (String keyword : SCAN_KEYWORDS) {
-            if (lower.contains(keyword)) return true;
-        }
-        return false;
-    }
-
     private String formatMethod(Method method) {
         return Modifier.toString(method.getModifiers()) + " "
                 + method.getReturnType().getTypeName() + " "
                 + method.getDeclaringClass().getName() + "." + method.getName()
                 + "(" + joinTypes(method.getParameterTypes()) + ")";
-    }
-
-    private String formatField(Field field) {
-        return Modifier.toString(field.getModifiers()) + " "
-                + field.getType().getTypeName() + " "
-                + field.getDeclaringClass().getName() + "." + field.getName();
-    }
-
-    private String formatConstructor(Constructor<?> constructor) {
-        return Modifier.toString(constructor.getModifiers()) + " "
-                + constructor.getDeclaringClass().getName()
-                + "(" + joinTypes(constructor.getParameterTypes()) + ")";
     }
 
     private String joinTypes(Class<?>[] types) {
@@ -359,11 +270,6 @@ public class NfcDiagnosticsModule extends XposedModule {
         Log.i(TAG, message);
     }
 
-    private void debug(String message) {
-        log(Log.DEBUG, TAG, message);
-        Log.d(TAG, message);
-    }
-
     private void warn(String message) {
         log(Log.WARN, TAG, message);
         Log.w(TAG, message);
@@ -372,10 +278,5 @@ public class NfcDiagnosticsModule extends XposedModule {
     private void warn(String message, Throwable t) {
         log(Log.WARN, TAG, message, t);
         Log.w(TAG, message, t);
-    }
-
-    private void error(String message, Throwable t) {
-        log(Log.ERROR, TAG, message, t);
-        Log.e(TAG, message, t);
     }
 }
