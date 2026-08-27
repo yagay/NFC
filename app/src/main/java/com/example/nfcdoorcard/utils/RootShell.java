@@ -1,33 +1,23 @@
 package com.example.nfcdoorcard.utils;
 
 import java.io.BufferedReader;
-import java.io.DataOutputStream;
-import java.io.IOException;
 import java.io.InputStreamReader;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 
-public class RootShell {
+public final class RootShell {
+    private static final long TIMEOUT_SECONDS = 10;
+
+    private RootShell() {}
+
     public static boolean run(List<String> commands) {
-        Process p = null;
-        DataOutputStream os = null;
-        try {
-            p = Runtime.getRuntime().exec("su");
-            os = new DataOutputStream(p.getOutputStream());
-            for (String cmd : commands) {
-                os.writeBytes(cmd + "\n");
-            }
-            os.writeBytes("exit\n");
-            os.flush();
-            return p.waitFor() == 0;
-        } catch (Exception e) {
-            e.printStackTrace();
-            return false;
-        } finally {
-            try {
-                if (os != null) os.close();
-                if (p != null) p.destroy();
-            } catch (IOException ignored) {}
+        if (commands == null || commands.isEmpty()) return true;
+        StringBuilder script = new StringBuilder("set -e\n");
+        for (String cmd : commands) {
+            script.append(cmd).append('\n');
         }
+        Result result = execute(script.toString());
+        return result.success();
     }
 
     public static boolean run(String... commands) {
@@ -35,21 +25,59 @@ public class RootShell {
     }
 
     public static String runWithResult(String command) {
-        StringBuilder output = new StringBuilder();
-        Process p = null;
-        try {
-            p = Runtime.getRuntime().exec(new String[]{"su", "-c", command});
-            BufferedReader reader = new BufferedReader(new InputStreamReader(p.getInputStream()));
-            String line;
-            while ((line = reader.readLine()) != null) {
-                output.append(line).append("\n");
-            }
-            p.waitFor();
-        } catch (Exception e) {
-            e.printStackTrace();
-        } finally {
-            if (p != null) p.destroy();
+        Result result = execute(command);
+        if (result.success()) return result.output();
+        if (result.output().isEmpty()) {
+            return "ERROR: exit=" + result.exitCode() + (result.timedOut() ? " timeout" : "");
         }
-        return output.toString().trim();
+        return result.output();
     }
+
+    public static Result execute(String command) {
+        Process process = null;
+        StringBuilder output = new StringBuilder();
+        try {
+            process = new ProcessBuilder("su", "-c", command)
+                    .redirectErrorStream(true)
+                    .start();
+
+            Process finalProcess = process;
+            Thread readerThread = new Thread(() -> {
+                try (BufferedReader reader = new BufferedReader(
+                        new InputStreamReader(finalProcess.getInputStream()))) {
+                    String line;
+                    while ((line = reader.readLine()) != null) {
+                        synchronized (output) {
+                            output.append(line).append('\n');
+                        }
+                    }
+                } catch (Exception ignored) {
+                }
+            }, "root-shell-reader");
+            readerThread.start();
+
+            boolean finished = process.waitFor(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            if (!finished) {
+                process.destroyForcibly();
+                readerThread.join(500);
+                return new Result(false, -1, trim(output), true);
+            }
+
+            readerThread.join(500);
+            int exitCode = process.exitValue();
+            return new Result(exitCode == 0, exitCode, trim(output), false);
+        } catch (Exception e) {
+            return new Result(false, -1, e.getClass().getSimpleName() + ": " + e.getMessage(), false);
+        } finally {
+            if (process != null) process.destroy();
+        }
+    }
+
+    private static String trim(StringBuilder output) {
+        synchronized (output) {
+            return output.toString().trim();
+        }
+    }
+
+    public record Result(boolean success, int exitCode, String output, boolean timedOut) {}
 }
