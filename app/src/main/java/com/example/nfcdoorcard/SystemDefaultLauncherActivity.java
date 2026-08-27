@@ -19,7 +19,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Small launcher that keeps the existing diagnostic UI untouched while providing
- * an explicit way to return NFC UID handling to the phone/system defaults.
+ * an explicit way to inspect/restore NFC UID handling.
  */
 public final class SystemDefaultLauncherActivity extends AppCompatActivity {
     private final AtomicBoolean operationRunning = new AtomicBoolean(false);
@@ -50,7 +50,7 @@ public final class SystemDefaultLauncherActivity extends AppCompatActivity {
         root.addView(title, lp(-1, -2, 16));
 
         TextView info = new TextView(this);
-        info.setText("“恢复系统默认 UID”不会写入新的 UID。若恢复后 UID 仍不变，可先使用只读扫描功能查找手机原厂 NFC 配置中的 NFCID1 / LA_NFCID1 候选值。");
+        info.setText("当前硬件属性已确认是 ST_NFC。下面的扫描只读取 ST HAL 配置，重点定位 NFC-A Listen 参数 0x30/0x31/0x32/0x33 及 NFCID1 候选值，不写入任何 NFC 数据。");
         info.setTextSize(15);
         root.addView(info, lp(-1, -2, 20));
 
@@ -60,7 +60,7 @@ public final class SystemDefaultLauncherActivity extends AppCompatActivity {
         root.addView(openMain, lp(-1, dp(52), 12));
 
         scanConfigButton = new Button(this);
-        scanConfigButton.setText("扫描手机原厂 NFC UID 配置（只读）");
+        scanConfigButton.setText("解析 ST 原厂 NFCID1（只读）");
         scanConfigButton.setOnClickListener(v -> scanFactoryNfcConfig());
         root.addView(scanConfigButton, lp(-1, dp(52), 12));
 
@@ -78,31 +78,52 @@ public final class SystemDefaultLauncherActivity extends AppCompatActivity {
             return;
         }
         setActionButtonsEnabled(false);
-        Toast.makeText(this, "正在只读扫描原厂 NFC 配置…", Toast.LENGTH_SHORT).show();
+        Toast.makeText(this, "正在只读解析 ST NFC 配置…", Toast.LENGTH_SHORT).show();
 
         new Thread(() -> {
             String command =
                     "set +e\n" +
-                    "echo '=== NFC hardware properties ==='\n" +
-                    "getprop ro.hardware.nfc\n" +
-                    "getprop ro.boot.hardware\n" +
+                    "echo '=== NFC hardware ==='\n" +
+                    "echo -n 'ro.hardware.nfc='; getprop ro.hardware.nfc\n" +
+                    "echo -n 'ro.boot.hardware='; getprop ro.boot.hardware\n" +
                     "echo\n" +
-                    "echo '=== NFC config files ==='\n" +
-                    "FILES=$(find /system /vendor /odm /product -type f 2>/dev/null | grep -Ei '/[^/]*nfc[^/]*\\.(conf|cfg)$' | sort -u)\n" +
-                    "echo \"$FILES\"\n" +
+                    "echo '=== ST HAL files ==='\n" +
+                    "STFILES=$(find /vendor /odm /system /product -type f 2>/dev/null | grep -Ei '/libnfc-hal-st[^/]*\\.(conf|cfg)$' | sort -u)\n" +
+                    "if [ -z \"$STFILES\" ]; then echo '(none found)'; else echo \"$STFILES\"; fi\n" +
                     "echo\n" +
-                    "echo '=== Candidate NFCID1 / NCI config lines ==='\n" +
-                    "for f in $FILES; do\n" +
-                    "  m=$(grep -Ein 'LA_NFCID1|NFCID1|NXP_CORE_CONF|0[xX]?33' \"$f\" 2>/dev/null | head -n 80)\n" +
+                    "echo '=== Generic ST config link / metadata ==='\n" +
+                    "ls -l /vendor/etc/libnfc-hal-st.conf 2>/dev/null\n" +
+                    "stat /vendor/etc/libnfc-hal-st.conf 2>/dev/null | head -n 8\n" +
+                    "echo\n" +
+                    "echo '=== NFC-related properties / init hints ==='\n" +
+                    "getprop | grep -Ei '(^|[._])(nfc|stnfc|st21|st54|sn[0-9])([._]|$)' | head -n 120\n" +
+                    "echo\n" +
+                    "echo '=== Direct NFCID1 / Listen-A text matches ==='\n" +
+                    "for f in $STFILES; do\n" +
+                    "  m=$(grep -Ein -C 4 'LA_NFCID1|NFCID1|LISTEN|POLL|NCI|RF_PARAM|RF_CONFIG' \"$f\" 2>/dev/null | head -n 180)\n" +
+                    "  if [ -n \"$m\" ]; then echo \"--- $f ---\"; echo \"$m\"; fi\n" +
+                    "done\n" +
+                    "echo\n" +
+                    "echo '=== Raw 0x30..0x33 candidate lines ==='\n" +
+                    "for f in $STFILES; do\n" +
+                    "  m=$(grep -Ein -C 5 '(^|[^0-9A-Fa-f])(0[xX])?(30|31|32|33)([^0-9A-Fa-f]|$)' \"$f\" 2>/dev/null | head -n 220)\n" +
+                    "  if [ -n \"$m\" ]; then echo \"--- $f ---\"; echo \"$m\"; fi\n" +
+                    "done\n" +
+                    "echo\n" +
+                    "echo '=== Compact hex-array candidates containing 30/31/32/33 ==='\n" +
+                    "for f in $STFILES; do\n" +
+                    "  m=$(grep -Ein '[{=].*(30|31|32|33)[, }]' \"$f\" 2>/dev/null | head -n 120)\n" +
                     "  if [ -n \"$m\" ]; then echo \"--- $f ---\"; echo \"$m\"; fi\n" +
                     "done\n";
 
             RootShell.Result result = RootShell.execute(command);
             String report = result.output();
-            if (report == null || report.isBlank()) report = "未找到候选配置，或 Root 无法读取这些目录。\n" + result.describe();
+            if (report == null || report.isBlank()) {
+                report = "未找到 ST 配置，或 Root 无法读取相关目录。\n" + result.describe();
+            }
 
             String finalReport = report;
-            AppLogger.i("UID", "原厂 NFC 配置只读扫描完成: success=" + result.success());
+            AppLogger.i("UID", "ST 原厂 NFCID1 只读解析完成: success=" + result.success());
             operationRunning.set(false);
             runOnUiThread(() -> {
                 setActionButtonsEnabled(true);
@@ -113,12 +134,12 @@ public final class SystemDefaultLauncherActivity extends AppCompatActivity {
                 android.widget.ScrollView scroll = new android.widget.ScrollView(this);
                 scroll.addView(view);
                 new android.app.AlertDialog.Builder(this)
-                        .setTitle("原厂 NFC 配置扫描结果")
+                        .setTitle("ST 原厂 NFCID1 解析结果")
                         .setView(scroll)
                         .setPositiveButton("关闭", null)
                         .show();
             });
-        }, "scan-oem-nfc-config").start();
+        }, "scan-st-nfc-config").start();
     }
 
     private void confirmRestore() {
@@ -164,7 +185,7 @@ public final class SystemDefaultLauncherActivity extends AppCompatActivity {
                 setActionButtonsEnabled(true);
                 if (result.success()) {
                     Toast.makeText(this,
-                            "已清除 UID 模拟配置并重启 NFC；若 UID 仍不变，请先运行原厂配置扫描",
+                            "已清除 UID 模拟配置并重启 NFC；若 UID 仍不变，请运行 ST 原厂 NFCID1 解析",
                             Toast.LENGTH_LONG).show();
                 } else {
                     Toast.makeText(this,
