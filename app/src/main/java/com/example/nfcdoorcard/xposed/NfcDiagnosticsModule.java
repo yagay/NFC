@@ -52,6 +52,10 @@ public class NfcDiagnosticsModule extends XposedModule {
             installServiceTraceHook(nfcService, "clearListenTech", boolean.class);
             installServiceTraceHook(nfcService, "getNfcPollTech");
             installServiceTraceHook(nfcService, "saveNfcPollTech", int.class);
+
+            // Exact signatures vary between NFC framework builds, so discover these by name only.
+            installNamedTraceHooks(nfcService, "restoreSavedTech");
+            installNamedTraceHooks(nfcService, "setDiscoveryTech");
         } else {
             warn("NFC-TRACE NfcService class unavailable");
         }
@@ -152,6 +156,18 @@ public class NfcDiagnosticsModule extends XposedModule {
         installTraceHook(serviceClass, methodName, parameterTypes);
     }
 
+    private void installNamedTraceHooks(Class<?> runtime, String methodName) {
+        int found = 0;
+        for (Method method : runtime.getDeclaredMethods()) {
+            if (!methodName.equals(method.getName())) continue;
+            found++;
+            installTraceHook(runtime, methodName, method.getParameterTypes());
+        }
+        if (found == 0) {
+            info("NFC-TRACE named method absent: " + runtime.getName() + "." + methodName);
+        }
+    }
+
     private void installTraceHook(Class<?> runtime, String methodName, Class<?>... parameterTypes) {
         String key = runtime.getName() + "#" + methodName + Arrays.toString(parameterTypes);
         synchronized (installedTraceHooks) {
@@ -161,11 +177,22 @@ public class NfcDiagnosticsModule extends XposedModule {
         try {
             Method method = runtime.getDeclaredMethod(methodName, parameterTypes);
             hook(method).intercept(chain -> {
+                Object thisObject = chain.getThisObject();
                 String args = summarizeArgs(chain.getArgs().toArray());
                 info("NFC-TRACE ENTER " + runtime.getSimpleName() + "." + methodName + " args=" + args);
+                if ("restoreSavedTech".equals(methodName)) {
+                    logServiceTechFields(thisObject, "BEFORE");
+                }
+                logDiscoveryMasks(methodName, chain.getArgs().toArray());
                 logShortStack(methodName);
                 try {
                     Object result = chain.proceed();
+                    if ("restoreSavedTech".equals(methodName)) {
+                        logServiceTechFields(thisObject, "AFTER");
+                    }
+                    if (result instanceof Integer) {
+                        logIntBreakdown(methodName + ".result", (Integer) result);
+                    }
                     info("NFC-TRACE RETURN " + runtime.getSimpleName() + "." + methodName
                             + " result=" + summarizeValue(result));
                     return result;
@@ -184,6 +211,58 @@ public class NfcDiagnosticsModule extends XposedModule {
         } catch (Throwable t) {
             warn("NFC-TRACE hook failed: " + runtime.getName() + "." + methodName
                     + " / " + t.getClass().getSimpleName(), t);
+        }
+    }
+
+    private void logDiscoveryMasks(String methodName, Object[] args) {
+        String lower = methodName.toLowerCase(Locale.ROOT);
+        if (!lower.contains("discoverytech") && !lower.contains("listentech") && !lower.contains("polltech")) {
+            return;
+        }
+        for (int i = 0; i < args.length; i++) {
+            if (args[i] instanceof Integer) {
+                logIntBreakdown(methodName + ".arg" + i, (Integer) args[i]);
+            }
+        }
+    }
+
+    private void logIntBreakdown(String label, int value) {
+        int high2 = value & 0xC0000000;
+        int middle = value & 0x3FFFFF00;
+        int low8 = value & 0x000000FF;
+        info("NFC-TRACE MASK " + label
+                + " raw=0x" + hex8(value)
+                + " high2=0x" + hex8(high2)
+                + " middle=0x" + hex8(middle)
+                + " low8=0x" + hex8(low8));
+    }
+
+    private void logServiceTechFields(Object service, String phase) {
+        if (service == null) return;
+        int emitted = 0;
+        Class<?> cursor = service.getClass();
+        while (cursor != null && cursor != Object.class && emitted < 12) {
+            for (Field field : cursor.getDeclaredFields()) {
+                if (emitted >= 12) break;
+                String name = field.getName().toLowerCase(Locale.ROOT);
+                boolean relevant = name.contains("tech") && (name.contains("poll") || name.contains("listen"));
+                if (!relevant) continue;
+                try {
+                    field.setAccessible(true);
+                    Object value = field.get(service);
+                    info("NFC-TRACE STATE " + phase + " " + field.getName() + "=" + summarizeValue(value));
+                    if (value instanceof Integer) {
+                        logIntBreakdown("STATE." + phase + "." + field.getName(), (Integer) value);
+                    }
+                    emitted++;
+                } catch (Throwable t) {
+                    info("NFC-TRACE STATE " + phase + " " + field.getName() + "=<unreadable>");
+                }
+            }
+            cursor = cursor.getSuperclass();
+        }
+        if (emitted == 0) {
+            info("NFC-TRACE STATE " + phase + " no poll/listen tech fields found");
         }
     }
 
@@ -211,6 +290,10 @@ public class NfcDiagnosticsModule extends XposedModule {
         }
         if (value instanceof String) return "String[len=" + ((String) value).length() + "]";
         return value.getClass().getName();
+    }
+
+    private String hex8(int value) {
+        return String.format(Locale.ROOT, "%08X", value);
     }
 
     private void logShortStack(String methodName) {
