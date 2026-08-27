@@ -50,6 +50,8 @@ public class NfcDiagnosticsModule extends XposedModule {
             installServiceTraceHook(nfcService, "getNfcListenTech");
             installServiceTraceHook(nfcService, "saveNfcListenTech", int.class);
             installServiceTraceHook(nfcService, "clearListenTech", boolean.class);
+            installServiceTraceHook(nfcService, "getNfcPollTech");
+            installServiceTraceHook(nfcService, "saveNfcPollTech", int.class);
         } else {
             warn("NFC-TRACE NfcService class unavailable");
         }
@@ -138,6 +140,12 @@ public class NfcDiagnosticsModule extends XposedModule {
         installTraceHook(runtime, "changeRfParamsByConfig", byte[].class);
         installTraceHook(runtime, "doWriteData", byte[].class, byte[].class);
         installTraceHook(runtime, "nativeSendRawVendorCmd", int.class, int.class, int.class, byte[].class);
+
+        // Follow the normal discovery configuration path without modifying it.
+        installTraceHook(runtime, "setDiscoveryTech", int.class, int.class);
+        installTraceHook(runtime, "resetDiscoveryTech");
+        installTraceHook(runtime, "restartRfDiscovery");
+        installTraceHook(runtime, "doRestartRFDiscovery");
     }
 
     private void installServiceTraceHook(Class<?> serviceClass, String methodName, Class<?>... parameterTypes) {
@@ -195,6 +203,10 @@ public class NfcDiagnosticsModule extends XposedModule {
         if (value instanceof int[]) return "int[len=" + ((int[]) value).length + "]";
         if (value instanceof boolean[]) return "boolean[len=" + ((boolean[]) value).length + "]";
         if (value instanceof Number || value instanceof Boolean || value instanceof Character) {
+            if (value instanceof Integer) {
+                int v = (Integer) value;
+                return v + "(0x" + Integer.toHexString(v).toUpperCase(Locale.ROOT) + ")";
+            }
             return String.valueOf(value);
         }
         if (value instanceof String) return "String[len=" + ((String) value).length() + "]";
