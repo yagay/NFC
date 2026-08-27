@@ -9,56 +9,47 @@ import java.util.Locale;
 public class AppLogger {
     private static final LinkedList<String> logList = new LinkedList<>();
     private static final int MAX_LOGS = 150;
-    private static OnLogUpdateListener listener;
+    private static volatile OnLogUpdateListener listener;
 
     public interface OnLogUpdateListener {
         void onLogUpdate(String allLogs);
     }
 
-    public static void i(String tag, String msg) {
-        addLog("I", tag, msg);
-        Log.i(tag, msg);
-    }
+    public static void i(String tag, String msg) { addLog("I", tag, msg); Log.i(tag, msg); }
+    public static void w(String tag, String msg) { addLog("W", tag, msg); Log.w(tag, msg); }
+    public static void e(String tag, String msg) { addLog("E", tag, msg); Log.e(tag, msg); }
 
-    public static void w(String tag, String msg) {
-        addLog("W", tag, msg);
-        Log.w(tag, msg);
-    }
-
-    public static void e(String tag, String msg) {
-        addLog("E", tag, msg);
-        Log.e(tag, msg);
-    }
-
-    private static synchronized void addLog(String level, String tag, String msg) {
-        String time = new SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(new Date());
-        String entry = String.format("[%s] %s/%s: %s", time, level, tag, msg);
-        logList.addFirst(entry);
-        if (logList.size() > MAX_LOGS) logList.removeLast();
-        if (listener != null) {
-            StringBuilder sb = new StringBuilder();
-            for (String s : logList) {
-                sb.append(s).append("\n");
-            }
-            listener.onLogUpdate(sb.toString());
+    private static void addLog(String level, String tag, String msg) {
+        OnLogUpdateListener target;
+        String snapshot;
+        synchronized (logList) {
+            String time = new SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(new Date());
+            logList.addFirst(String.format("[%s] %s/%s: %s", time, level, tag, msg));
+            if (logList.size() > MAX_LOGS) logList.removeLast();
+            target = listener;
+            snapshot = target == null ? null : snapshotLocked();
         }
+        if (target != null) target.onLogUpdate(snapshot);
     }
 
     public static void setListener(OnLogUpdateListener l) {
         listener = l;
         if (l != null) {
-            StringBuilder sb = new StringBuilder();
-            synchronized (logList) {
-                for (String s : logList) sb.append(s).append("\n");
-            }
-            l.onLogUpdate(sb.toString());
+            String snapshot;
+            synchronized (logList) { snapshot = snapshotLocked(); }
+            l.onLogUpdate(snapshot);
         }
     }
 
     public static void clear() {
-        synchronized (logList) {
-            logList.clear();
-        }
-        if (listener != null) listener.onLogUpdate("");
+        synchronized (logList) { logList.clear(); }
+        OnLogUpdateListener target = listener;
+        if (target != null) target.onLogUpdate("");
+    }
+
+    private static String snapshotLocked() {
+        StringBuilder sb = new StringBuilder();
+        for (String s : logList) sb.append(s).append('\n');
+        return sb.toString();
     }
 }
