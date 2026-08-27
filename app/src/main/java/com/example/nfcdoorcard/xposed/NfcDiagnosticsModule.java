@@ -5,7 +5,12 @@ import android.database.Cursor;
 import android.net.Uri;
 import android.util.Log;
 
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
+import java.util.Arrays;
+import java.util.Locale;
 
 import io.github.libxposed.api.XposedModule;
 import io.github.libxposed.api.XposedModuleInterface;
@@ -14,6 +19,9 @@ import io.github.libxposed.api.XposedModuleInterface;
 public class NfcDiagnosticsModule extends XposedModule {
     private static final String TAG = "NfcUIDSim";
     private static final Uri CONFIG_URI = Uri.parse("content://com.example.nfcdoorcard.uidconfig/target");
+    private static final String[] SCAN_KEYWORDS = {
+            "uid", "config", "nci", "rf", "discover", "routing", "listen", "poll", "set", "write"
+    };
 
     @Override
     public void onPackageLoaded(XposedModuleInterface.PackageLoadedParam lp) {
@@ -49,6 +57,7 @@ public class NfcDiagnosticsModule extends XposedModule {
 
             Log.i(TAG, "NativeNfcManager.doInitialize hook installed");
             reportKnownVendorSignature(nativeManager);
+            scanNfcBackend(cl, nativeManager);
         } catch (ClassNotFoundException e) {
             Log.w(TAG, "NativeNfcManager class not found on this NFC stack", e);
         } catch (NoSuchMethodException e) {
@@ -97,5 +106,94 @@ public class NfcDiagnosticsModule extends XposedModule {
         } catch (Throwable t) {
             Log.w(TAG, "Unable to inspect known vendor NFC signature", t);
         }
+    }
+
+    private void scanNfcBackend(ClassLoader cl, Class<?> nativeManager) {
+        Log.i(TAG, "NFC backend scan begin; diagnostics only, no vendor method will be invoked");
+        scanClass(nativeManager);
+
+        String[] candidates = {
+                "com.android.nfc.NfcService",
+                "com.android.nfc.DeviceHost",
+                "com.android.nfc.dhimpl.NativeNfcManager",
+                "com.android.nfc.dhimpl.NativeNfcTag",
+                "com.android.nfc.cardemulation.CardEmulationManager",
+                "com.android.nfc.cardemulation.RegisteredAidCache",
+                "com.android.nfc.cardemulation.RegisteredNfcFServicesCache"
+        };
+
+        for (String className : candidates) {
+            if (className.equals(nativeManager.getName())) continue;
+            try {
+                scanClass(cl.loadClass(className));
+            } catch (ClassNotFoundException ignored) {
+                Log.d(TAG, "NFC backend class absent: " + className);
+            } catch (Throwable t) {
+                Log.w(TAG, "NFC backend class scan failed: " + className + " / " + t.getClass().getSimpleName());
+            }
+        }
+        Log.i(TAG, "NFC backend scan end");
+    }
+
+    private void scanClass(Class<?> clazz) {
+        try {
+            int methodMatches = 0;
+            for (Method method : clazz.getDeclaredMethods()) {
+                if (!matchesKeyword(method.getName())) continue;
+                methodMatches++;
+                Log.i(TAG, "NFC-SCAN METHOD " + formatMethod(method));
+            }
+
+            int fieldMatches = 0;
+            for (Field field : clazz.getDeclaredFields()) {
+                if (!matchesKeyword(field.getName())) continue;
+                fieldMatches++;
+                Log.i(TAG, "NFC-SCAN FIELD " + formatField(field));
+            }
+
+            if (methodMatches > 0 || fieldMatches > 0) {
+                for (Constructor<?> constructor : clazz.getDeclaredConstructors()) {
+                    Log.d(TAG, "NFC-SCAN CTOR " + formatConstructor(constructor));
+                }
+                Log.i(TAG, "NFC-SCAN CLASS " + clazz.getName()
+                        + " matches: methods=" + methodMatches + ", fields=" + fieldMatches);
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "Unable to scan NFC class " + clazz.getName(), t);
+        }
+    }
+
+    private boolean matchesKeyword(String name) {
+        String lower = name.toLowerCase(Locale.ROOT);
+        for (String keyword : SCAN_KEYWORDS) {
+            if (lower.contains(keyword)) return true;
+        }
+        return false;
+    }
+
+    private String formatMethod(Method method) {
+        return Modifier.toString(method.getModifiers()) + " "
+                + method.getReturnType().getTypeName() + " "
+                + method.getDeclaringClass().getName() + "." + method.getName()
+                + "(" + joinTypes(method.getParameterTypes()) + ")";
+    }
+
+    private String formatField(Field field) {
+        return Modifier.toString(field.getModifiers()) + " "
+                + field.getType().getTypeName() + " "
+                + field.getDeclaringClass().getName() + "." + field.getName();
+    }
+
+    private String formatConstructor(Constructor<?> constructor) {
+        return Modifier.toString(constructor.getModifiers()) + " "
+                + constructor.getDeclaringClass().getName()
+                + "(" + joinTypes(constructor.getParameterTypes()) + ")";
+    }
+
+    private String joinTypes(Class<?>[] types) {
+        return Arrays.stream(types)
+                .map(Class::getTypeName)
+                .reduce((a, b) -> a + ", " + b)
+                .orElse("");
     }
 }
