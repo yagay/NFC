@@ -10,79 +10,23 @@ import io.github.libxposed.api.XposedModuleInterface;
 /**
  * LSPosed/libxposed API 102 diagnostics module.
  *
- * The module deliberately keeps device-specific NFC controller writes disabled until
- * the target NFC stack has been identified. It provides reliable module/self diagnostics
- * and confirms that the Android NFC service hook is installed and executed.
+ * This module intentionally does not write controller-specific NFC configuration.
+ * It only confirms that the Android NFC service target was loaded and that
+ * NativeNfcManager.doInitialize() can be observed on the current NFC stack.
  */
 public class NfcDiagnosticsModule extends XposedModule {
 
     private static final String TAG = "NfcUIDSim";
-
-    private static volatile boolean nfcHookInstalled;
-    private static volatile boolean nfcInitializeObserved;
-    private static volatile String lastNfcState = "LSPosed active; NFC service not observed yet";
 
     @Override
     public void onPackageLoaded(XposedModuleInterface.PackageLoadedParam lp) {
         super.onPackageLoaded(lp);
 
         String packageName = lp.getPackageName();
-        Log.i(TAG, "LSPosed loaded package: " + packageName);
+        if (!"com.android.nfc".equals(packageName)) return;
 
-        if ("com.example.nfcdoorcard".equals(packageName)) {
-            installAppHooks(lp);
-            return;
-        }
-
-        if ("com.android.nfc".equals(packageName)) {
-            installNfcServiceHooks(lp);
-        }
-    }
-
-    private void installAppHooks(XposedModuleInterface.PackageLoadedParam lp) {
-        try {
-            ClassLoader cl = lp.getDefaultClassLoader();
-            Class<?> mainActivity = cl.loadClass("com.example.nfcdoorcard.MainActivity");
-
-            hookStaticBooleanMethod(mainActivity, "isModuleLoaded");
-            hookHardwareStatusMethod(mainActivity);
-
-            Log.i(TAG, "App diagnostics hooks installed");
-        } catch (Throwable t) {
-            Log.e(TAG, "Failed to install app diagnostics hooks", t);
-        }
-    }
-
-    private void hookStaticBooleanMethod(Class<?> owner, String methodName) {
-        try {
-            Method method = owner.getDeclaredMethod(methodName);
-            deoptimize(method);
-            hook(method).intercept(chain -> true);
-            Log.i(TAG, methodName + " hook installed");
-        } catch (NoSuchMethodException e) {
-            Log.w(TAG, methodName + " is not present in this app build");
-        }
-    }
-
-    private void hookHardwareStatusMethod(Class<?> mainActivity) {
-        try {
-            Method method = mainActivity.getDeclaredMethod("getHardwareActualUid");
-            deoptimize(method);
-            hook(method).intercept(chain -> currentHardwareStatus());
-            Log.i(TAG, "getHardwareActualUid hook installed");
-        } catch (NoSuchMethodException e) {
-            Log.w(TAG, "getHardwareActualUid is not present in this app build");
-        }
-    }
-
-    private String currentHardwareStatus() {
-        if (nfcInitializeObserved) {
-            return lastNfcState;
-        }
-        if (nfcHookInstalled) {
-            return "NFC hook installed; waiting for doInitialize";
-        }
-        return "LSPosed active; NFC service scope not observed";
+        Log.i(TAG, "LSPosed loaded NFC target: " + packageName);
+        installNfcServiceHooks(lp);
     }
 
     private void installNfcServiceHooks(XposedModuleInterface.PackageLoadedParam lp) {
@@ -94,46 +38,32 @@ public class NfcDiagnosticsModule extends XposedModule {
             deoptimize(initMethod);
             hook(initMethod).intercept(chain -> {
                 Object result = chain.proceed();
-                nfcInitializeObserved = true;
-
                 if (result instanceof Boolean) {
-                    boolean ok = (Boolean) result;
-                    lastNfcState = ok
-                            ? "NFC doInitialize observed: success"
-                            : "NFC doInitialize observed: failed";
+                    Log.i(TAG, "NFC doInitialize observed: " + ((Boolean) result ? "success" : "failed"));
                 } else {
-                    lastNfcState = "NFC doInitialize observed; return=" + String.valueOf(result);
+                    Log.i(TAG, "NFC doInitialize observed; return=" + String.valueOf(result));
                 }
-
-                Log.i(TAG, lastNfcState);
                 return result;
             });
 
-            nfcHookInstalled = true;
-            lastNfcState = "NFC hook installed; waiting for doInitialize";
             Log.i(TAG, "NativeNfcManager.doInitialize hook installed");
-
             reportVendorBackend(nativeManager);
         } catch (ClassNotFoundException e) {
-            lastNfcState = "NativeNfcManager class not found on this NFC stack";
-            Log.w(TAG, lastNfcState, e);
+            Log.w(TAG, "NativeNfcManager class not found on this NFC stack", e);
         } catch (NoSuchMethodException e) {
-            lastNfcState = "NativeNfcManager.doInitialize not found on this NFC stack";
-            Log.w(TAG, lastNfcState, e);
+            Log.w(TAG, "NativeNfcManager.doInitialize not found on this NFC stack", e);
         } catch (Throwable t) {
-            lastNfcState = "NFC hook installation failed: " + t.getClass().getSimpleName();
-            Log.e(TAG, lastNfcState, t);
+            Log.e(TAG, "NFC hook installation failed: " + t.getClass().getSimpleName(), t);
         }
     }
 
     /**
-     * Only reports whether the prototype's vendor-specific method exists.
-     * It does not invoke that method because its semantics are not portable across NFC HALs.
+     * Only reports whether the prototype vendor method exists. It is never invoked.
      */
     private void reportVendorBackend(Class<?> nativeManager) {
         try {
             nativeManager.getDeclaredMethod("doWriteNciConfig", int.class, byte[].class);
-            Log.i(TAG, "Vendor method doWriteNciConfig(int, byte[]) is present; write disabled pending device mapping");
+            Log.i(TAG, "Vendor method doWriteNciConfig(int, byte[]) is present; writes remain disabled");
         } catch (NoSuchMethodException e) {
             Log.i(TAG, "Vendor method doWriteNciConfig(int, byte[]) is absent");
         } catch (Throwable t) {
