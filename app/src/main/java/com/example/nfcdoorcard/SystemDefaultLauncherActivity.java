@@ -24,6 +24,7 @@ public final class SystemDefaultLauncherActivity extends AppCompatActivity {
     private final AtomicBoolean operationRunning = new AtomicBoolean(false);
     private Button restoreButton;
     private Button scanConfigButton;
+    private Button dataNfcButton;
 
     private SharedPreferences simulationPrefs() {
         return createDeviceProtectedStorageContext()
@@ -54,7 +55,7 @@ public final class SystemDefaultLauncherActivity extends AppCompatActivity {
         root.addView(title, lp(-1, -2, 16));
 
         TextView info = new TextView(this);
-        info.setText("一键定位功能只读检查系统/厂商 NFC 配置、ST HAL 文件 hash/时间、挂载状态、KernelSU/Magisk 模块覆盖和旧版属性，用来判断固定 UID 更像来自文件覆盖还是 NFC Controller 持久配置。不会写入 NFC。\n\n恢复系统默认 UID 会清除新旧版本保存的 UID 请求和旧版 persist.nfcuidsim 属性，再重启 NFC；不会写入新的 UID。");
+        info.setText("一键定位功能只读检查系统/厂商 NFC 配置、ST HAL 文件 hash/时间、挂载状态、KernelSU/Magisk 模块覆盖和旧版属性。\n\n/data/nfc 分析会只读列出该目录的文件树、大小、修改时间、SHA-256、可疑文本和小文件十六进制预览，用来判断固定 UID 是否保存在 Android NFC 持久状态里。\n\n恢复系统默认 UID 只清除 App/旧属性并重启 NFC，不写入新的 UID。");
         info.setTextSize(15);
         root.addView(info, lp(-1, -2, 20));
 
@@ -68,12 +69,84 @@ public final class SystemDefaultLauncherActivity extends AppCompatActivity {
         scanConfigButton.setOnClickListener(v -> scanFactoryNfcConfig());
         root.addView(scanConfigButton, lp(-1, dp(52), 12));
 
+        dataNfcButton = new Button(this);
+        dataNfcButton.setText("一键分析 /data/nfc 持久状态（只读）");
+        dataNfcButton.setOnClickListener(v -> analyzeDataNfc());
+        root.addView(dataNfcButton, lp(-1, dp(52), 12));
+
         restoreButton = new Button(this);
         restoreButton.setText("恢复系统默认 UID");
         restoreButton.setOnClickListener(v -> confirmRestore());
         root.addView(restoreButton, lp(-1, dp(52), 12));
 
         return root;
+    }
+
+    private void analyzeDataNfc() {
+        if (!operationRunning.compareAndSet(false, true)) {
+            Toast.makeText(this, "NFC 操作正在执行", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        setActionButtonsEnabled(false);
+        Toast.makeText(this, "正在只读分析 /data/nfc…", Toast.LENGTH_SHORT).show();
+
+        new Thread(() -> {
+            String command =
+                    "set +e\n" +
+                    "echo '=== 1. /data/nfc directory ==='\n" +
+                    "ls -ld /data/nfc 2>/dev/null || echo '(missing or unreadable)'\n" +
+                    "echo\n" +
+                    "echo '=== 2. File tree / metadata ==='\n" +
+                    "find /data/nfc -maxdepth 4 -type f -print0 2>/dev/null | while IFS= read -r -d '' f; do\n" +
+                    "  echo \"--- $f ---\"\n" +
+                    "  stat -c 'mode=%A uid=%u gid=%g size=%s mtime=%y' \"$f\" 2>/dev/null\n" +
+                    "  sha256sum \"$f\" 2>/dev/null\n" +
+                    "done\n" +
+                    "echo\n" +
+                    "echo '=== 3. Recently modified files ==='\n" +
+                    "find /data/nfc -maxdepth 4 -type f -printf '%TY-%Tm-%Td %TH:%TM:%TS %s %p\\n' 2>/dev/null | sort -r | head -n 120\n" +
+                    "echo\n" +
+                    "echo '=== 4. Text clues: UID / NFCID / NCI / config ==='\n" +
+                    "grep -RInaE 'LA_NFCID1|NFCID1|NFCID|UID|NCI|RF_PARAM|RF_CONFIG|listen|poll|config' /data/nfc 2>/dev/null | head -n 260\n" +
+                    "echo\n" +
+                    "echo '=== 5. Printable strings from small files ==='\n" +
+                    "find /data/nfc -maxdepth 4 -type f -size -256k -print0 2>/dev/null | while IFS= read -r -d '' f; do\n" +
+                    "  echo \"--- $f ---\"\n" +
+                    "  strings \"$f\" 2>/dev/null | grep -Ei 'nfcid|uid|nci|listen|poll|rf|config|param' | head -n 80\n" +
+                    "done\n" +
+                    "echo\n" +
+                    "echo '=== 6. Hex preview of small files (first 256 bytes) ==='\n" +
+                    "find /data/nfc -maxdepth 4 -type f -size -64k -print0 2>/dev/null | while IFS= read -r -d '' f; do\n" +
+                    "  echo \"--- $f ---\"\n" +
+                    "  if command -v xxd >/dev/null 2>&1; then xxd -g 1 -l 256 \"$f\" 2>/dev/null; else od -An -tx1 -N256 \"$f\" 2>/dev/null; fi\n" +
+                    "done\n" +
+                    "echo\n" +
+                    "echo '=== 7. NFA storage references from ROM config ==='\n" +
+                    "grep -RinE '^NFA_STORAGE|/data/nfc' /vendor/etc /odm/etc /system/etc /product/etc 2>/dev/null | head -n 120\n" +
+                    "echo\n" +
+                    "echo '=== 8. Automatic hint ==='\n" +
+                    "COUNT=$(find /data/nfc -maxdepth 4 -type f 2>/dev/null | wc -l)\n" +
+                    "echo \"files=$COUNT\"\n" +
+                    "if [ \"$COUNT\" -eq 0 ]; then\n" +
+                    "  echo 'RESULT: /data/nfc contains no readable persistent files. If the fixed UID still remains, Controller/NVM persistence becomes more likely.'\n" +
+                    "else\n" +
+                    "  echo 'RESULT: /data/nfc contains persistent NFC files. Compare recent mtimes and hex/string clues; do not delete anything yet.'\n" +
+                    "fi\n";
+
+            RootShell.Result result = RootShell.execute(command);
+            String report = result.output();
+            if (report == null || report.isBlank()) {
+                report = "Root 扫描没有返回内容。\n" + result.describe();
+            }
+
+            String finalReport = report;
+            AppLogger.i("UID", "/data/nfc 持久状态只读分析完成: success=" + result.success());
+            operationRunning.set(false);
+            runOnUiThread(() -> {
+                setActionButtonsEnabled(true);
+                showReport("/data/nfc 持久状态分析", finalReport);
+            });
+        }, "analyze-data-nfc").start();
     }
 
     private void scanFactoryNfcConfig() {
@@ -163,19 +236,23 @@ public final class SystemDefaultLauncherActivity extends AppCompatActivity {
             operationRunning.set(false);
             runOnUiThread(() -> {
                 setActionButtonsEnabled(true);
-                TextView view = new TextView(this);
-                view.setText(finalReport);
-                view.setTextIsSelectable(true);
-                view.setPadding(dp(16), dp(8), dp(16), dp(8));
-                android.widget.ScrollView scroll = new android.widget.ScrollView(this);
-                scroll.addView(view);
-                new android.app.AlertDialog.Builder(this)
-                        .setTitle("UID 持久位置诊断结果")
-                        .setView(scroll)
-                        .setPositiveButton("关闭", null)
-                        .show();
+                showReport("UID 持久位置诊断结果", finalReport);
             });
         }, "diagnose-uid-persistence").start();
+    }
+
+    private void showReport(String title, String report) {
+        TextView view = new TextView(this);
+        view.setText(report);
+        view.setTextIsSelectable(true);
+        view.setPadding(dp(16), dp(8), dp(16), dp(8));
+        android.widget.ScrollView scroll = new android.widget.ScrollView(this);
+        scroll.addView(view);
+        new android.app.AlertDialog.Builder(this)
+                .setTitle(title)
+                .setView(scroll)
+                .setPositiveButton("关闭", null)
+                .show();
     }
 
     private void confirmRestore() {
@@ -240,6 +317,7 @@ public final class SystemDefaultLauncherActivity extends AppCompatActivity {
     private void setActionButtonsEnabled(boolean enabled) {
         if (restoreButton != null) restoreButton.setEnabled(enabled);
         if (scanConfigButton != null) scanConfigButton.setEnabled(enabled);
+        if (dataNfcButton != null) dataNfcButton.setEnabled(enabled);
     }
 
     private LinearLayout.LayoutParams lp(int width, int height, int bottomMargin) {
