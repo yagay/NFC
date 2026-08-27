@@ -52,10 +52,7 @@ public class NfcDiagnosticsModule extends XposedModule {
             installServiceTraceHook(nfcService, "clearListenTech", boolean.class);
             installServiceTraceHook(nfcService, "getNfcPollTech");
             installServiceTraceHook(nfcService, "saveNfcPollTech", int.class);
-
-            // Exact signatures vary between NFC framework builds, so discover these by name only.
             installNamedTraceHooks(nfcService, "restoreSavedTech");
-            installNamedTraceHooks(nfcService, "setDiscoveryTech");
         } else {
             warn("NFC-TRACE NfcService class unavailable");
         }
@@ -134,7 +131,6 @@ public class NfcDiagnosticsModule extends XposedModule {
         info("NFC-RUNTIME DeviceHost field=" + hostField);
         info("NFC-RUNTIME DeviceHost class=" + runtime.getName());
         info("NFC-RUNTIME DeviceHost interfaces=" + joinTypes(runtime.getInterfaces()));
-
         installHostTraceHooks(runtime);
         logConfiguredTestRequest();
     }
@@ -144,8 +140,6 @@ public class NfcDiagnosticsModule extends XposedModule {
         installTraceHook(runtime, "changeRfParamsByConfig", byte[].class);
         installTraceHook(runtime, "doWriteData", byte[].class, byte[].class);
         installTraceHook(runtime, "nativeSendRawVendorCmd", int.class, int.class, int.class, byte[].class);
-
-        // Follow the normal discovery configuration path without modifying it.
         installTraceHook(runtime, "setDiscoveryTech", int.class, int.class);
         installTraceHook(runtime, "resetDiscoveryTech");
         installTraceHook(runtime, "restartRfDiscovery");
@@ -163,9 +157,7 @@ public class NfcDiagnosticsModule extends XposedModule {
             found++;
             installTraceHook(runtime, methodName, method.getParameterTypes());
         }
-        if (found == 0) {
-            info("NFC-TRACE named method absent: " + runtime.getName() + "." + methodName);
-        }
+        if (found == 0) info("NFC-TRACE named method absent: " + runtime.getName() + "." + methodName);
     }
 
     private void installTraceHook(Class<?> runtime, String methodName, Class<?>... parameterTypes) {
@@ -178,17 +170,20 @@ public class NfcDiagnosticsModule extends XposedModule {
             Method method = runtime.getDeclaredMethod(methodName, parameterTypes);
             hook(method).intercept(chain -> {
                 Object thisObject = chain.getThisObject();
-                String args = summarizeArgs(chain.getArgs().toArray());
-                info("NFC-TRACE ENTER " + runtime.getSimpleName() + "." + methodName + " args=" + args);
+                Object[] argsArray = chain.getArgs().toArray();
+                info("NFC-TRACE ENTER " + runtime.getSimpleName() + "." + methodName
+                        + " args=" + summarizeArgs(argsArray));
+
                 if ("restoreSavedTech".equals(methodName)) {
-                    logServiceTechFields(thisObject, "BEFORE");
+                    logActualSavedTech(thisObject, "BEFORE");
                 }
-                logDiscoveryMasks(methodName, chain.getArgs().toArray());
+                logDiscoveryMasks(methodName, argsArray);
                 logShortStack(methodName);
+
                 try {
                     Object result = chain.proceed();
                     if ("restoreSavedTech".equals(methodName)) {
-                        logServiceTechFields(thisObject, "AFTER");
+                        logActualSavedTech(thisObject, "AFTER");
                     }
                     if (result instanceof Integer) {
                         logIntBreakdown(methodName + ".result", (Integer) result);
@@ -214,15 +209,35 @@ public class NfcDiagnosticsModule extends XposedModule {
         }
     }
 
+    /** Read the actual framework values through the framework's own read-only getters. */
+    private void logActualSavedTech(Object service, String phase) {
+        Integer poll = invokeIntGetter(service, "getNfcPollTech");
+        Integer listen = invokeIntGetter(service, "getNfcListenTech");
+        info("NFC-TRACE SAVED " + phase
+                + " poll=" + summarizeValue(poll)
+                + " listen=" + summarizeValue(listen));
+        if (poll != null) logIntBreakdown("SAVED." + phase + ".poll", poll);
+        if (listen != null) logIntBreakdown("SAVED." + phase + ".listen", listen);
+    }
+
+    private Integer invokeIntGetter(Object target, String methodName) {
+        if (target == null) return null;
+        try {
+            Method method = target.getClass().getDeclaredMethod(methodName);
+            method.setAccessible(true);
+            Object value = method.invoke(target);
+            return value instanceof Integer ? (Integer) value : null;
+        } catch (Throwable t) {
+            info("NFC-TRACE SAVED unable to read " + methodName + ": " + t.getClass().getSimpleName());
+            return null;
+        }
+    }
+
     private void logDiscoveryMasks(String methodName, Object[] args) {
         String lower = methodName.toLowerCase(Locale.ROOT);
-        if (!lower.contains("discoverytech") && !lower.contains("listentech") && !lower.contains("polltech")) {
-            return;
-        }
+        if (!lower.contains("discoverytech") && !lower.contains("listentech") && !lower.contains("polltech")) return;
         for (int i = 0; i < args.length; i++) {
-            if (args[i] instanceof Integer) {
-                logIntBreakdown(methodName + ".arg" + i, (Integer) args[i]);
-            }
+            if (args[i] instanceof Integer) logIntBreakdown(methodName + ".arg" + i, (Integer) args[i]);
         }
     }
 
@@ -235,35 +250,6 @@ public class NfcDiagnosticsModule extends XposedModule {
                 + " high2=0x" + hex8(high2)
                 + " middle=0x" + hex8(middle)
                 + " low8=0x" + hex8(low8));
-    }
-
-    private void logServiceTechFields(Object service, String phase) {
-        if (service == null) return;
-        int emitted = 0;
-        Class<?> cursor = service.getClass();
-        while (cursor != null && cursor != Object.class && emitted < 12) {
-            for (Field field : cursor.getDeclaredFields()) {
-                if (emitted >= 12) break;
-                String name = field.getName().toLowerCase(Locale.ROOT);
-                boolean relevant = name.contains("tech") && (name.contains("poll") || name.contains("listen"));
-                if (!relevant) continue;
-                try {
-                    field.setAccessible(true);
-                    Object value = field.get(service);
-                    info("NFC-TRACE STATE " + phase + " " + field.getName() + "=" + summarizeValue(value));
-                    if (value instanceof Integer) {
-                        logIntBreakdown("STATE." + phase + "." + field.getName(), (Integer) value);
-                    }
-                    emitted++;
-                } catch (Throwable t) {
-                    info("NFC-TRACE STATE " + phase + " " + field.getName() + "=<unreadable>");
-                }
-            }
-            cursor = cursor.getSuperclass();
-        }
-        if (emitted == 0) {
-            info("NFC-TRACE STATE " + phase + " no poll/listen tech fields found");
-        }
     }
 
     private String summarizeArgs(Object[] args) {
@@ -281,13 +267,11 @@ public class NfcDiagnosticsModule extends XposedModule {
         if (value instanceof byte[]) return "byte[len=" + ((byte[]) value).length + "]";
         if (value instanceof int[]) return "int[len=" + ((int[]) value).length + "]";
         if (value instanceof boolean[]) return "boolean[len=" + ((boolean[]) value).length + "]";
-        if (value instanceof Number || value instanceof Boolean || value instanceof Character) {
-            if (value instanceof Integer) {
-                int v = (Integer) value;
-                return v + "(0x" + Integer.toHexString(v).toUpperCase(Locale.ROOT) + ")";
-            }
-            return String.valueOf(value);
+        if (value instanceof Integer) {
+            int v = (Integer) value;
+            return v + "(0x" + Integer.toHexString(v).toUpperCase(Locale.ROOT) + ")";
         }
+        if (value instanceof Number || value instanceof Boolean || value instanceof Character) return String.valueOf(value);
         if (value instanceof String) return "String[len=" + ((String) value).length() + "]";
         return value.getClass().getName();
     }
@@ -354,10 +338,7 @@ public class NfcDiagnosticsModule extends XposedModule {
     }
 
     private String joinTypes(Class<?>[] types) {
-        return Arrays.stream(types)
-                .map(Class::getTypeName)
-                .reduce((a, b) -> a + ", " + b)
-                .orElse("");
+        return Arrays.stream(types).map(Class::getTypeName).reduce((a, b) -> a + ", " + b).orElse("");
     }
 
     private void info(String message) {
