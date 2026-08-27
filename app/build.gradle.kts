@@ -4,7 +4,7 @@ plugins {
 
 android {
     namespace = "com.example.nfcdoorcard"
-    compileSdk = 37
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.example.nfcdoorcard"
