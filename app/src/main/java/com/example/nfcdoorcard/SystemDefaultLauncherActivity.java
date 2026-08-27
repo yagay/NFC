@@ -88,13 +88,12 @@ public final class SystemDefaultLauncherActivity extends AppCompatActivity {
                     "getprop ro.boot.hardware\n" +
                     "echo\n" +
                     "echo '=== NFC config files ==='\n" +
-                    "find /system /vendor /odm /product -type f \\\n" +
-                    "  \( -iname 'libnfc*.conf' -o -iname '*nfc*.conf' -o -iname '*nfc*.cfg' \) 2>/dev/null | sort -u\n" +
+                    "FILES=$(find /system /vendor /odm /product -type f 2>/dev/null | grep -Ei '/[^/]*nfc[^/]*\\.(conf|cfg)$' | sort -u)\n" +
+                    "echo \"$FILES\"\n" +
                     "echo\n" +
                     "echo '=== Candidate NFCID1 / NCI config lines ==='\n" +
-                    "for f in $(find /system /vendor /odm /product -type f \\\n" +
-                    "  \( -iname 'libnfc*.conf' -o -iname '*nfc*.conf' -o -iname '*nfc*.cfg' \) 2>/dev/null | sort -u); do\n" +
-                    "  m=$(grep -Ein 'LA_NFCID1|NFCID1|NXP_CORE_CONF|(^|[^0-9A-Fa-f])0[xX]?33([^0-9A-Fa-f]|$)' \"$f\" 2>/dev/null | head -n 80)\n" +
+                    "for f in $FILES; do\n" +
+                    "  m=$(grep -Ein 'LA_NFCID1|NFCID1|NXP_CORE_CONF|0[xX]?33' \"$f\" 2>/dev/null | head -n 80)\n" +
                     "  if [ -n \"$m\" ]; then echo \"--- $f ---\"; echo \"$m\"; fi\n" +
                     "done\n";
 
