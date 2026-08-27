@@ -24,10 +24,16 @@ public class NfcDiagnosticsModule extends XposedModule {
     };
 
     @Override
+    public void onModuleLoaded(XposedModuleInterface.ModuleLoadedParam param) {
+        super.onModuleLoaded(param);
+        info("onModuleLoaded process=" + param.getProcessName() + ", api=" + getApiVersion());
+    }
+
+    @Override
     public void onPackageLoaded(XposedModuleInterface.PackageLoadedParam lp) {
         super.onPackageLoaded(lp);
         if (!"com.android.nfc".equals(lp.getPackageName())) return;
-        Log.i(TAG, "LSPosed loaded NFC target: com.android.nfc");
+        info("onPackageLoaded package=com.android.nfc process=" + lp.getProcessName());
         installNfcServiceHooks(lp);
     }
 
@@ -39,31 +45,27 @@ public class NfcDiagnosticsModule extends XposedModule {
 
             deoptimize(initMethod);
             hook(initMethod).intercept(chain -> {
-                Log.i(TAG, "NFC doInitialize entered");
+                info("NFC doInitialize entered");
                 logConfiguredTestRequest();
                 try {
                     Object result = chain.proceed();
-                    if (result instanceof Boolean) {
-                        Log.i(TAG, "NFC doInitialize returned: " + ((Boolean) result ? "success" : "failed"));
-                    } else {
-                        Log.i(TAG, "NFC doInitialize returned: " + String.valueOf(result));
-                    }
+                    info("NFC doInitialize returned: " + String.valueOf(result));
                     return result;
                 } catch (Throwable t) {
-                    Log.e(TAG, "NFC doInitialize threw: " + t.getClass().getName(), t);
+                    error("NFC doInitialize threw: " + t.getClass().getName(), t);
                     throw t;
                 }
             });
 
-            Log.i(TAG, "NativeNfcManager.doInitialize hook installed");
+            info("NativeNfcManager.doInitialize hook installed");
             reportKnownVendorSignature(nativeManager);
             scanNfcBackend(cl, nativeManager);
         } catch (ClassNotFoundException e) {
-            Log.w(TAG, "NativeNfcManager class not found on this NFC stack", e);
+            warn("NativeNfcManager class not found on this NFC stack", e);
         } catch (NoSuchMethodException e) {
-            Log.w(TAG, "NativeNfcManager.doInitialize not found on this NFC stack", e);
+            warn("NativeNfcManager.doInitialize not found on this NFC stack", e);
         } catch (Throwable t) {
-            Log.e(TAG, "NFC hook installation failed: " + t.getClass().getSimpleName(), t);
+            error("NFC hook installation failed: " + t.getClass().getSimpleName(), t);
         }
     }
 
@@ -75,41 +77,40 @@ public class NfcDiagnosticsModule extends XposedModule {
             currentApplication.setAccessible(true);
             Object value = currentApplication.invoke(null);
             if (!(value instanceof Application app)) {
-                Log.w(TAG, "UID config bridge unavailable: currentApplication is null");
+                warn("UID config bridge unavailable: currentApplication is null");
                 return;
             }
 
             cursor = app.getContentResolver().query(CONFIG_URI, null, null, null, null);
             if (cursor == null || !cursor.moveToFirst()) {
-                Log.w(TAG, "UID config bridge returned no row");
+                warn("UID config bridge returned no row");
                 return;
             }
             int uidColumn = cursor.getColumnIndex("uid");
             int activeColumn = cursor.getColumnIndex("active");
             String uid = uidColumn >= 0 ? cursor.getString(uidColumn) : null;
             boolean active = activeColumn >= 0 && cursor.getInt(activeColumn) == 1;
-            Log.i(TAG, "UID test config observed: active=" + active + ", uid=" + (uid == null ? "unset" : uid));
+            info("UID test config observed: active=" + active + ", uid=" + (uid == null ? "unset" : uid));
         } catch (Throwable t) {
-            Log.w(TAG, "Unable to read UID test configuration: " + t.getClass().getSimpleName(), t);
+            warn("Unable to read UID test configuration: " + t.getClass().getSimpleName(), t);
         } finally {
             if (cursor != null) cursor.close();
         }
     }
 
-    /** Checks one known signature only; absence does not imply the controller lacks configuration support. */
     private void reportKnownVendorSignature(Class<?> nativeManager) {
         try {
             nativeManager.getDeclaredMethod("doWriteNciConfig", int.class, byte[].class);
-            Log.i(TAG, "Known vendor signature doWriteNciConfig(int, byte[]) is present; invocation disabled");
+            info("Known vendor signature doWriteNciConfig(int, byte[]) is present; invocation disabled");
         } catch (NoSuchMethodException e) {
-            Log.i(TAG, "Known vendor signature doWriteNciConfig(int, byte[]) not found; other vendor APIs may differ");
+            info("Known vendor signature doWriteNciConfig(int, byte[]) not found; other vendor APIs may differ");
         } catch (Throwable t) {
-            Log.w(TAG, "Unable to inspect known vendor NFC signature", t);
+            warn("Unable to inspect known vendor NFC signature", t);
         }
     }
 
     private void scanNfcBackend(ClassLoader cl, Class<?> nativeManager) {
-        Log.i(TAG, "NFC backend scan begin; diagnostics only, no vendor method will be invoked");
+        info("NFC backend scan begin; diagnostics only, no vendor method will be invoked");
         scanClass(nativeManager);
 
         String[] candidates = {
@@ -127,12 +128,12 @@ public class NfcDiagnosticsModule extends XposedModule {
             try {
                 scanClass(cl.loadClass(className));
             } catch (ClassNotFoundException ignored) {
-                Log.d(TAG, "NFC backend class absent: " + className);
+                debug("NFC backend class absent: " + className);
             } catch (Throwable t) {
-                Log.w(TAG, "NFC backend class scan failed: " + className + " / " + t.getClass().getSimpleName());
+                warn("NFC backend class scan failed: " + className + " / " + t.getClass().getSimpleName());
             }
         }
-        Log.i(TAG, "NFC backend scan end");
+        info("NFC backend scan end");
     }
 
     private void scanClass(Class<?> clazz) {
@@ -141,25 +142,25 @@ public class NfcDiagnosticsModule extends XposedModule {
             for (Method method : clazz.getDeclaredMethods()) {
                 if (!matchesKeyword(method.getName())) continue;
                 methodMatches++;
-                Log.i(TAG, "NFC-SCAN METHOD " + formatMethod(method));
+                info("NFC-SCAN METHOD " + formatMethod(method));
             }
 
             int fieldMatches = 0;
             for (Field field : clazz.getDeclaredFields()) {
                 if (!matchesKeyword(field.getName())) continue;
                 fieldMatches++;
-                Log.i(TAG, "NFC-SCAN FIELD " + formatField(field));
+                info("NFC-SCAN FIELD " + formatField(field));
             }
 
             if (methodMatches > 0 || fieldMatches > 0) {
                 for (Constructor<?> constructor : clazz.getDeclaredConstructors()) {
-                    Log.d(TAG, "NFC-SCAN CTOR " + formatConstructor(constructor));
+                    debug("NFC-SCAN CTOR " + formatConstructor(constructor));
                 }
-                Log.i(TAG, "NFC-SCAN CLASS " + clazz.getName()
+                info("NFC-SCAN CLASS " + clazz.getName()
                         + " matches: methods=" + methodMatches + ", fields=" + fieldMatches);
             }
         } catch (Throwable t) {
-            Log.w(TAG, "Unable to scan NFC class " + clazz.getName(), t);
+            warn("Unable to scan NFC class " + clazz.getName(), t);
         }
     }
 
@@ -195,5 +196,30 @@ public class NfcDiagnosticsModule extends XposedModule {
                 .map(Class::getTypeName)
                 .reduce((a, b) -> a + ", " + b)
                 .orElse("");
+    }
+
+    private void info(String message) {
+        log(Log.INFO, TAG, message);
+        Log.i(TAG, message);
+    }
+
+    private void debug(String message) {
+        log(Log.DEBUG, TAG, message);
+        Log.d(TAG, message);
+    }
+
+    private void warn(String message) {
+        log(Log.WARN, TAG, message);
+        Log.w(TAG, message);
+    }
+
+    private void warn(String message, Throwable t) {
+        log(Log.WARN, TAG, message, t);
+        Log.w(TAG, message, t);
+    }
+
+    private void error(String message, Throwable t) {
+        log(Log.ERROR, TAG, message, t);
+        Log.e(TAG, message, t);
     }
 }
