@@ -12,7 +12,8 @@ Android 12–17 (API 31–37) NFC diagnostics + conservative HCE prototype.
 - Modern libxposed API/service 102 integration.
 - Static LSPosed scope for `com.android.nfc`.
 - `NativeNfcManager.doInitialize()` diagnostic hook only; no controller configuration writes are performed.
-- Device-protected UID test configuration storage exposed through a read-only provider for future authorized diagnostics integration.
+- Device-protected UID test configuration is exposed through a read-only provider; the NFC process reads and logs `active` / target UID during `doInitialize()` for diagnostics only.
+- Wallet entries use independent IDs, so separate cards with the same UID can coexist; legacy UID-keyed entries remain readable.
 
 ## UID test request semantics
 
