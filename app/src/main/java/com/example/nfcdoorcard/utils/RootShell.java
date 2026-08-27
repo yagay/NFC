@@ -13,11 +13,8 @@ public final class RootShell {
     public static boolean run(List<String> commands) {
         if (commands == null || commands.isEmpty()) return true;
         StringBuilder script = new StringBuilder("set -e\n");
-        for (String cmd : commands) {
-            script.append(cmd).append('\n');
-        }
-        Result result = execute(script.toString());
-        return result.success();
+        for (String cmd : commands) script.append(cmd).append('\n');
+        return execute(script.toString()).success();
     }
 
     public static boolean run(String... commands) {
@@ -25,12 +22,7 @@ public final class RootShell {
     }
 
     public static String runWithResult(String command) {
-        Result result = execute(command);
-        if (result.success()) return result.output();
-        if (result.output().isEmpty()) {
-            return "ERROR: exit=" + result.exitCode() + (result.timedOut() ? " timeout" : "");
-        }
-        return result.output();
+        return execute(command).describe();
     }
 
     public static Result execute(String command) {
@@ -41,10 +33,9 @@ public final class RootShell {
                     .redirectErrorStream(true)
                     .start();
 
-            Process finalProcess = process;
+            Process target = process;
             Thread readerThread = new Thread(() -> {
-                try (BufferedReader reader = new BufferedReader(
-                        new InputStreamReader(finalProcess.getInputStream()))) {
+                try (BufferedReader reader = new BufferedReader(new InputStreamReader(target.getInputStream()))) {
                     String line;
                     while ((line = reader.readLine()) != null) {
                         synchronized (output) {
@@ -59,13 +50,18 @@ public final class RootShell {
             boolean finished = process.waitFor(TIMEOUT_SECONDS, TimeUnit.SECONDS);
             if (!finished) {
                 process.destroyForcibly();
-                readerThread.join(500);
+                process.waitFor(2, TimeUnit.SECONDS);
+                readerThread.join(2000);
                 return new Result(false, -1, trim(output), true);
             }
 
-            readerThread.join(500);
+            readerThread.join();
             int exitCode = process.exitValue();
             return new Result(exitCode == 0, exitCode, trim(output), false);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            if (process != null) process.destroyForcibly();
+            return new Result(false, -1, "Interrupted", false);
         } catch (Exception e) {
             return new Result(false, -1, e.getClass().getSimpleName() + ": " + e.getMessage(), false);
         } finally {
@@ -79,5 +75,13 @@ public final class RootShell {
         }
     }
 
-    public record Result(boolean success, int exitCode, String output, boolean timedOut) {}
+    public record Result(boolean success, int exitCode, String output, boolean timedOut) {
+        public String describe() {
+            StringBuilder sb = new StringBuilder();
+            sb.append("exit=").append(exitCode);
+            if (timedOut) sb.append(" timeout");
+            if (!output.isEmpty()) sb.append("\n").append(output);
+            return sb.toString();
+        }
+    }
 }
