@@ -92,7 +92,8 @@ public final class SystemDefaultLauncherActivity extends AppCompatActivity {
 
             RootShell.Result result;
             if (!prefsSaved) {
-                result = new RootShell.Result(false, -1, "failed to persist UID default state");
+                result = new RootShell.Result(false, -1,
+                        "failed to persist UID default state", false);
             } else {
                 result = RootShell.execute(
                         "set -e\n" +
