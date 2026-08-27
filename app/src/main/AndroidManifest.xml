@@ -7,24 +7,9 @@
     <application
         android:allowBackup="true"
         android:label="@string/app_name"
+        android:description="NFC 门禁诊断模块"
         android:supportsRtl="true"
         android:theme="@style/AppTheme">
-
-        <meta-data
-            android:name="xposedmodule"
-            android:value="true" />
-        <meta-data
-            android:name="libxposedmodule"
-            android:value="true" />
-        <meta-data
-            android:name="xposeddescription"
-            android:value="NFC 门禁诊断模块" />
-        <meta-data
-            android:name="xposedminversion"
-            android:value="102" />
-        <meta-data
-            android:name="xposedscope"
-            android:value="com.android.nfc|com.example.nfcdoorcard" />
 
         <activity
             android:name=".MainActivity"
