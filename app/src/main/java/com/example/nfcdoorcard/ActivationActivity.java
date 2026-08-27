@@ -98,6 +98,16 @@ public final class ActivationActivity extends MainActivity implements NfcDoorApp
             report.append("Android SDK: ").append(Build.VERSION.SDK_INT).append('\n');
             report.append("App version: ").append(BuildConfig.VERSION_NAME).append("\n\n");
 
+            boolean frameworkConnected = NfcDoorApplication.isFrameworkConnected();
+            boolean scopeEnabled = NfcDoorApplication.isNfcScopeEnabled();
+            boolean nfcHooked = NfcDoorApplication.isNfcProcessHooked();
+            report.append("【libxposed 运行状态】\n");
+            report.append("框架连接: ").append(frameworkConnected ? "YES" : "NO").append('\n');
+            report.append("com.android.nfc 作用域: ").append(scopeEnabled ? "YES" : "NO").append('\n');
+            report.append("com.android.nfc 实际运行 Hook: ").append(nfcHooked ? "YES" : "NO").append('\n');
+            report.append("框架: ").append(NfcDoorApplication.getFrameworkSummary()).append('\n');
+            report.append("运行目标:\n").append(NfcDoorApplication.getRunningTargetsSummary()).append("\n\n");
+
             RootShell.Result nfcPid = RootShell.execute("pidof com.android.nfc || true");
             report.append("【NFC 进程】\n");
             report.append("PID: ").append(nfcPid.output().isEmpty() ? "未找到" : nfcPid.output()).append("\n\n");
@@ -114,9 +124,28 @@ public final class ActivationActivity extends MainActivity implements NfcDoorApp
                     "tail -n 2000 || true");
             report.append("【NFC / LSPosed Logcat】\n");
             if (logcat.output().isEmpty()) {
-                report.append("未找到匹配日志。请确认 LSPosed 已勾选 com.android.nfc，并重启 NFC 服务或手机。\n");
+                report.append("未找到匹配日志。\n");
             } else {
                 report.append(logcat.output()).append('\n');
+            }
+
+            RootShell.Result lsposedFiles = RootShell.execute(
+                    "for d in /data/adb/lspd/log /data/adb/lsposed/log; do " +
+                    "[ -d \"$d\" ] && find \"$d\" -maxdepth 2 -type f 2>/dev/null; done | tail -n 80 || true");
+            report.append("\n【LSPosed 持久日志文件】\n");
+            report.append(lsposedFiles.output().isEmpty() ? "未找到常见 LSPosed 日志目录/文件\n" : lsposedFiles.output() + "\n");
+
+            RootShell.Result lsposedPersistent = RootShell.execute(
+                    "for d in /data/adb/lspd/log /data/adb/lsposed/log; do " +
+                    "[ -d \"$d\" ] || continue; " +
+                    "find \"$d\" -maxdepth 2 -type f -print0 2>/dev/null | " +
+                    "xargs -0 grep -H -i -E 'NfcUIDSim|NFC-SCAN|com\\.example\\.nfcdoorcard|com\\.android\\.nfc' 2>/dev/null; " +
+                    "done | tail -n 3000 || true");
+            report.append("\n【LSPosed 持久日志匹配内容】\n");
+            if (lsposedPersistent.output().isEmpty()) {
+                report.append("未找到模块/NFC 匹配内容。若上面的“实际运行 Hook”为 NO，优先检查模块加载/框架兼容性。\n");
+            } else {
+                report.append(lsposedPersistent.output()).append('\n');
             }
 
             lastSystemLogReport = report.toString();
