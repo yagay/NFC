@@ -1,5 +1,8 @@
 name=NFC 门禁模拟
 author=Developer
-description=NFC UID 模拟与智能切卡屏蔽
-minApiVersion=100
+description=NFC UID 模拟与诊断
+minApiVersion=102
 targetApiVersion=102
+staticScope=true
+exceptionMode=protective
+autoHotReload=false
