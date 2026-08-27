@@ -30,6 +30,9 @@ import com.example.nfcdoorcard.nfc.TagInspector;
 import com.example.nfcdoorcard.utils.AppLogger;
 import com.example.nfcdoorcard.utils.RootShell;
 
+import org.json.JSONObject;
+
+import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -441,9 +444,18 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
     }
 
     private void saveCard(String name, String uid) {
-        getSharedPreferences("card_wallet", Context.MODE_PRIVATE).edit().putString(uid, name).apply();
-        toast("保存成功");
-        refreshCardList();
+        try {
+            JSONObject card = new JSONObject();
+            card.put("uid", uid);
+            card.put("name", name);
+            String key = "card_" + UUID.randomUUID();
+            getSharedPreferences("card_wallet", Context.MODE_PRIVATE).edit().putString(key, card.toString()).apply();
+            toast("保存成功");
+            refreshCardList();
+        } catch (Exception e) {
+            AppLogger.e("Wallet", "保存卡片失败: " + e.getMessage());
+            toast("保存失败");
+        }
     }
 
     private void refreshCardList() {
@@ -454,18 +466,36 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
         if (allCards.isEmpty()) { cardListContainer.addView(text("卡包空空如也", 14, false)); return; }
 
         for (java.util.Map.Entry<String, ?> entry : allCards.entrySet()) {
-            String uid = entry.getKey();
-            String name = String.valueOf(entry.getValue());
+            String storageKey = entry.getKey();
+            String uid;
+            String name;
+            if (storageKey.startsWith("card_")) {
+                try {
+                    JSONObject card = new JSONObject(String.valueOf(entry.getValue()));
+                    uid = card.optString("uid", "—");
+                    name = card.optString("name", "未命名卡片");
+                } catch (Exception e) {
+                    AppLogger.w("Wallet", "跳过损坏的卡片记录: " + storageKey);
+                    continue;
+                }
+            } else {
+                // Backward compatibility with legacy uid -> name entries.
+                uid = storageKey;
+                name = String.valueOf(entry.getValue());
+            }
+
+            String selectedUid = uid;
+            String selectedName = name;
             Button btn = new Button(this);
-            btn.setText(name + " (" + uid + ")");
+            btn.setText(selectedName + " (" + selectedUid + ")");
             btn.setAllCaps(false);
             btn.setOnClickListener(v -> {
-                currentUid = uid;
-                details.setText("已从卡包选择：" + name + "\nUID: " + uid + "\n\n如需设置测试请求，请点击上方“设置当前 UID 测试请求”。");
+                currentUid = selectedUid;
+                details.setText("已从卡包选择：" + selectedName + "\nUID: " + selectedUid + "\n\n如需设置测试请求，请点击上方“设置当前 UID 测试请求”。");
             });
             btn.setOnLongClickListener(v -> {
-                new android.app.AlertDialog.Builder(this).setMessage("删除 " + name + "？")
-                        .setPositiveButton("删除", (d, w) -> { prefs.edit().remove(uid).apply(); refreshCardList(); })
+                new android.app.AlertDialog.Builder(this).setMessage("删除 " + selectedName + "？")
+                        .setPositiveButton("删除", (d, w) -> { prefs.edit().remove(storageKey).apply(); refreshCardList(); })
                         .setNegativeButton("取消", null).show();
                 return true;
             });
