@@ -25,74 +25,75 @@ import androidx.core.view.ViewCompat;
 import androidx.core.view.WindowInsetsCompat;
 
 import com.example.nfcdoorcard.data.CardSnapshot;
+import com.example.nfcdoorcard.data.CardType;
 import com.example.nfcdoorcard.nfc.TagInspector;
 import com.example.nfcdoorcard.utils.AppLogger;
 import com.example.nfcdoorcard.utils.RootShell;
 
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 
 public class MainActivity extends AppCompatActivity implements NfcAdapter.ReaderCallback {
     private static final int MIN_SUPPORTED_SDK = 31;
     private static final int MAX_SUPPORTED_SDK = 37;
 
+    private final ExecutorService nfcExecutor = Executors.newSingleThreadExecutor();
+    private final AtomicBoolean nfcOperationRunning = new AtomicBoolean(false);
+
     private NfcAdapter nfcAdapter;
     private TextView status;
     private TextView details;
     private TextView logView;
     private LinearLayout cardListContainer;
+    private Button simulateBtn;
+    private Button stopSimBtn;
     private String currentUid;
     private String savedUid;
-
-    public static boolean isSimulationRequestActive() {
-        try {
-            java.lang.reflect.Method get = Class.forName("android.os.SystemProperties")
-                    .getDeclaredMethod("get", String.class);
-            String val = (String) get.invoke(null, "persist.nfcuidsim.active");
-            return "1".equals(val);
-        } catch (Exception ignored) {
-            return false;
-        }
-    }
+    private boolean readerRequested;
 
     private SharedPreferences simulationPrefs() {
-        return createDeviceProtectedStorageContext()
-                .getSharedPreferences("sim_prefs", Context.MODE_PRIVATE);
+        return createDeviceProtectedStorageContext().getSharedPreferences("sim_prefs", Context.MODE_PRIVATE);
+    }
+
+    private SharedPreferences uiPrefs() {
+        return getSharedPreferences("ui_prefs", Context.MODE_PRIVATE);
+    }
+
+    private boolean isSimulationRequestActive() {
+        return simulationPrefs().getBoolean("request_active", false);
     }
 
     private void runHardwareDiagnostic() {
         AppLogger.i("Diag", "正在抓取 NFC 诊断信息...");
         new Thread(() -> {
             StringBuilder sb = new StringBuilder();
-
             sb.append("【LSPosed / libxposed】\n");
             boolean connected = NfcDoorApplication.isFrameworkConnected();
             boolean scoped = NfcDoorApplication.isNfcScopeEnabled();
             sb.append("● 框架连接: ").append(connected ? "✅ 已连接" : "❌ 未连接").append("\n");
-            sb.append("● NFC 作用域: ").append(scoped ? "✅ com.android.nfc 已启用" : "❌ 未启用").append("\n");
+            sb.append("● NFC 作用域配置: ").append(scoped ? "✅ com.android.nfc 已启用" : "❌ 未启用").append("\n");
+            sb.append("● 实际 NFC 进程 Hook: 当前服务 API 未做可靠确认\n");
             sb.append("● 框架信息: ").append(NfcDoorApplication.getFrameworkSummary()).append("\n");
-            sb.append("● 底层 UID 写入: 未启用（当前模块仅诊断 doInitialize）\n\n");
+            sb.append("● 底层固定 UID 写入: 未启用\n\n");
 
+            SharedPreferences prefs = simulationPrefs();
             sb.append("【测试请求】\n");
-            String target = simulationPrefs().getString("target_uid", null);
-            sb.append("● 请求状态: ").append(isSimulationRequestActive() ? "已开启" : "已停止").append("\n");
-            sb.append("● 目标 UID: ").append(target == null ? "未设置" : target).append("\n\n");
+            sb.append("● 请求状态: ").append(prefs.getBoolean("request_active", false) ? "已开启" : "已停止").append("\n");
+            sb.append("● 目标 UID: ").append(prefs.getString("target_uid", "未设置")).append("\n\n");
 
             sb.append("【系统服务实时数据】\n");
             RootShell.Result nfcDump = RootShell.execute("dumpsys nfc | grep -E 'mState|listenTech'");
-            if (nfcDump.success() && !nfcDump.output().isEmpty()) {
-                sb.append(nfcDump.output()).append("\n");
-            } else {
-                sb.append("⚠️ 获取失败: ").append(nfcDump.output()).append("\n");
-            }
+            sb.append(nfcDump.success() && !nfcDump.output().isEmpty() ? nfcDump.output() : "⚠️ 获取失败: " + nfcDump.describe()).append("\n");
 
             RootShell.Result chipResult = RootShell.execute("getprop ro.hardware.nfc");
-            sb.append("\n【硬件芯片方案】\n");
-            sb.append("● ro.hardware.nfc: ")
+            sb.append("\n【硬件芯片方案】\n● ro.hardware.nfc: ")
                     .append(chipResult.success() && !chipResult.output().isEmpty() ? chipResult.output() : "未知")
                     .append("\n");
 
             String report = sb.toString();
-            runOnUiThread(() -> {
+            runOnUiThreadIfAlive(() -> {
                 AppLogger.i("Diag", "扫描完成");
                 new android.app.AlertDialog.Builder(this)
                         .setTitle("NFC 实时诊断报告")
@@ -104,35 +105,21 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
     }
 
     private void openLSPosedManager() {
-        String[] managers = {
-                "org.lsposed.manager",
-                "io.github.lsposed.manager",
-                "org.meowcat.edxposed.manager",
-                "de.robv.android.xposed.installer"
-        };
-
+        String[] managers = {"org.lsposed.manager", "io.github.lsposed.manager", "org.meowcat.edxposed.manager", "de.robv.android.xposed.installer"};
         for (String pkg : managers) {
             try {
                 Intent intent = getPackageManager().getLaunchIntentForPackage(pkg);
-                if (intent != null) {
-                    startActivity(intent);
-                    return;
-                }
-            } catch (Exception ignored) {
-            }
+                if (intent != null) { startActivity(intent); return; }
+            } catch (Exception ignored) {}
         }
-
         try {
             Intent intent = new Intent("org.lsposed.manager.LAUNCH_MODULE");
             intent.putExtra("pkg", getPackageName());
             intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
             startActivity(intent);
             return;
-        } catch (Exception ignored) {
-        }
-
+        } catch (Exception ignored) {}
         Toast.makeText(this, "未找到 LSPosed 管理器，请手动打开并检查 NFC 服务作用域", Toast.LENGTH_LONG).show();
-        AppLogger.e("UI", "LSPosed Manager not found");
     }
 
     @Override
@@ -140,6 +127,7 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
         EdgeToEdge.enable(this);
         super.onCreate(savedInstanceState);
         nfcAdapter = NfcAdapter.getDefaultAdapter(this);
+        savedUid = uiPrefs().getString("comparison_uid", null);
 
         View rootLayout = buildUi();
         setContentView(rootLayout);
@@ -159,10 +147,22 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
     @Override
     protected void onStart() {
         super.onStart();
-        AppLogger.setListener(allLogs -> runOnUiThread(() -> {
+        AppLogger.setListener(allLogs -> runOnUiThreadIfAlive(() -> {
             if (logView != null) logView.setText(allLogs);
         }));
         refreshStatus();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (readerRequested) enableReaderModeInternal(false);
+    }
+
+    @Override
+    protected void onPause() {
+        if (nfcAdapter != null) nfcAdapter.disableReaderMode(this);
+        super.onPause();
     }
 
     @Override
@@ -171,18 +171,22 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
         super.onStop();
     }
 
+    @Override
+    protected void onDestroy() {
+        nfcExecutor.shutdownNow();
+        super.onDestroy();
+    }
+
     private View buildUi() {
         int pad = dp(20);
         LinearLayout content = new LinearLayout(this);
         content.setOrientation(LinearLayout.VERTICAL);
         content.setPadding(pad, pad, pad, pad);
-
         android.util.TypedValue outValue = new android.util.TypedValue();
         getTheme().resolveAttribute(android.R.attr.colorBackground, outValue, true);
         content.setBackgroundColor(outValue.data);
 
-        TextView title = text("NFC 门禁 · v" + BuildConfig.VERSION_NAME, 26, true);
-        content.addView(title);
+        content.addView(text("NFC 门禁 · v" + BuildConfig.VERSION_NAME, 26, true));
         TextView sub = text("支持 Android 12–17（API 31–37）。读取和诊断 NFC 卡片，并验证 HCE/LSPosed 链路；当前版本不会写入 NFC 控制器固定 UID。", 14, false);
         sub.setPadding(0, dp(6), 0, dp(18));
         content.addView(sub);
@@ -203,12 +207,10 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
         Button saveUid = new Button(this);
         saveUid.setText("保存当前 UID 作为对比基准");
         saveUid.setOnClickListener(v -> {
-            if (currentUid == null || "—".equals(currentUid)) {
-                Toast.makeText(this, "请先读取一张卡", Toast.LENGTH_SHORT).show();
-                return;
-            }
+            if (!hasCurrentUid()) { toast("请先读取一张卡"); return; }
             savedUid = currentUid;
-            Toast.makeText(this, "已保存 UID: " + savedUid, Toast.LENGTH_SHORT).show();
+            uiPrefs().edit().putString("comparison_uid", savedUid).apply();
+            toast("已保存 UID: " + savedUid);
         });
         content.addView(saveUid, lp(-1, dp(52), 12));
 
@@ -217,12 +219,12 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
         copyUid.setOnClickListener(v -> copyCurrentUid());
         content.addView(copyUid, lp(-1, dp(52), 12));
 
-        Button simulateBtn = new Button(this);
+        simulateBtn = new Button(this);
         simulateBtn.setText("设置当前 UID 测试请求");
         simulateBtn.setOnClickListener(v -> simulateCurrentUid());
         content.addView(simulateBtn, lp(-1, dp(52), 12));
 
-        Button stopSimBtn = new Button(this);
+        stopSimBtn = new Button(this);
         stopSimBtn.setText("停止 UID 测试请求");
         stopSimBtn.setOnClickListener(v -> stopSimulation());
         content.addView(stopSimBtn, lp(-1, dp(52), 12));
@@ -236,7 +238,8 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
         clearSaved.setText("清除 UID 对比基准");
         clearSaved.setOnClickListener(v -> {
             savedUid = null;
-            Toast.makeText(this, "已清除 UID 对比基准", Toast.LENGTH_SHORT).show();
+            uiPrefs().edit().remove("comparison_uid").apply();
+            toast("已清除 UID 对比基准");
         });
         content.addView(clearSaved, lp(-1, dp(52), 12));
 
@@ -263,7 +266,6 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
         TextView walletTitle = text("我的卡包", 20, true);
         walletTitle.setPadding(0, dp(20), 0, dp(10));
         content.addView(walletTitle);
-
         cardListContainer = new LinearLayout(this);
         cardListContainer.setOrientation(LinearLayout.VERTICAL);
         content.addView(cardListContainer);
@@ -271,7 +273,6 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
         TextView logTitle = text("实时控制台日志", 18, true);
         logTitle.setPadding(0, dp(24), 0, dp(8));
         content.addView(logTitle);
-
         Button clearLogBtn = new Button(this);
         clearLogBtn.setText("清空控制台");
         clearLogBtn.setOnClickListener(v -> AppLogger.clear());
@@ -294,44 +295,27 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
     }
 
     protected void refreshStatus() {
+        if (status == null) return;
         Boolean root = RootStatus.getCachedResult();
         String rootText = root == null ? "检测中" : (root ? "可用" : "未检测到/未授权");
-
-        String nfc;
-        if (nfcAdapter == null) nfc = "无 NFC 硬件";
-        else nfc = nfcAdapter.isEnabled() ? "NFC 已开启" : "NFC 未开启";
-
+        String nfc = nfcAdapter == null ? "无 NFC 硬件" : (nfcAdapter.isEnabled() ? "NFC 已开启" : "NFC 未开启");
         int sdk = Build.VERSION.SDK_INT;
         String support = isSupportedSdk(sdk) ? "系统受支持" : "系统版本超出支持范围";
+        String moduleStatus = !NfcDoorApplication.isFrameworkConnected()
+                ? "LSPosed: 未连接框架"
+                : (!NfcDoorApplication.isNfcScopeEnabled()
+                ? "LSPosed: 已连接 · NFC 服务未在作用域"
+                : "LSPosed: 已连接 · NFC 作用域已配置（实际进程 Hook 待诊断确认）");
 
-        String moduleStatus;
-        if (!NfcDoorApplication.isFrameworkConnected()) {
-            moduleStatus = "LSPosed: 未连接框架";
-        } else if (!NfcDoorApplication.isNfcScopeEnabled()) {
-            moduleStatus = "LSPosed: 已连接 · NFC 服务未在作用域";
-        } else {
-            moduleStatus = "LSPosed: 已连接 · NFC 服务作用域已启用";
-        }
+        SharedPreferences prefs = simulationPrefs();
+        String simStatus = prefs.getBoolean("request_active", false)
+                ? "\nUID 测试请求: 已开启 [" + prefs.getString("target_uid", "未设置") + "] · 底层固定 UID 写入未启用"
+                : "\nUID 测试请求: 已停止";
 
-        String simStatus;
-        if (isSimulationRequestActive()) {
-            String uid = simulationPrefs().getString("target_uid", "未设置");
-            simStatus = "\nUID 测试请求: 已开启 [" + uid + "] · 底层固定 UID 写入未启用";
-        } else {
-            simStatus = "\nUID 测试请求: 已停止";
-        }
-
-        status.setText(
-                androidVersionName(sdk) + " / API " + sdk + "   ·   " + support +
-                        "\n" + nfc + "   ·   Root: " + rootText +
-                        "\n" + moduleStatus + simStatus
-        );
-
+        status.setText(androidVersionName(sdk) + " / API " + sdk + "   ·   " + support +
+                "\n" + nfc + "   ·   Root: " + rootText + "\n" + moduleStatus + simStatus);
         status.setOnClickListener(v -> {
-            AppLogger.i("UI", "用户点击状态栏");
-            if (!NfcDoorApplication.isFrameworkConnected() || !NfcDoorApplication.isNfcScopeEnabled()) {
-                openLSPosedManager();
-            }
+            if (!NfcDoorApplication.isFrameworkConnected() || !NfcDoorApplication.isNfcScopeEnabled()) openLSPosedManager();
         });
     }
 
@@ -340,155 +324,125 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
         refreshStatus();
         new Thread(() -> {
             boolean ok = RootStatus.hasRoot();
-            runOnUiThread(() -> {
+            runOnUiThreadIfAlive(() -> {
                 refreshStatus();
-                if (showToast) {
-                    Toast.makeText(this, ok ? "Root 权限已获取" : "未获得 Root 权限，请在授权管理中允许",
-                            ok ? Toast.LENGTH_SHORT : Toast.LENGTH_LONG).show();
-                }
+                if (showToast) Toast.makeText(this, ok ? "Root 权限已获取" : "未获得 Root 权限，请在授权管理中允许", ok ? Toast.LENGTH_SHORT : Toast.LENGTH_LONG).show();
             });
         }, "root-check").start();
     }
 
-    private boolean isSupportedSdk(int sdk) {
-        return sdk >= MIN_SUPPORTED_SDK && sdk <= MAX_SUPPORTED_SDK;
-    }
+    private boolean isSupportedSdk(int sdk) { return sdk >= MIN_SUPPORTED_SDK && sdk <= MAX_SUPPORTED_SDK; }
 
     private String androidVersionName(int sdk) {
-        switch (sdk) {
-            case 31: return "Android 12";
-            case 32: return "Android 12L";
-            case 33: return "Android 13";
-            case 34: return "Android 14";
-            case 35: return "Android 15";
-            case 36: return "Android 16";
-            case 37: return "Android 17";
-            default: return "Android";
-        }
+        return switch (sdk) {
+            case 31 -> "Android 12"; case 32 -> "Android 12L"; case 33 -> "Android 13";
+            case 34 -> "Android 14"; case 35 -> "Android 15"; case 36 -> "Android 16";
+            case 37 -> "Android 17"; default -> "Android";
+        };
     }
 
     private void enableReader() {
+        readerRequested = true;
+        enableReaderModeInternal(true);
+    }
+
+    private void enableReaderModeInternal(boolean updateMessage) {
         refreshStatus();
         if (!isSupportedSdk(Build.VERSION.SDK_INT)) {
-            details.setText("当前 Android 版本不在正式支持范围内。支持 Android 12–17（API 31–37）。");
+            readerRequested = false;
+            if (updateMessage) details.setText("当前 Android 版本不在正式支持范围内。支持 Android 12–17（API 31–37）。");
             return;
         }
         if (nfcAdapter == null || !nfcAdapter.isEnabled()) {
-            details.setText("请先开启 NFC。");
+            readerRequested = false;
+            if (updateMessage) details.setText("NFC 不可用或未开启。");
             return;
         }
-        int flags = NfcAdapter.FLAG_READER_NFC_A |
-                NfcAdapter.FLAG_READER_NFC_B |
-                NfcAdapter.FLAG_READER_NFC_F |
-                NfcAdapter.FLAG_READER_NFC_V |
+        int flags = NfcAdapter.FLAG_READER_NFC_A | NfcAdapter.FLAG_READER_NFC_B |
+                NfcAdapter.FLAG_READER_NFC_F | NfcAdapter.FLAG_READER_NFC_V |
                 NfcAdapter.FLAG_READER_SKIP_NDEF_CHECK;
         nfcAdapter.enableReaderMode(this, this, flags, null);
-        details.setText("读取模式已开启。请把门禁卡贴近手机。");
+        if (updateMessage) details.setText("读取模式已开启。请把门禁卡贴近手机。");
     }
 
     private void disableReader() {
+        readerRequested = false;
         if (nfcAdapter != null) nfcAdapter.disableReaderMode(this);
         details.setText("读取模式已停止。");
     }
 
     private void copyCurrentUid() {
-        if (currentUid == null || "—".equals(currentUid)) {
-            Toast.makeText(this, "请先读取一张卡", Toast.LENGTH_SHORT).show();
-            return;
-        }
+        if (!hasCurrentUid()) { toast("请先读取一张卡"); return; }
         ClipboardManager clipboard = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
         clipboard.setPrimaryClip(ClipData.newPlainText("NFC UID", currentUid));
-        Toast.makeText(this, "UID 已复制", Toast.LENGTH_SHORT).show();
+        toast("UID 已复制");
     }
 
     private void simulateCurrentUid() {
-        if (currentUid == null || "—".equals(currentUid)) {
-            Toast.makeText(this, "请先读取一张卡", Toast.LENGTH_SHORT).show();
-            return;
-        }
-
+        if (!hasCurrentUid()) { toast("请先读取或从卡包选择一张卡"); return; }
         String safeUid = currentUid.replaceAll("[^0-9A-Fa-f:]", "");
-        simulationPrefs().edit().putString("target_uid", safeUid).apply();
-        AppLogger.i("Action", "设置 UID 测试请求: " + safeUid);
-        Toast.makeText(this, "已设置 UID 测试请求，正在重启 NFC 服务进行链路诊断", Toast.LENGTH_LONG).show();
-
-        new Thread(() -> {
-            RootShell.Result result = RootShell.execute(
-                    "set -e\n" +
-                    "setprop persist.nfcuidsim.uid '" + safeUid + "'\n" +
-                    "setprop persist.nfcuidsim.active 1\n" +
-                    "test \"$(getprop persist.nfcuidsim.active)\" = \"1\"\n" +
-                    "svc nfc disable\n" +
-                    "sleep 1\n" +
-                    "svc nfc enable\n"
-            );
-            if (result.success()) {
-                AppLogger.i("Root", "测试请求已写入并完成 NFC 重启");
-            } else {
-                AppLogger.e("Root", "测试请求失败: " + result.output());
-                simulationPrefs().edit().remove("target_uid").apply();
-            }
-            runOnUiThread(() -> {
-                refreshStatus();
-                if (!result.success()) {
-                    Toast.makeText(this, "Root 执行失败: " + result.output(), Toast.LENGTH_LONG).show();
-                }
-            });
-        }, "nfc-request-start").start();
-    }
-
-    private void stopSimulation() {
-        AppLogger.i("Action", "停止 UID 测试请求");
-        simulationPrefs().edit().remove("target_uid").apply();
-
-        new Thread(() -> {
-            RootShell.Result result = RootShell.execute(
-                    "set -e\n" +
-                    "setprop persist.nfcuidsim.uid OFF\n" +
-                    "setprop persist.nfcuidsim.active 0\n" +
-                    "test \"$(getprop persist.nfcuidsim.active)\" = \"0\"\n" +
-                    "svc nfc disable\n" +
-                    "sleep 1\n" +
-                    "svc nfc enable\n"
-            );
-            if (result.success()) {
-                AppLogger.i("Root", "UID 测试请求已停止");
-            } else {
-                AppLogger.e("Root", "停止请求失败: " + result.output());
-            }
-            runOnUiThread(() -> {
-                refreshStatus();
-                if (!result.success()) {
-                    Toast.makeText(this, "Root 执行失败: " + result.output(), Toast.LENGTH_LONG).show();
-                }
-            });
-        }, "nfc-request-stop").start();
-    }
-
-    private void showSaveDialog() {
-        if (currentUid == null || "—".equals(currentUid)) {
-            Toast.makeText(this, "请先读取一张卡", Toast.LENGTH_SHORT).show();
-            return;
-        }
-        android.widget.EditText input = new android.widget.EditText(this);
-        input.setHint("给这张卡起个名字 (如：公司门禁)");
-
         new android.app.AlertDialog.Builder(this)
-                .setTitle("保存卡片")
-                .setView(input)
-                .setPositiveButton("保存", (d, w) -> {
-                    String name = input.getText().toString().trim();
-                    if (name.isEmpty()) name = "未命名卡片";
-                    saveCard(name, currentUid);
-                })
+                .setTitle("设置测试请求")
+                .setMessage("将保存 UID " + safeUid + " 并重启 NFC 服务用于诊断。当前版本不会改写控制器固定 UID。")
+                .setPositiveButton("继续", (d, w) -> enqueueNfcRequest(true, safeUid))
                 .setNegativeButton("取消", null)
                 .show();
     }
 
+    private void stopSimulation() {
+        if (!isSimulationRequestActive()) { toast("当前没有活动的 UID 测试请求"); return; }
+        enqueueNfcRequest(false, null);
+    }
+
+    private void enqueueNfcRequest(boolean start, String uid) {
+        if (!nfcOperationRunning.compareAndSet(false, true)) {
+            toast("NFC 操作正在执行，请稍后再试");
+            return;
+        }
+        setNfcButtonsEnabled(false);
+        AppLogger.i("Action", start ? "准备设置 UID 测试请求: " + uid : "准备停止 UID 测试请求");
+
+        nfcExecutor.execute(() -> {
+            RootShell.Result result = RootShell.execute("set -e\nsvc nfc disable\nsleep 1\nsvc nfc enable\n");
+            if (result.success()) {
+                SharedPreferences.Editor editor = simulationPrefs().edit();
+                if (start) editor.putString("target_uid", uid).putBoolean("request_active", true);
+                else editor.remove("target_uid").putBoolean("request_active", false);
+                editor.commit();
+                AppLogger.i("Root", start ? "测试请求已保存并完成 NFC 重启" : "测试请求已停止并完成 NFC 重启");
+            } else {
+                AppLogger.e("Root", "NFC 操作失败: " + result.describe());
+            }
+            nfcOperationRunning.set(false);
+            runOnUiThreadIfAlive(() -> {
+                setNfcButtonsEnabled(true);
+                refreshStatus();
+                if (result.success()) toast(start ? "UID 测试请求已设置" : "UID 测试请求已停止");
+                else Toast.makeText(this, "Root/NFC 操作失败: " + result.describe(), Toast.LENGTH_LONG).show();
+            });
+        });
+    }
+
+    private void setNfcButtonsEnabled(boolean enabled) {
+        if (simulateBtn != null) simulateBtn.setEnabled(enabled);
+        if (stopSimBtn != null) stopSimBtn.setEnabled(enabled);
+    }
+
+    private void showSaveDialog() {
+        if (!hasCurrentUid()) { toast("请先读取一张卡"); return; }
+        android.widget.EditText input = new android.widget.EditText(this);
+        input.setHint("给这张卡起个名字 (如：公司门禁)");
+        new android.app.AlertDialog.Builder(this)
+                .setTitle("保存卡片").setView(input)
+                .setPositiveButton("保存", (d, w) -> {
+                    String name = input.getText().toString().trim();
+                    saveCard(name.isEmpty() ? "未命名卡片" : name, currentUid);
+                }).setNegativeButton("取消", null).show();
+    }
+
     private void saveCard(String name, String uid) {
-        SharedPreferences prefs = getSharedPreferences("card_wallet", Context.MODE_PRIVATE);
-        prefs.edit().putString(uid, name).apply();
-        Toast.makeText(this, "保存成功", Toast.LENGTH_SHORT).show();
+        getSharedPreferences("card_wallet", Context.MODE_PRIVATE).edit().putString(uid, name).apply();
+        toast("保存成功");
         refreshCardList();
     }
 
@@ -497,32 +451,22 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
         cardListContainer.removeAllViews();
         SharedPreferences prefs = getSharedPreferences("card_wallet", Context.MODE_PRIVATE);
         java.util.Map<String, ?> allCards = prefs.getAll();
-
-        if (allCards.isEmpty()) {
-            cardListContainer.addView(text("卡包空空如也", 14, false));
-            return;
-        }
+        if (allCards.isEmpty()) { cardListContainer.addView(text("卡包空空如也", 14, false)); return; }
 
         for (java.util.Map.Entry<String, ?> entry : allCards.entrySet()) {
             String uid = entry.getKey();
             String name = String.valueOf(entry.getValue());
-
             Button btn = new Button(this);
             btn.setText(name + " (" + uid + ")");
             btn.setAllCaps(false);
             btn.setOnClickListener(v -> {
                 currentUid = uid;
-                simulateCurrentUid();
+                details.setText("已从卡包选择：" + name + "\nUID: " + uid + "\n\n如需设置测试请求，请点击上方“设置当前 UID 测试请求”。");
             });
             btn.setOnLongClickListener(v -> {
-                new android.app.AlertDialog.Builder(this)
-                        .setMessage("删除 " + name + "？")
-                        .setPositiveButton("删除", (d, w) -> {
-                            prefs.edit().remove(uid).apply();
-                            refreshCardList();
-                        })
-                        .setNegativeButton("取消", null)
-                        .show();
+                new android.app.AlertDialog.Builder(this).setMessage("删除 " + name + "？")
+                        .setPositiveButton("删除", (d, w) -> { prefs.edit().remove(uid).apply(); refreshCardList(); })
+                        .setNegativeButton("取消", null).show();
                 return true;
             });
             cardListContainer.addView(btn, lp(-1, dp(48), 8));
@@ -530,9 +474,7 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
     }
 
     private String uidOnlyAssessment(CardSnapshot s) {
-        if (!"MIFARE Classic / NFC-A".equals(s.classification())) {
-            return "暂不判断：当前卡不是 MIFARE Classic。";
-        }
+        if (s.cardType() != CardType.MIFARE_CLASSIC) return "暂不判断：当前卡不是 MIFARE Classic。";
         return "候选：仅凭卡片本身不能证明门禁只认 UID。需要在你有权限管理的读卡器上进一步验证。";
     }
 
@@ -547,43 +489,28 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
         CardSnapshot s = TagInspector.inspect(tag);
         currentUid = s.uid();
         String tech = s.techList().stream().collect(Collectors.joining(", "));
-        String out = "UID\n" + s.uid() +
-                "\n\nUID 长度\n" + s.uidLength() +
-                "\n\nUID 对比\n" + comparisonText(s.uid()) +
-                "\n\nTech\n" + tech +
-                "\n\nATQA\n" + s.atqa() +
-                "\n\nSAK\n" + s.sak() +
-                "\n\n判断\n" + s.classification() +
-                "\n\nUID-only 候选\n" + uidOnlyAssessment(s) +
-                "\n\nClassic 容量\n" + s.classicSize() +
-                "\n\n扇区数\n" + s.classicSectors() +
-                "\n\n块数\n" + s.classicBlocks() +
-                "\n\n标准 HCE\n" + s.hceSupport() +
+        String out = "UID\n" + s.uid() + "\n\nUID 长度\n" + s.uidLength() +
+                "\n\nUID 对比\n" + comparisonText(s.uid()) + "\n\nTech\n" + tech +
+                "\n\nATQA\n" + s.atqa() + "\n\nSAK\n" + s.sak() +
+                "\n\n判断\n" + s.classification() + "\n\nUID-only 候选\n" + uidOnlyAssessment(s) +
+                "\n\nClassic 容量\n" + s.classicSize() + "\n\n扇区数\n" + s.classicSectors() +
+                "\n\n块数\n" + s.classicBlocks() + "\n\n标准 HCE\n" + s.hceSupport() +
                 "\n\n说明\n" + s.note();
-        runOnUiThread(() -> details.setText(out));
+        runOnUiThreadIfAlive(() -> details.setText(out));
     }
 
-    @Override
-    protected void onPause() {
-        super.onPause();
-        if (nfcAdapter != null) nfcAdapter.disableReaderMode(this);
+    private boolean hasCurrentUid() { return currentUid != null && !"—".equals(currentUid); }
+    private void toast(String text) { Toast.makeText(this, text, Toast.LENGTH_SHORT).show(); }
+    private void runOnUiThreadIfAlive(Runnable action) {
+        if (isFinishing() || isDestroyed()) return;
+        runOnUiThread(() -> { if (!isFinishing() && !isDestroyed()) action.run(); });
     }
-
     private TextView text(String value, int sp, boolean bold) {
-        TextView t = new TextView(this);
-        t.setText(value);
-        t.setTextSize(sp);
-        if (bold) t.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
-        return t;
+        TextView t = new TextView(this); t.setText(value); t.setTextSize(sp);
+        if (bold) t.setTypeface(Typeface.DEFAULT, Typeface.BOLD); return t;
     }
-
     private LinearLayout.LayoutParams lp(int w, int h, int bottom) {
-        LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(w, h);
-        p.bottomMargin = dp(bottom);
-        return p;
+        LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(w, h); p.bottomMargin = dp(bottom); return p;
     }
-
-    private int dp(int v) {
-        return Math.round(v * getResources().getDisplayMetrics().density);
-    }
+    private int dp(int v) { return Math.round(v * getResources().getDisplayMetrics().density); }
 }
