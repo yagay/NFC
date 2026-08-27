@@ -33,7 +33,7 @@ public class NfcDiagnosticsModule extends XposedModule {
     public void onPackageLoaded(XposedModuleInterface.PackageLoadedParam lp) {
         super.onPackageLoaded(lp);
         if (!"com.android.nfc".equals(lp.getPackageName())) return;
-        info("onPackageLoaded package=com.android.nfc process=" + lp.getProcessName());
+        info("onPackageLoaded package=com.android.nfc");
         installNfcServiceHooks(lp);
     }
 
