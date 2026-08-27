@@ -10,8 +10,14 @@ import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.util.Arrays;
+import java.util.Enumeration;
+import java.util.LinkedHashSet;
 import java.util.Locale;
+import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
+import dalvik.system.DexFile;
 import io.github.libxposed.api.XposedModule;
 import io.github.libxposed.api.XposedModuleInterface;
 
@@ -19,8 +25,18 @@ import io.github.libxposed.api.XposedModuleInterface;
 public class NfcDiagnosticsModule extends XposedModule {
     private static final String TAG = "NfcUIDSim";
     private static final Uri CONFIG_URI = Uri.parse("content://com.example.nfcdoorcard.uidconfig/target");
+    private static final int MAX_CLASS_CANDIDATES = 180;
+    private static final int MAX_MEMBERS_PER_CLASS = 50;
+    private static final Pattern DEX_PATH_PATTERN = Pattern.compile("(?:zip file |dex file )?\\\"([^\\\"]+\\.(?:apk|jar))\\\"");
+
     private static final String[] SCAN_KEYWORDS = {
-            "uid", "config", "nci", "rf", "discover", "routing", "listen", "poll", "set", "write"
+            "uid", "config", "nci", "rf", "discover", "routing", "listen", "poll", "set", "write",
+            "initialize", "enable", "disable", "hal", "vendor"
+    };
+
+    private static final String[] CLASS_KEYWORDS = {
+            "native", "devicehost", "manager", "service", "hal", "vendor", "config", "routing",
+            "discover", "controller", "stnfc", "st_nfc", "nfcst", "nci"
     };
 
     @Override
@@ -34,15 +50,28 @@ public class NfcDiagnosticsModule extends XposedModule {
         super.onPackageLoaded(lp);
         if (!"com.android.nfc".equals(lp.getPackageName())) return;
         info("onPackageLoaded package=com.android.nfc");
-        installNfcServiceHooks(lp);
+        inspectNfcService(lp);
     }
 
-    private void installNfcServiceHooks(XposedModuleInterface.PackageLoadedParam lp) {
-        try {
-            ClassLoader cl = lp.getDefaultClassLoader();
-            Class<?> nativeManager = cl.loadClass("com.android.nfc.dhimpl.NativeNfcManager");
-            Method initMethod = nativeManager.getDeclaredMethod("doInitialize");
+    private void inspectNfcService(XposedModuleInterface.PackageLoadedParam lp) {
+        ClassLoader cl = lp.getDefaultClassLoader();
+        Class<?> nativeManager = null;
 
+        try {
+            nativeManager = Class.forName("com.android.nfc.dhimpl.NativeNfcManager", false, cl);
+            installKnownNativeManagerHook(nativeManager);
+        } catch (ClassNotFoundException e) {
+            warn("NativeNfcManager class not found on this NFC stack; continuing with vendor class enumeration");
+        } catch (Throwable t) {
+            error("Known NativeNfcManager inspection failed: " + t.getClass().getSimpleName(), t);
+        }
+
+        scanNfcBackend(cl, nativeManager);
+    }
+
+    private void installKnownNativeManagerHook(Class<?> nativeManager) {
+        try {
+            Method initMethod = nativeManager.getDeclaredMethod("doInitialize");
             deoptimize(initMethod);
             hook(initMethod).intercept(chain -> {
                 info("NFC doInitialize entered");
@@ -56,27 +85,21 @@ public class NfcDiagnosticsModule extends XposedModule {
                     throw t;
                 }
             });
-
             info("NativeNfcManager.doInitialize hook installed");
-            reportKnownVendorSignature(nativeManager);
-            scanNfcBackend(cl, nativeManager);
-        } catch (ClassNotFoundException e) {
-            warn("NativeNfcManager class not found on this NFC stack", e);
         } catch (NoSuchMethodException e) {
-            warn("NativeNfcManager.doInitialize not found on this NFC stack", e);
+            warn("NativeNfcManager.doInitialize not found on this NFC stack");
         } catch (Throwable t) {
             error("NFC hook installation failed: " + t.getClass().getSimpleName(), t);
         }
+
+        reportKnownVendorSignature(nativeManager);
     }
 
     private void logConfiguredTestRequest() {
         Cursor cursor = null;
         try {
-            Class<?> activityThread = Class.forName("android.app.ActivityThread");
-            Method currentApplication = activityThread.getDeclaredMethod("currentApplication");
-            currentApplication.setAccessible(true);
-            Object value = currentApplication.invoke(null);
-            if (!(value instanceof Application app)) {
+            Application app = currentApplication();
+            if (app == null) {
                 warn("UID config bridge unavailable: currentApplication is null");
                 return;
             }
@@ -98,6 +121,19 @@ public class NfcDiagnosticsModule extends XposedModule {
         }
     }
 
+    private Application currentApplication() {
+        try {
+            Class<?> activityThread = Class.forName("android.app.ActivityThread");
+            Method currentApplication = activityThread.getDeclaredMethod("currentApplication");
+            currentApplication.setAccessible(true);
+            Object value = currentApplication.invoke(null);
+            return value instanceof Application ? (Application) value : null;
+        } catch (Throwable t) {
+            debug("currentApplication unavailable: " + t.getClass().getSimpleName());
+            return null;
+        }
+    }
+
     private void reportKnownVendorSignature(Class<?> nativeManager) {
         try {
             nativeManager.getDeclaredMethod("doWriteNciConfig", int.class, byte[].class);
@@ -111,7 +147,7 @@ public class NfcDiagnosticsModule extends XposedModule {
 
     private void scanNfcBackend(ClassLoader cl, Class<?> nativeManager) {
         info("NFC backend scan begin; diagnostics only, no vendor method will be invoked");
-        scanClass(nativeManager);
+        if (nativeManager != null) scanClass(nativeManager);
 
         String[] candidates = {
                 "com.android.nfc.NfcService",
@@ -124,16 +160,95 @@ public class NfcDiagnosticsModule extends XposedModule {
         };
 
         for (String className : candidates) {
-            if (className.equals(nativeManager.getName())) continue;
+            if (nativeManager != null && className.equals(nativeManager.getName())) continue;
             try {
-                scanClass(cl.loadClass(className));
+                scanClass(Class.forName(className, false, cl));
             } catch (ClassNotFoundException ignored) {
                 debug("NFC backend class absent: " + className);
             } catch (Throwable t) {
                 warn("NFC backend class scan failed: " + className + " / " + t.getClass().getSimpleName());
             }
         }
+
+        enumerateVendorNfcClasses(cl);
         info("NFC backend scan end");
+    }
+
+    private void enumerateVendorNfcClasses(ClassLoader cl) {
+        Set<String> dexPaths = collectDexPaths(cl);
+        if (dexPaths.isEmpty()) {
+            warn("NFC-CLASS no APK/JAR path could be resolved from NFC process");
+            return;
+        }
+
+        int candidates = 0;
+        for (String dexPath : dexPaths) {
+            info("NFC-DEX scanning " + dexPath);
+            DexFile dexFile = null;
+            try {
+                dexFile = new DexFile(dexPath);
+                Enumeration<String> entries = dexFile.entries();
+                while (entries.hasMoreElements() && candidates < MAX_CLASS_CANDIDATES) {
+                    String className = entries.nextElement();
+                    if (!isNfcCandidateClass(className)) continue;
+                    candidates++;
+                    info("NFC-CLASS candidate " + className);
+                    try {
+                        Class<?> clazz = Class.forName(className, false, cl);
+                        scanClass(clazz);
+                    } catch (Throwable t) {
+                        debug("NFC-CLASS load skipped " + className + " / " + t.getClass().getSimpleName());
+                    }
+                }
+            } catch (Throwable t) {
+                warn("NFC-DEX scan failed for " + dexPath + " / " + t.getClass().getSimpleName(), t);
+            } finally {
+                if (dexFile != null) {
+                    try {
+                        dexFile.close();
+                    } catch (Throwable ignored) {
+                    }
+                }
+            }
+            if (candidates >= MAX_CLASS_CANDIDATES) break;
+        }
+        info("NFC-CLASS enumeration complete; candidates=" + candidates + ", limit=" + MAX_CLASS_CANDIDATES);
+    }
+
+    private Set<String> collectDexPaths(ClassLoader cl) {
+        Set<String> paths = new LinkedHashSet<>();
+
+        Application app = currentApplication();
+        if (app != null && app.getApplicationInfo() != null) {
+            if (app.getApplicationInfo().sourceDir != null) paths.add(app.getApplicationInfo().sourceDir);
+            if (app.getApplicationInfo().splitSourceDirs != null) {
+                paths.addAll(Arrays.asList(app.getApplicationInfo().splitSourceDirs));
+            }
+        }
+
+        String classLoaderText = String.valueOf(cl);
+        Matcher matcher = DEX_PATH_PATTERN.matcher(classLoaderText);
+        while (matcher.find()) {
+            paths.add(matcher.group(1));
+        }
+
+        debug("NFC-DEX resolved paths=" + paths);
+        return paths;
+    }
+
+    private boolean isNfcCandidateClass(String className) {
+        String lower = className.toLowerCase(Locale.ROOT);
+        boolean relevantPackage = lower.startsWith("com.android.nfc.")
+                || lower.startsWith("com.st.")
+                || lower.startsWith("vendor.st.")
+                || lower.startsWith("com.stmicroelectronics.")
+                || lower.startsWith("android.hardware.nfc.");
+        if (!relevantPackage) return false;
+
+        for (String keyword : CLASS_KEYWORDS) {
+            if (lower.contains(keyword)) return true;
+        }
+        return false;
     }
 
     private void scanClass(Class<?> clazz) {
@@ -142,18 +257,24 @@ public class NfcDiagnosticsModule extends XposedModule {
             for (Method method : clazz.getDeclaredMethods()) {
                 if (!matchesKeyword(method.getName())) continue;
                 methodMatches++;
-                info("NFC-SCAN METHOD " + formatMethod(method));
+                if (methodMatches <= MAX_MEMBERS_PER_CLASS) {
+                    info("NFC-SCAN METHOD " + formatMethod(method));
+                }
             }
 
             int fieldMatches = 0;
             for (Field field : clazz.getDeclaredFields()) {
                 if (!matchesKeyword(field.getName())) continue;
                 fieldMatches++;
-                info("NFC-SCAN FIELD " + formatField(field));
+                if (fieldMatches <= MAX_MEMBERS_PER_CLASS) {
+                    info("NFC-SCAN FIELD " + formatField(field));
+                }
             }
 
             if (methodMatches > 0 || fieldMatches > 0) {
+                int ctorCount = 0;
                 for (Constructor<?> constructor : clazz.getDeclaredConstructors()) {
+                    if (ctorCount++ >= 8) break;
                     debug("NFC-SCAN CTOR " + formatConstructor(constructor));
                 }
                 info("NFC-SCAN CLASS " + clazz.getName()
