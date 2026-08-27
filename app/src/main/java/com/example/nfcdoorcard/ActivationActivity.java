@@ -18,10 +18,7 @@ import java.text.SimpleDateFormat;
 import java.util.Date;
 import java.util.Locale;
 
-/**
- * Launcher activity that refreshes MainActivity when the modern libxposed service
- * connection or module scope changes, and provides in-app NFC/LSPosed log capture.
- */
+/** Launcher activity with libxposed status and in-app NFC/LSPosed diagnostics. */
 public final class ActivationActivity extends MainActivity implements NfcDoorApplication.Listener {
     private static final int REQUEST_EXPORT_LOG = 4102;
 
@@ -34,6 +31,7 @@ public final class ActivationActivity extends MainActivity implements NfcDoorApp
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         addLogControls();
+        cleanupLegacyPersistProperties();
     }
 
     @Override
@@ -56,6 +54,24 @@ public final class ActivationActivity extends MainActivity implements NfcDoorApp
     @Override
     public void onXposedStateChanged() {
         runOnUiThread(this::refreshStatus);
+    }
+
+    private void cleanupLegacyPersistProperties() {
+        new Thread(() -> {
+            RootShell.Result oldActive = RootShell.execute("getprop persist.nfcuidsim.active");
+            RootShell.Result oldUid = RootShell.execute("getprop persist.nfcuidsim.uid");
+            boolean present = !oldActive.output().isEmpty() || !oldUid.output().isEmpty();
+            if (!present) return;
+
+            RootShell.Result clear = RootShell.execute(
+                    "setprop persist.nfcuidsim.active ''\n" +
+                    "setprop persist.nfcuidsim.uid ''\n");
+            if (clear.success()) {
+                AppLogger.i("Diag", "已清空旧版 persist.nfcuidsim.* 系统属性");
+            } else {
+                AppLogger.w("Diag", "旧版 persist.nfcuidsim.* 清理失败: " + clear.describe());
+            }
+        }, "legacy-prop-cleanup").start();
     }
 
     private void addLogControls() {
@@ -114,7 +130,9 @@ public final class ActivationActivity extends MainActivity implements NfcDoorApp
 
             RootShell.Result props = RootShell.execute(
                     "printf 'ro.hardware.nfc='; getprop ro.hardware.nfc; " +
-                    "printf 'ro.boot.hardware='; getprop ro.boot.hardware");
+                    "printf 'ro.boot.hardware='; getprop ro.boot.hardware; " +
+                    "printf 'legacy.active='; getprop persist.nfcuidsim.active; " +
+                    "printf 'legacy.uid='; getprop persist.nfcuidsim.uid");
             report.append("【设备 NFC 属性】\n");
             report.append(props.output().isEmpty() ? props.describe() : props.output()).append("\n\n");
 
@@ -123,11 +141,8 @@ public final class ActivationActivity extends MainActivity implements NfcDoorApp
                     "grep -i -E 'NfcUIDSim|NFC-SCAN|LSPosed|libxposed|com\\.android\\.nfc' | " +
                     "tail -n 2000 || true");
             report.append("【NFC / LSPosed Logcat】\n");
-            if (logcat.output().isEmpty()) {
-                report.append("未找到匹配日志。\n");
-            } else {
-                report.append(logcat.output()).append('\n');
-            }
+            if (logcat.output().isEmpty()) report.append("未找到匹配日志。\n");
+            else report.append(logcat.output()).append('\n');
 
             RootShell.Result lsposedFiles = RootShell.execute(
                     "for d in /data/adb/lspd/log /data/adb/lsposed/log; do " +
