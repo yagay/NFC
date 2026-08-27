@@ -32,4 +32,5 @@ dependencies {
     implementation("androidx.core:core:1.15.0")
     implementation("androidx.activity:activity:1.10.0")
     compileOnly("io.github.libxposed:api:102.0.0")
+    implementation("io.github.libxposed:service:102.0.0")
 }
