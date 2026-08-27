@@ -60,6 +60,11 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
         return createDeviceProtectedStorageContext().getSharedPreferences("sim_prefs", Context.MODE_PRIVATE);
     }
 
+    /** Legacy builds stored sim_prefs in credential-protected storage. */
+    private SharedPreferences legacySimulationPrefs() {
+        return getSharedPreferences("sim_prefs", Context.MODE_PRIVATE);
+    }
+
     private SharedPreferences uiPrefs() {
         return getSharedPreferences("ui_prefs", Context.MODE_PRIVATE);
     }
@@ -228,7 +233,7 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
         content.addView(simulateBtn, lp(-1, dp(52), 12));
 
         stopSimBtn = new Button(this);
-        stopSimBtn.setText("停止 UID 测试请求");
+        stopSimBtn.setText("停止 UID 测试请求 / 清理旧状态");
         stopSimBtn.setOnClickListener(v -> stopSimulation());
         content.addView(stopSimBtn, lp(-1, dp(52), 12));
 
@@ -386,14 +391,13 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
         String safeUid = currentUid.replaceAll("[^0-9A-Fa-f:]", "");
         new android.app.AlertDialog.Builder(this)
                 .setTitle("设置测试请求")
-                .setMessage("将保存 UID " + safeUid + " 并重启 NFC 服务用于诊断。当前版本不会改写控制器固定 UID。")
+                .setMessage("将先保存 UID " + safeUid + "，确认配置落盘后再重启 NFC。当前版本不会写入控制器固定 UID。")
                 .setPositiveButton("继续", (d, w) -> enqueueNfcRequest(true, safeUid))
                 .setNegativeButton("取消", null)
                 .show();
     }
 
     private void stopSimulation() {
-        if (!isSimulationRequestActive()) { toast("当前没有活动的 UID 测试请求"); return; }
         enqueueNfcRequest(false, null);
     }
 
@@ -403,16 +407,42 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
             return;
         }
         setNfcButtonsEnabled(false);
-        AppLogger.i("Action", start ? "准备设置 UID 测试请求: " + uid : "准备停止 UID 测试请求");
+        AppLogger.i("Action", start ? "准备设置 UID 测试请求: " + uid : "准备停止 UID 测试请求并清理旧状态");
 
         nfcExecutor.execute(() -> {
-            RootShell.Result result = RootShell.execute("set -e\nsvc nfc disable\nsleep 1\nsvc nfc enable\n");
+            SharedPreferences.Editor editor = simulationPrefs().edit();
+            if (start) {
+                editor.putString("target_uid", uid).putBoolean("request_active", true);
+            } else {
+                editor.remove("target_uid").putBoolean("request_active", false);
+            }
+            boolean currentPrefsSaved = editor.commit();
+
+            // Never migrate legacy UID values forward. Old builds used credential-protected
+            // sim_prefs and persist.nfcuidsim.* fallbacks, which could keep a fixed UID alive.
+            boolean legacyPrefsCleared = legacySimulationPrefs().edit()
+                    .remove("target_uid")
+                    .putBoolean("request_active", false)
+                    .commit();
+
+            RootShell.Result result;
+            if (!currentPrefsSaved || !legacyPrefsCleared) {
+                result = new RootShell.Result(false, -1,
+                        "failed to persist current UID state or clear legacy state", false);
+            } else {
+                result = RootShell.execute(
+                        "set -e\n" +
+                        "setprop persist.nfcuidsim.active '' || true\n" +
+                        "setprop persist.nfcuidsim.uid '' || true\n" +
+                        "svc nfc disable\n" +
+                        "sleep 1\n" +
+                        "svc nfc enable\n");
+            }
+
             if (result.success()) {
-                SharedPreferences.Editor editor = simulationPrefs().edit();
-                if (start) editor.putString("target_uid", uid).putBoolean("request_active", true);
-                else editor.remove("target_uid").putBoolean("request_active", false);
-                editor.commit();
-                AppLogger.i("Root", start ? "测试请求已保存并完成 NFC 重启" : "测试请求已停止并完成 NFC 重启");
+                AppLogger.i("Root", start
+                        ? "UID 请求已先保存，旧固定 UID 状态已清理，然后完成 NFC 重启"
+                        : "UID 请求和旧固定 UID 状态已清理，然后完成 NFC 重启");
             } else {
                 AppLogger.e("Root", "NFC 操作失败: " + result.describe());
             }
@@ -420,8 +450,11 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
             runOnUiThreadIfAlive(() -> {
                 setNfcButtonsEnabled(true);
                 refreshStatus();
-                if (result.success()) toast(start ? "UID 测试请求已设置" : "UID 测试请求已停止");
-                else Toast.makeText(this, "Root/NFC 操作失败: " + result.describe(), Toast.LENGTH_LONG).show();
+                if (result.success()) {
+                    toast(start ? "UID 测试请求已设置" : "UID 测试请求和旧状态已清理");
+                } else {
+                    Toast.makeText(this, "配置/Root/NFC 操作失败: " + result.describe(), Toast.LENGTH_LONG).show();
+                }
             });
         });
     }
