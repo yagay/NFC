@@ -1,1 +1,0 @@
-Trigger latest debug APK build after HCE resource fix.
