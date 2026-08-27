@@ -31,6 +31,11 @@ public final class SystemDefaultLauncherActivity extends AppCompatActivity {
                 .getSharedPreferences("sim_prefs", Context.MODE_PRIVATE);
     }
 
+    /** Legacy builds stored sim_prefs in credential-protected storage. */
+    private SharedPreferences legacySimulationPrefs() {
+        return getSharedPreferences("sim_prefs", Context.MODE_PRIVATE);
+    }
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -50,7 +55,7 @@ public final class SystemDefaultLauncherActivity extends AppCompatActivity {
         root.addView(title, lp(-1, -2, 16));
 
         TextView info = new TextView(this);
-        info.setText("当前硬件属性已确认是 ST_NFC。下面的扫描只读取 ST HAL 配置，重点定位 NFC-A Listen 参数 0x30/0x31/0x32/0x33 及 NFCID1 候选值，不写入任何 NFC 数据。");
+        info.setText("当前硬件属性已确认是 ST_NFC。恢复系统默认 UID 会同时清除新旧版本保存的 UID 请求和旧版 persist.nfcuidsim 属性，然后再重启 NFC；不会写入新的 UID。扫描功能仍然完全只读。");
         info.setTextSize(15);
         root.addView(info, lp(-1, -2, 20));
 
@@ -145,7 +150,7 @@ public final class SystemDefaultLauncherActivity extends AppCompatActivity {
     private void confirmRestore() {
         new android.app.AlertDialog.Builder(this)
                 .setTitle("恢复系统默认 UID")
-                .setMessage("将停止 UID 测试、删除已保存的目标 UID，并重启 NFC 服务。不会写入任何新的 UID。")
+                .setMessage("将清除当前版本和旧版本保存的 UID 请求、清除旧版 persist.nfcuidsim 属性，然后重启 NFC。不会写入任何新的 UID。")
                 .setPositiveButton("恢复", (dialog, which) -> restoreSystemDefaultUid())
                 .setNegativeButton("取消", null)
                 .show();
@@ -159,15 +164,20 @@ public final class SystemDefaultLauncherActivity extends AppCompatActivity {
         setActionButtonsEnabled(false);
 
         new Thread(() -> {
-            SharedPreferences.Editor editor = simulationPrefs().edit();
-            editor.putBoolean("request_active", false);
-            editor.remove("target_uid");
-            boolean prefsSaved = editor.commit();
+            boolean devicePrefsSaved = simulationPrefs().edit()
+                    .putBoolean("request_active", false)
+                    .remove("target_uid")
+                    .commit();
+            boolean legacyPrefsSaved = legacySimulationPrefs().edit()
+                    .putBoolean("request_active", false)
+                    .remove("target_uid")
+                    .commit();
+            boolean prefsSaved = devicePrefsSaved && legacyPrefsSaved;
 
             RootShell.Result result;
             if (!prefsSaved) {
                 result = new RootShell.Result(false, -1,
-                        "failed to persist UID default state", false);
+                        "failed to clear current/legacy UID state", false);
             } else {
                 result = RootShell.execute(
                         "set -e\n" +
@@ -178,14 +188,14 @@ public final class SystemDefaultLauncherActivity extends AppCompatActivity {
                         "svc nfc enable\n");
             }
 
-            AppLogger.i("UID", "恢复系统默认 UID: prefsSaved=" + prefsSaved +
-                    ", nfcRestart=" + result.success());
+            AppLogger.i("UID", "恢复系统默认 UID: devicePrefs=" + devicePrefsSaved
+                    + ", legacyPrefs=" + legacyPrefsSaved + ", nfcRestart=" + result.success());
             operationRunning.set(false);
             runOnUiThread(() -> {
                 setActionButtonsEnabled(true);
                 if (result.success()) {
                     Toast.makeText(this,
-                            "已清除 UID 模拟配置并重启 NFC；若 UID 仍不变，请运行 ST 原厂 NFCID1 解析",
+                            "已清除新旧 UID 请求和旧版属性，并重启 NFC；当前模块不会重新写入固定 UID",
                             Toast.LENGTH_LONG).show();
                 } else {
                     Toast.makeText(this,
