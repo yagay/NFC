@@ -5,16 +5,23 @@ import java.io.InputStreamReader;
 import java.util.concurrent.TimeUnit;
 
 public final class RootStatus {
-    private static Boolean cachedResult = null;
+    private static volatile Boolean cachedResult;
 
     private RootStatus() {}
 
+    public static Boolean getCachedResult() {
+        return cachedResult;
+    }
+
     public static boolean hasRoot() {
-        if (cachedResult != null) return cachedResult;
-        
+        Boolean cached = cachedResult;
+        if (cached != null) return cached;
+
         Process p = null;
         try {
-            p = new ProcessBuilder("su", "-c", "id -u").redirectErrorStream(true).start();
+            p = new ProcessBuilder("su", "-c", "id -u")
+                    .redirectErrorStream(true)
+                    .start();
             if (!p.waitFor(2, TimeUnit.SECONDS)) {
                 p.destroyForcibly();
                 cachedResult = false;
