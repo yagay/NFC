@@ -28,11 +28,15 @@ public final class UidConfigProvider extends ContentProvider {
 
         Context context = providerContext().createDeviceProtectedStorageContext();
         android.content.SharedPreferences prefs = context.getSharedPreferences("sim_prefs", Context.MODE_PRIVATE);
-        String uid = prefs.getString("target_uid", null);
         boolean active = prefs.getBoolean("request_active", false);
+        String uid = active ? prefs.getString("target_uid", null) : null;
+        if (uid != null) {
+            uid = uid.trim();
+            if (uid.isEmpty()) uid = null;
+        }
 
         MatrixCursor cursor = new MatrixCursor(new String[]{COLUMN_UID, COLUMN_ACTIVE}, 1);
-        cursor.addRow(new Object[]{uid, active ? 1 : 0});
+        cursor.addRow(new Object[]{uid, active && uid != null ? 1 : 0});
         return cursor;
     }
 
