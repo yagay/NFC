@@ -28,15 +28,8 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Ensure Android API 37 SDK
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ ! -d "$ANDROID_HOME/platforms/android-37" ]; then
-            sdkmanager "platforms;android-37"
-          fi
-          sdkmanager "build-tools;36.0.0"
-          test -d "$ANDROID_HOME/platforms/android-37"
+      - name: Install Android SDK
+        run: sdkmanager "platforms;android-36" "build-tools;36.0.0"
 
       - name: Set up Gradle 9.4.1
         uses: gradle/actions/setup-gradle@v4
