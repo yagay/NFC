@@ -1,6 +1,6 @@
-name=NFC 门禁模拟
+name=NFC 门禁诊断
 author=Developer
-description=NFC UID 模拟与诊断
+description=NFC / LSPosed 诊断与 UID 测试配置（不写入控制器固定 UID）
 minApiVersion=102
 targetApiVersion=102
 staticScope=true
