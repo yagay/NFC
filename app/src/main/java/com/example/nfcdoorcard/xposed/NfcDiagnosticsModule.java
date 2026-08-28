@@ -22,8 +22,13 @@ public class NfcDiagnosticsModule extends XposedModule {
     private static final String TAG = "NfcUIDSim";
     private static final Uri CONFIG_URI = Uri.parse("content://com.example.nfcdoorcard.uidconfig/target");
     private static final int MAX_STACK_FRAMES = 6;
+    private static final int MAX_AUTO_TRACE_PARAMS = 4;
+    private static final String[] CANDIDATE_KEYWORDS = {
+            "config", "core", "vendor", "raw", "write", "rf", "listen", "discovery", "nfcid", "uid"
+    };
 
     private final Set<String> installedTraceHooks = new HashSet<>();
+    private final Set<String> inspectedRuntimeClasses = new HashSet<>();
 
     @Override
     public void onModuleLoaded(XposedModuleInterface.ModuleLoadedParam param) {
@@ -131,8 +136,41 @@ public class NfcDiagnosticsModule extends XposedModule {
         info("NFC-RUNTIME DeviceHost field=" + hostField);
         info("NFC-RUNTIME DeviceHost class=" + runtime.getName());
         info("NFC-RUNTIME DeviceHost interfaces=" + joinTypes(runtime.getInterfaces()));
+        inspectAndTraceRuntimeClass(runtime);
         installHostTraceHooks(runtime);
         logConfiguredTestRequest();
+    }
+
+    private void inspectAndTraceRuntimeClass(Class<?> runtime) {
+        synchronized (inspectedRuntimeClasses) {
+            if (!inspectedRuntimeClasses.add(runtime.getName())) return;
+        }
+
+        info("NFC-RUNTIME METHOD ENUM BEGIN class=" + runtime.getName());
+        int total = 0;
+        int candidates = 0;
+        for (Method method : runtime.getDeclaredMethods()) {
+            total++;
+            if (!isCandidateMethod(method)) continue;
+            candidates++;
+            info("NFC-RUNTIME CANDIDATE " + formatMethod(method));
+            if (method.getParameterCount() <= MAX_AUTO_TRACE_PARAMS) {
+                installTraceHook(runtime, method.getName(), method.getParameterTypes());
+            } else {
+                info("NFC-RUNTIME candidate not auto-hooked (params=" + method.getParameterCount() + "): " + method.getName());
+            }
+        }
+        info("NFC-RUNTIME METHOD ENUM END class=" + runtime.getName()
+                + " total=" + total + " candidates=" + candidates);
+    }
+
+    private boolean isCandidateMethod(Method method) {
+        if (method.isSynthetic() || method.isBridge()) return false;
+        String name = method.getName().toLowerCase(Locale.ROOT);
+        for (String keyword : CANDIDATE_KEYWORDS) {
+            if (name.contains(keyword)) return true;
+        }
+        return false;
     }
 
     private void installHostTraceHooks(Class<?> runtime) {
