@@ -124,47 +124,38 @@ public final class LegacyHardcodedUidTraceActivity extends AppCompatActivity {
 
     private String buildRuntimeTraceCommand() {
         return "set +e\n" +
-                "echo '=== NFC UID runtime diagnostic v3 ==='\n" +
+                "echo '=== NFC UID runtime diagnostic v4 ==='\n" +
                 "date\n" +
                 "echo\n" +
-                "echo '=== 1A. Persistent LSPosed module logs ==='\n" +
+                "echo '=== 1A. Recent persistent LSPosed NFC trace ==='\n" +
                 "for d in /data/adb/lspd/log /data/adb/lspd/log/verbose; do\n" +
                 " [ -d \"$d\" ] || continue;\n" +
-                " find \"$d\" -type f 2>/dev/null | sort | tail -n 40 | while IFS= read -r f; do\n" +
-                "  grep -iE 'NfcUIDSim|com\\.example\\.nfcdoorcard|NFC-RUNTIME|NFC-TRACE|NxpNativeNfcManager|NativeNfcManager' \"$f\" 2>/dev/null;\n" +
+                " find \"$d\" -maxdepth 1 -type f 2>/dev/null | sort | tail -n 8 | while IFS= read -r f; do\n" +
+                "  tail -n 5000 \"$f\" 2>/dev/null | grep -iE 'NfcUIDSim|NFC-RUNTIME|NFC-TRACE (ENTER|RETURN|DIGEST|THROW)|NxpNativeNfcManager|setTransitConfig|changeRfParamsByConfig|setHceTypeAConfig|sendRawVendorCmd' | tail -n 180;\n" +
                 " done;\n" +
-                "done | tail -n 1000\n" +
+                "done | tail -n 450\n" +
                 "echo\n" +
-                "echo '=== 1B. Current logcat NFC runtime logs ==='\n" +
-                "logcat -b all -d -v threadtime -t 12000 2>/dev/null | grep -iE 'NfcUIDSim|NfcDoorHCE|UidConfigProvider|NfcService|NativeNfcManager|DeviceHost|NFC-RUNTIME|NFC-TRACE|changeRfParams|changeRfParamsByConfig|doWriteData|nativeSendRawVendorCmd|setDiscoveryTech|restartRfDiscovery|doRestartRFDiscovery' | tail -n 900\n" +
+                "echo '=== 1B. Current logcat NFC trace ==='\n" +
+                "logcat -b all -d -v threadtime -t 5000 2>/dev/null | grep -iE 'NfcUIDSim|NFC-RUNTIME|NFC-TRACE|NxpNativeNfcManager|setTransitConfig|changeRfParamsByConfig|setHceTypeAConfig|sendRawVendorCmd|NfcService' | tail -n 400\n" +
                 "echo\n" +
-                "echo '=== 2. HAL/vendor crash clues ==='\n" +
-                "logcat -b all -d -v threadtime -t 12000 2>/dev/null | grep -iE 'libnfc|sn100|sn110|sn220|st21|nfc.*fatal|nfc.*abort|com.android.nfc.*crash|SIGABRT|WatchDogThread' | tail -n 420\n" +
+                "echo '=== 2. Transit config identity ==='\n" +
+                "for f in /data/nfc/libnfc-nxpTransit.conf /data/vendor/nfc/libnfc_default_config.conf /data/vendor/nfc/libnfc_tap_config.conf /data/vendor/nfc/libnfc_accesscard_config.conf; do\n" +
+                " [ -f \"$f\" ] || continue; echo \"--- $f ---\"; wc -c \"$f\" 2>/dev/null; sha256sum \"$f\" 2>/dev/null; done\n" +
                 "echo\n" +
-                "echo '=== 3. Android / device ==='\n" +
-                "getprop ro.product.manufacturer\n" +
-                "getprop ro.product.model\n" +
-                "getprop ro.build.version.release\n" +
-                "getprop ro.build.version.sdk\n" +
-                "getprop ro.hardware.nfc\n" +
-                "getprop ro.boot.hardware\n" +
+                "echo '=== 3. HAL/vendor crash clues ==='\n" +
+                "logcat -b all -d -v threadtime -t 5000 2>/dev/null | grep -iE 'libnfc|sn100|sn110|sn220|st21|nfc.*fatal|nfc.*abort|com.android.nfc.*crash|SIGABRT|WatchDogThread' | tail -n 220\n" +
                 "echo\n" +
-                "echo '=== 4. NFC processes/services ==='\n" +
-                "ps -A 2>/dev/null | grep -iE 'nfc|ese' | head -n 80\n" +
-                "service list 2>/dev/null | grep -i nfc | head -n 80\n" +
+                "echo '=== 4. NFC runtime summary ==='\n" +
+                "ps -A 2>/dev/null | grep -iE 'nfc|ese' | head -n 40\n" +
+                "service list 2>/dev/null | grep -i nfc | head -n 40\n" +
+                "dumpsys nfc 2>&1 | grep -E 'mState=|listenTech=|pollTech=|mTechMask:|mEnableHostRouting:|mIsSecureNfcEnabled=|mIsReaderOptionEnabled=' | head -n 60\n" +
                 "echo\n" +
-                "echo '=== 5. NFC service summary ==='\n" +
-                "dumpsys nfc 2>&1 | grep -E 'mState=|listenTech=|pollTech=|mTechMask:|mEnableLPD:|mEnableReader:|mEnableHostRouting:|mIsSecureNfcEnabled=|mIsReaderOptionEnabled=|mIsObserveMode' | head -n 100\n" +
+                "echo '=== 5. Relevant properties ==='\n" +
+                "getprop 2>/dev/null | grep -iE '(^|\\[)(ro\\.hardware\\.nfc|ro\\.nfc|nfc\\.|persist\\.nfc|persist\\.nfcuidsim|oplus.*nfc|sn220|st21)' | head -n 100\n" +
                 "echo\n" +
-                "echo '=== 6. Relevant properties ==='\n" +
-                "getprop 2>/dev/null | grep -iE '(^|\\[)(ro\\.hardware\\.nfc|ro\\.nfc|nfc\\.|persist\\.nfc|persist\\.nfcuidsim|oplus.*nfc|sn220|st21)' | head -n 160\n" +
-                "echo\n" +
-                "echo '=== 7. Key config files only ==='\n" +
-                "for f in /data/vendor/nfc/libnfc-mtp-SN220.conf /data/vendor/nfc/libnfc-nci.conf /data/vendor/nfc/libnfc_accesscard_config.conf /data/vendor/nfc/libnfc_default_config.conf /data/vendor/nfc/libnfc_tap_config.conf /data/nfc/libnfc-nxpTransit.conf /vendor/etc/libnfc-hal-st.conf; do\n" +
-                " [ -f \"$f\" ] || continue; echo \"--- $f ---\"; stat -c 'size=%s mtime=%y' \"$f\" 2>/dev/null; grep -Ein 'LA_NFCID1|NFCID1|NXP_CORE_CONF|CORE_CONF_PROP|RF_CONF' \"$f\" 2>/dev/null | head -n 45; done\n" +
-                "echo\n" +
-                "echo '=== 8. CardEmulator backup presence ==='\n" +
-                "find /data/nfc/CardEmulator/backup -maxdepth 5 -type f 2>/dev/null | grep -iE 'libnfc|nfc.*conf' | head -n 100\n" +
+                "echo '=== 6. Key config clues ==='\n" +
+                "for f in /data/vendor/nfc/libnfc-mtp-SN220.conf /data/nfc/libnfc-nxpTransit.conf; do\n" +
+                " [ -f \"$f\" ] || continue; echo \"--- $f ---\"; stat -c 'size=%s mtime=%y' \"$f\" 2>/dev/null; grep -Ein 'LA_NFCID1|NFCID1|NXP_CORE_CONF|RF_CONF' \"$f\" 2>/dev/null | head -n 35; done\n" +
                 "echo\n" +
                 "echo '=== End ==='\n";
     }
