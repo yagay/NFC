@@ -41,7 +41,7 @@ public final class LegacyHardcodedUidTraceActivity extends AppCompatActivity {
         root.addView(title, lp(-1, -2, 14));
 
         TextView info = new TextView(this);
-        info.setText("只读检查旧 UID 遗留、当前 NFC 配置与运行时调用链。不会写入 NFC 控制器，也不会修改或删除系统 NFC 文件。");
+        info.setText("只读检查旧 UID 遗留、当前 NFC 配置与完整运行时控制链。不会写入 NFC 控制器，也不会修改或删除系统 NFC 文件。");
         info.setTextSize(15);
         root.addView(info, lp(-1, -2, 20));
 
@@ -51,7 +51,7 @@ public final class LegacyHardcodedUidTraceActivity extends AppCompatActivity {
         root.addView(traceButton, lp(-1, dp(54), 12));
 
         runtimeButton = new Button(this);
-        runtimeButton.setText("抓取 NFC 运行时模拟链路");
+        runtimeButton.setText("抓取完整 NFC 控制链");
         runtimeButton.setOnClickListener(v -> runRuntimeTrace());
         root.addView(runtimeButton, lp(-1, dp(54), 12));
 
@@ -72,7 +72,7 @@ public final class LegacyHardcodedUidTraceActivity extends AppCompatActivity {
     }
 
     private void runRuntimeTrace() {
-        runDiagnostic("正在抓取 NFC 运行时链路…", "trace-nfc-runtime", buildRuntimeTraceCommand(), "NFC 运行时诊断结果");
+        runDiagnostic("正在抓取完整 NFC 控制链…", "trace-nfc-runtime", buildRuntimeTraceCommand(), "NFC 完整控制链诊断结果");
     }
 
     private void runDiagnostic(String toastText, String threadName, String command, String dialogTitle) {
@@ -124,38 +124,38 @@ public final class LegacyHardcodedUidTraceActivity extends AppCompatActivity {
 
     private String buildRuntimeTraceCommand() {
         return "set +e\n" +
-                "echo '=== NFC UID runtime diagnostic v4 ==='\n" +
+                "echo '=== NFC complete control-flow diagnostic v5 ==='\n" +
                 "date\n" +
                 "echo\n" +
-                "echo '=== 1A. Recent persistent LSPosed NFC trace ==='\n" +
+                "echo '=== 1A. Recent persistent LSPosed NFC control flow ==='\n" +
                 "for d in /data/adb/lspd/log /data/adb/lspd/log/verbose; do\n" +
                 " [ -d \"$d\" ] || continue;\n" +
                 " find \"$d\" -maxdepth 1 -type f 2>/dev/null | sort | tail -n 8 | while IFS= read -r f; do\n" +
-                "  tail -n 5000 \"$f\" 2>/dev/null | grep -iE 'NfcUIDSim|NFC-RUNTIME|NFC-TRACE (ENTER|RETURN|DIGEST|THROW)|NxpNativeNfcManager|setTransitConfig|changeRfParamsByConfig|setHceTypeAConfig|sendRawVendorCmd' | tail -n 180;\n" +
+                "  tail -n 8000 \"$f\" 2>/dev/null | grep -iE 'NfcUIDSim|NFC-FLOW|NFC-RUNTIME DeviceHost|NFC-TRACE (ENTER|RETURN|DIGEST|THROW|STACK)|VendorNfcService|NxpNfcService|NxpNfcAdapterService|NxpNativeNfcManager|doSetHceTypeAConfig|setHceTypeAConfig|setPollingTechMask|setTransitConfig|changeRfParamsByConfig|setConfig' | tail -n 320;\n" +
                 " done;\n" +
-                "done | tail -n 450\n" +
+                "done | tail -n 800\n" +
                 "echo\n" +
-                "echo '=== 1B. Current logcat NFC trace ==='\n" +
-                "logcat -b all -d -v threadtime -t 5000 2>/dev/null | grep -iE 'NfcUIDSim|NFC-RUNTIME|NFC-TRACE|NxpNativeNfcManager|setTransitConfig|changeRfParamsByConfig|setHceTypeAConfig|sendRawVendorCmd|NfcService' | tail -n 400\n" +
+                "echo '=== 1B. Current logcat NFC control flow ==='\n" +
+                "logcat -b all -d -v threadtime -t 8000 2>/dev/null | grep -iE 'NfcUIDSim|NFC-FLOW|NFC-RUNTIME DeviceHost|NFC-TRACE|VendorNfcService|NxpNfcService|NxpNfcAdapterService|NxpNativeNfcManager|doSetHceTypeAConfig|setHceTypeAConfig|setPollingTechMask|setTransitConfig|changeRfParamsByConfig|setConfig|NfcService' | tail -n 700\n" +
                 "echo\n" +
-                "echo '=== 2. Transit config identity ==='\n" +
+                "echo '=== 2. Config identities ==='\n" +
                 "for f in /data/nfc/libnfc-nxpTransit.conf /data/vendor/nfc/libnfc_default_config.conf /data/vendor/nfc/libnfc_tap_config.conf /data/vendor/nfc/libnfc_accesscard_config.conf; do\n" +
-                " [ -f \"$f\" ] || continue; echo \"--- $f ---\"; wc -c \"$f\" 2>/dev/null; sha256sum \"$f\" 2>/dev/null; done\n" +
+                " [ -f \"$f\" ] || continue; echo \"--- $f ---\"; wc -c \"$f\" 2>/dev/null; sha256sum \"$f\" 2>/dev/null; stat -c 'mtime=%y' \"$f\" 2>/dev/null; done\n" +
                 "echo\n" +
                 "echo '=== 3. HAL/vendor crash clues ==='\n" +
-                "logcat -b all -d -v threadtime -t 5000 2>/dev/null | grep -iE 'libnfc|sn100|sn110|sn220|st21|nfc.*fatal|nfc.*abort|com.android.nfc.*crash|SIGABRT|WatchDogThread' | tail -n 220\n" +
+                "logcat -b all -d -v threadtime -t 8000 2>/dev/null | grep -iE 'libnfc|sn100|sn110|sn220|st21|nfc.*fatal|nfc.*abort|com.android.nfc.*crash|SIGABRT|WatchDogThread' | tail -n 260\n" +
                 "echo\n" +
                 "echo '=== 4. NFC runtime summary ==='\n" +
-                "ps -A 2>/dev/null | grep -iE 'nfc|ese' | head -n 40\n" +
-                "service list 2>/dev/null | grep -i nfc | head -n 40\n" +
-                "dumpsys nfc 2>&1 | grep -E 'mState=|listenTech=|pollTech=|mTechMask:|mEnableHostRouting:|mIsSecureNfcEnabled=|mIsReaderOptionEnabled=' | head -n 60\n" +
+                "ps -A 2>/dev/null | grep -iE 'nfc|ese' | head -n 50\n" +
+                "service list 2>/dev/null | grep -i nfc | head -n 50\n" +
+                "dumpsys nfc 2>&1 | grep -E 'mState=|listenTech=|pollTech=|mTechMask:|mEnableHostRouting:|mIsSecureNfcEnabled=|mIsReaderOptionEnabled=' | head -n 80\n" +
                 "echo\n" +
                 "echo '=== 5. Relevant properties ==='\n" +
-                "getprop 2>/dev/null | grep -iE '(^|\\[)(ro\\.hardware\\.nfc|ro\\.nfc|nfc\\.|persist\\.nfc|persist\\.nfcuidsim|oplus.*nfc|sn220|st21)' | head -n 100\n" +
+                "getprop 2>/dev/null | grep -iE '(^|\\[)(ro\\.hardware\\.nfc|ro\\.nfc|nfc\\.|persist\\.nfc|persist\\.nfcuidsim|oplus.*nfc|sn220|st21)' | head -n 120\n" +
                 "echo\n" +
                 "echo '=== 6. Key config clues ==='\n" +
                 "for f in /data/vendor/nfc/libnfc-mtp-SN220.conf /data/nfc/libnfc-nxpTransit.conf; do\n" +
-                " [ -f \"$f\" ] || continue; echo \"--- $f ---\"; stat -c 'size=%s mtime=%y' \"$f\" 2>/dev/null; grep -Ein 'LA_NFCID1|NFCID1|NXP_CORE_CONF|RF_CONF' \"$f\" 2>/dev/null | head -n 35; done\n" +
+                " [ -f \"$f\" ] || continue; echo \"--- $f ---\"; stat -c 'size=%s mtime=%y' \"$f\" 2>/dev/null; grep -Ein 'LA_NFCID1|NFCID1|NXP_CORE_CONF|RF_CONF' \"$f\" 2>/dev/null | head -n 40; done\n" +
                 "echo\n" +
                 "echo '=== End ==='\n";
     }
@@ -186,7 +186,7 @@ public final class LegacyHardcodedUidTraceActivity extends AppCompatActivity {
     private void shareReport(String report) {
         Intent intent = new Intent(Intent.ACTION_SEND);
         intent.setType("text/plain");
-        intent.putExtra(Intent.EXTRA_SUBJECT, "NFC runtime diagnostic");
+        intent.putExtra(Intent.EXTRA_SUBJECT, "NFC complete control-flow diagnostic");
         intent.putExtra(Intent.EXTRA_TEXT, report);
         startActivity(Intent.createChooser(intent, "分享 NFC 诊断报告"));
     }
