@@ -19,7 +19,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public final class LegacyHardcodedUidTraceActivity extends AppCompatActivity {
     private final AtomicBoolean running = new AtomicBoolean(false);
     private Button traceButton;
+    private Button runtimeButton;
     private Button toolsButton;
+    private String lastReport;
 
     @Override protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -34,19 +36,29 @@ public final class LegacyHardcodedUidTraceActivity extends AppCompatActivity {
         root.setPadding(pad, pad, pad, pad);
 
         TextView title = new TextView(this);
-        title.setText("4cfe2f 写死 UID 遗留追踪");
+        title.setText("NFC UID 诊断中心");
         title.setTextSize(23);
         root.addView(title, lp(-1, -2, 14));
 
         TextView info = new TextView(this);
-        info.setText("只读检查 /data/nfc/CardEmulator/backup 与当前 NFC 配置，专门查 AABBCCDD、LA_NFCID1、NFCID1 和 NXP_CORE_CONF。不会写入 NFC，也不会删除文件。");
+        info.setText("只读检查旧 UID 遗留、当前 NFC 配置与运行时调用链。不会写入 NFC 控制器，也不会修改或删除系统 NFC 文件。");
         info.setTextSize(15);
         root.addView(info, lp(-1, -2, 20));
 
         traceButton = new Button(this);
-        traceButton.setText("一键追踪 4cfe2f 写死 UID 遗留");
+        traceButton.setText("一键追踪旧写死 UID 遗留");
         traceButton.setOnClickListener(v -> runTrace());
         root.addView(traceButton, lp(-1, dp(54), 12));
+
+        runtimeButton = new Button(this);
+        runtimeButton.setText("抓取 NFC 运行时模拟链路");
+        runtimeButton.setOnClickListener(v -> runRuntimeTrace());
+        root.addView(runtimeButton, lp(-1, dp(54), 12));
+
+        Button shareButton = new Button(this);
+        shareButton.setText("分享最近一次诊断报告");
+        shareButton.setOnClickListener(v -> shareLastReport());
+        root.addView(shareButton, lp(-1, dp(52), 12));
 
         toolsButton = new Button(this);
         toolsButton.setText("进入现有 NFC UID 工具");
@@ -56,47 +68,99 @@ public final class LegacyHardcodedUidTraceActivity extends AppCompatActivity {
     }
 
     private void runTrace() {
+        runDiagnostic("正在只读追踪旧写死 UID…", "trace-legacy-uid", buildLegacyTraceCommand(), "旧写死 UID 遗留追踪结果");
+    }
+
+    private void runRuntimeTrace() {
+        runDiagnostic("正在抓取 NFC 运行时链路…", "trace-nfc-runtime", buildRuntimeTraceCommand(), "NFC 运行时诊断结果");
+    }
+
+    private void runDiagnostic(String toastText, String threadName, String command, String dialogTitle) {
         if (!running.compareAndSet(false, true)) {
             Toast.makeText(this, "诊断正在执行", Toast.LENGTH_SHORT).show();
             return;
         }
         setButtons(false);
-        Toast.makeText(this, "正在只读追踪旧写死 UID…", Toast.LENGTH_SHORT).show();
+        Toast.makeText(this, toastText, Toast.LENGTH_SHORT).show();
 
         new Thread(() -> {
-            String command =
-                    "set +e\n" +
-                    "echo '=== 1. CardEmulator backup inventory ==='\n" +
-                    "find /data/nfc/CardEmulator/backup -type f 2>/dev/null | sort | head -n 260\n" +
-                    "echo\n" +
-                    "echo '=== 2. Exact AABBCCDD remnants ==='\n" +
-                    "grep -RInaE 'AABBCCDD|AA[ :_-]*BB[ :_-]*CC[ :_-]*DD' /data/nfc/CardEmulator /data/nfc/libnfc-nxpTransit.conf 2>/dev/null | head -n 220\n" +
-                    "echo\n" +
-                    "echo '=== 3. Backup LA_NFCID1 / core config ==='\n" +
-                    "grep -RInaE -C 8 'LA_NFCID1|NFCID1|NXP_CORE_CONF' /data/nfc/CardEmulator/backup 2>/dev/null | head -n 320\n" +
-                    "echo\n" +
-                    "echo '=== 4. Current NFC config clues ==='\n" +
-                    "for f in /data/nfc/libnfc-nxpTransit.conf /data/vendor/nfc/libnfc-mtp-SN220.conf /data/vendor/nfc/libnfc-nci.conf /odm/etc/nfc/libnfc-mtp-SN220.conf /vendor/etc/libnfc-hal-st.conf; do\n" +
-                    " [ -f \"$f\" ] || continue; echo \"--- $f ---\"; stat -c 'size=%s mtime=%y' \"$f\" 2>/dev/null; sha256sum \"$f\" 2>/dev/null; grep -Ein -C 8 'LA_NFCID1|NFCID1|NXP_CORE_CONF|AABBCCDD' \"$f\" 2>/dev/null | head -n 120; done\n" +
-                    "echo\n" +
-                    "echo '=== 5. Backup/current hashes ==='\n" +
-                    "for f in /data/nfc/CardEmulator/backup/data/vendor/nfc/libnfc-mtp-SN220.conf.backup /data/nfc/CardEmulator/backup/data/vendor/nfc/libnfc-nci.conf.backup /data/nfc/CardEmulator/backup/vendor/etc/libnfc-hal-st.conf.backup; do [ -f \"$f\" ] && sha256sum \"$f\"; done\n" +
-                    "for f in /data/vendor/nfc/libnfc-mtp-SN220.conf /data/vendor/nfc/libnfc-nci.conf /vendor/etc/libnfc-hal-st.conf; do [ -f \"$f\" ] && sha256sum \"$f\"; done\n" +
-                    "echo\n" +
-                    "echo '=== 6. Assessment ==='\n" +
-                    "if grep -RqiE 'AABBCCDD|AA[ :_-]*BB[ :_-]*CC[ :_-]*DD' /data/nfc/CardEmulator /data/nfc/libnfc-nxpTransit.conf 2>/dev/null; then echo 'RESULT: exact legacy AABBCCDD text found in NFC data.'; else echo 'RESULT: no exact AABBCCDD text found. Inspect LA_NFCID1/core-config differences; if absent, controller/NVM persistence remains plausible.'; fi\n";
-
             RootShell.Result result = RootShell.execute(command);
             String report = result.output();
             if (report == null || report.isBlank()) report = "Root 诊断没有返回内容。\n" + result.describe();
+            report = "Command success=" + result.success() + "\n" + result.describe() + "\n\n" + report;
+            lastReport = report;
             String finalReport = report;
-            AppLogger.i("UID", "4cfe2f legacy UID trace complete: success=" + result.success());
+            AppLogger.i("UID", threadName + " complete: success=" + result.success());
             running.set(false);
-            runOnUiThread(() -> { setButtons(true); showReport(finalReport); });
-        }, "trace-4cfe2f-uid").start();
+            runOnUiThread(() -> {
+                setButtons(true);
+                showReport(dialogTitle, finalReport);
+            });
+        }, threadName).start();
     }
 
-    private void showReport(String report) {
+    private String buildLegacyTraceCommand() {
+        return "set +e\n" +
+                "echo '=== 1. CardEmulator backup inventory ==='\n" +
+                "find /data/nfc/CardEmulator/backup -type f 2>/dev/null | sort | head -n 260\n" +
+                "echo\n" +
+                "echo '=== 2. Exact AABBCCDD remnants ==='\n" +
+                "grep -RInaE 'AABBCCDD|AA[ :_-]*BB[ :_-]*CC[ :_-]*DD' /data/nfc/CardEmulator /data/nfc/libnfc-nxpTransit.conf 2>/dev/null | head -n 220\n" +
+                "echo\n" +
+                "echo '=== 3. Backup LA_NFCID1 / core config ==='\n" +
+                "grep -RInaE -C 8 'LA_NFCID1|NFCID1|NXP_CORE_CONF' /data/nfc/CardEmulator/backup 2>/dev/null | head -n 320\n" +
+                "echo\n" +
+                "echo '=== 4. Current NFC config clues ==='\n" +
+                "for f in /data/nfc/libnfc-nxpTransit.conf /data/vendor/nfc/libnfc-mtp-SN220.conf /data/vendor/nfc/libnfc-nci.conf /odm/etc/nfc/libnfc-mtp-SN220.conf /vendor/etc/libnfc-hal-st.conf; do\n" +
+                " [ -f \"$f\" ] || continue; echo \"--- $f ---\"; stat -c 'size=%s mtime=%y' \"$f\" 2>/dev/null; sha256sum \"$f\" 2>/dev/null; grep -Ein -C 8 'LA_NFCID1|NFCID1|NXP_CORE_CONF|AABBCCDD' \"$f\" 2>/dev/null | head -n 120; done\n" +
+                "echo\n" +
+                "echo '=== 5. Backup/current hashes ==='\n" +
+                "for f in /data/nfc/CardEmulator/backup/data/vendor/nfc/libnfc-mtp-SN220.conf.backup /data/nfc/CardEmulator/backup/data/vendor/nfc/libnfc-nci.conf.backup /data/nfc/CardEmulator/backup/vendor/etc/libnfc-hal-st.conf.backup; do [ -f \"$f\" ] && sha256sum \"$f\"; done\n" +
+                "for f in /data/vendor/nfc/libnfc-mtp-SN220.conf /data/vendor/nfc/libnfc-nci.conf /vendor/etc/libnfc-hal-st.conf; do [ -f \"$f\" ] && sha256sum \"$f\"; done\n" +
+                "echo\n" +
+                "echo '=== 6. Assessment ==='\n" +
+                "if grep -RqiE 'AABBCCDD|AA[ :_-]*BB[ :_-]*CC[ :_-]*DD' /data/nfc/CardEmulator /data/nfc/libnfc-nxpTransit.conf 2>/dev/null; then echo 'RESULT: exact legacy AABBCCDD text found in NFC data.'; else echo 'RESULT: no exact AABBCCDD text found. Inspect LA_NFCID1/core-config differences; if absent, controller/NVM persistence remains plausible.'; fi\n";
+    }
+
+    private String buildRuntimeTraceCommand() {
+        return "set +e\n" +
+                "echo '=== NFC UID runtime diagnostic ==='\n" +
+                "date\n" +
+                "echo\n" +
+                "echo '=== 1. Android / device ==='\n" +
+                "getprop ro.product.manufacturer\n" +
+                "getprop ro.product.model\n" +
+                "getprop ro.build.version.release\n" +
+                "getprop ro.build.version.sdk\n" +
+                "getprop ro.hardware.nfc\n" +
+                "getprop ro.boot.hardware\n" +
+                "echo\n" +
+                "echo '=== 2. NFC service summary ==='\n" +
+                "dumpsys nfc 2>&1 | head -n 320\n" +
+                "echo\n" +
+                "echo '=== 3. NFC processes/services ==='\n" +
+                "ps -A 2>/dev/null | grep -iE 'nfc|ese'\n" +
+                "service list 2>/dev/null | grep -i nfc\n" +
+                "echo\n" +
+                "echo '=== 4. Relevant properties ==='\n" +
+                "getprop 2>/dev/null | grep -iE 'nfc|nq|sn100|sn110|sn220|st21|pn5|ese' | head -n 240\n" +
+                "echo\n" +
+                "echo '=== 5. NFC vendor/config file names ==='\n" +
+                "find /vendor/etc /odm/etc /product/etc /data/vendor/nfc /data/nfc -maxdepth 3 -type f \\( -iname '*nfc*' -o -iname 'libnfc*' \\) 2>/dev/null | sort | head -n 360\n" +
+                "echo\n" +
+                "echo '=== 6. UID/core configuration clues (read only) ==='\n" +
+                "grep -RInaE 'LA_NFCID1|NFCID1|NXP_CORE_CONF|CORE_CONF|RF_CONF|DISCOVERY' /data/vendor/nfc /data/nfc /vendor/etc /odm/etc 2>/dev/null | head -n 320\n" +
+                "echo\n" +
+                "echo '=== 7. LSPosed / app / framework NFC runtime logs ==='\n" +
+                "logcat -b all -d -v threadtime 2>/dev/null | grep -iE 'NfcUIDSim|NfcDoorHCE|UidConfigProvider|NfcService|NativeNfcManager|DeviceHost|changeRfParams|changeRfParamsByConfig|doWriteData|nativeSendRawVendorCmd|setDiscoveryTech|restartRfDiscovery|doRestartRFDiscovery' | tail -n 700\n" +
+                "echo\n" +
+                "echo '=== 8. HAL/vendor crash clues ==='\n" +
+                "logcat -b all -d -v threadtime 2>/dev/null | grep -iE 'libnfc|sn100|sn110|sn220|st21|nfc.*fatal|nfc.*abort|com.android.nfc.*crash|SIGABRT|WatchDogThread' | tail -n 420\n" +
+                "echo\n" +
+                "echo '=== End ==='\n";
+    }
+
+    private void showReport(String title, String report) {
         TextView view = new TextView(this);
         view.setText(report);
         view.setTextIsSelectable(true);
@@ -104,14 +168,32 @@ public final class LegacyHardcodedUidTraceActivity extends AppCompatActivity {
         ScrollView scroll = new ScrollView(this);
         scroll.addView(view);
         new android.app.AlertDialog.Builder(this)
-                .setTitle("4cfe2f 写死 UID 遗留追踪结果")
+                .setTitle(title)
                 .setView(scroll)
+                .setNeutralButton("分享", (d, w) -> shareReport(report))
                 .setPositiveButton("关闭", null)
                 .show();
     }
 
+    private void shareLastReport() {
+        if (lastReport == null || lastReport.isBlank()) {
+            Toast.makeText(this, "还没有诊断报告，请先执行一次诊断", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        shareReport(lastReport);
+    }
+
+    private void shareReport(String report) {
+        Intent intent = new Intent(Intent.ACTION_SEND);
+        intent.setType("text/plain");
+        intent.putExtra(Intent.EXTRA_SUBJECT, "NFC runtime diagnostic");
+        intent.putExtra(Intent.EXTRA_TEXT, report);
+        startActivity(Intent.createChooser(intent, "分享 NFC 诊断报告"));
+    }
+
     private void setButtons(boolean enabled) {
         if (traceButton != null) traceButton.setEnabled(enabled);
+        if (runtimeButton != null) runtimeButton.setEnabled(enabled);
         if (toolsButton != null) toolsButton.setEnabled(enabled);
     }
 
