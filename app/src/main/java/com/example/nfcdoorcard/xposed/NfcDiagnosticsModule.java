@@ -3,6 +3,7 @@ package com.example.nfcdoorcard.xposed;
 import android.app.Application;
 import android.database.Cursor;
 import android.net.Uri;
+import android.os.Binder;
 import android.util.Log;
 
 import java.lang.reflect.Constructor;
@@ -38,6 +39,11 @@ public class NfcDiagnosticsModule extends XposedModule {
             "com.android.nfc.StNativeNfcManager"
     };
 
+    private static final String[] CONFIG_SELECTOR_CLASS_CANDIDATES = {
+            "com.android.nfc.nxp.NxpNfcService$NxpNfcAdapterService",
+            "com.android.nfc.nxp.NxpNfcService"
+    };
+
     private final Set<String> installedTraceHooks = new HashSet<>();
     private final Set<String> inspectedRuntimeClasses = new HashSet<>();
 
@@ -62,6 +68,7 @@ public class NfcDiagnosticsModule extends XposedModule {
         Class<?> nfcService = loadOptional(cl, "com.android.nfc.NfcService");
 
         probeKnownRuntimeClasses(cl);
+        probeConfigSelectorClasses(cl);
 
         if (nfcService != null) {
             installNfcServiceConstructorProbe(nfcService, deviceHost);
@@ -95,6 +102,40 @@ public class NfcDiagnosticsModule extends XposedModule {
             }
         }
         info("NFC-RUNTIME DIRECT PROBE END found=" + found);
+    }
+
+    private void probeConfigSelectorClasses(ClassLoader cl) {
+        info("NFC-SELECTOR PROBE BEGIN");
+        int found = 0;
+        for (String className : CONFIG_SELECTOR_CLASS_CANDIDATES) {
+            try {
+                Class<?> selector = Class.forName(className, false, cl);
+                found++;
+                info("NFC-SELECTOR CLASS FOUND " + selector.getName());
+                enumerateSelectorMethods(selector);
+                installNamedTraceHooks(selector, "setConfig");
+                installNamedTraceHooks(selector, "changeRfParamsByConfig");
+            } catch (ClassNotFoundException e) {
+                info("NFC-SELECTOR CLASS ABSENT " + className);
+            } catch (Throwable t) {
+                warn("NFC-SELECTOR CLASS ERROR " + className + " / " + t.getClass().getSimpleName(), t);
+            }
+        }
+        info("NFC-SELECTOR PROBE END found=" + found);
+    }
+
+    private void enumerateSelectorMethods(Class<?> selector) {
+        int candidates = 0;
+        for (Method method : selector.getDeclaredMethods()) {
+            String name = method.getName().toLowerCase(Locale.ROOT);
+            if (!name.contains("config") && !name.contains("tap") && !name.contains("access")
+                    && !name.contains("card") && !name.contains("hce") && !name.contains("transit")) {
+                continue;
+            }
+            candidates++;
+            info("NFC-SELECTOR METHOD " + formatMethod(method));
+        }
+        info("NFC-SELECTOR METHOD ENUM END class=" + selector.getName() + " candidates=" + candidates);
     }
 
     private Class<?> loadOptional(ClassLoader cl, String name) {
@@ -238,6 +279,7 @@ public class NfcDiagnosticsModule extends XposedModule {
                 Object[] argsArray = chain.getArgs().toArray();
                 info("NFC-TRACE ENTER " + runtime.getSimpleName() + "." + methodName + " args=" + summarizeArgs(argsArray));
                 logPayloadDigests(methodName, argsArray);
+                if ("setConfig".equals(methodName)) logBinderCaller();
 
                 if ("restoreSavedTech".equals(methodName)) {
                     logActualSavedTech(thisObject, "BEFORE");
@@ -271,8 +313,25 @@ public class NfcDiagnosticsModule extends XposedModule {
         }
     }
 
+    private void logBinderCaller() {
+        try {
+            int uid = Binder.getCallingUid();
+            int pid = Binder.getCallingPid();
+            String packages = "[]";
+            Application app = currentApplication();
+            if (app != null) {
+                String[] names = app.getPackageManager().getPackagesForUid(uid);
+                packages = names == null ? "[]" : Arrays.toString(names);
+            }
+            info("NFC-SELECTOR CALLER uid=" + uid + " pid=" + pid + " packages=" + packages);
+        } catch (Throwable t) {
+            info("NFC-SELECTOR CALLER unavailable=" + t.getClass().getSimpleName());
+        }
+    }
+
     private void logPayloadDigests(String methodName, Object[] args) {
-        if (!"setTransitConfig".equals(methodName)
+        if (!"setConfig".equals(methodName)
+                && !"setTransitConfig".equals(methodName)
                 && !"changeRfParamsByConfig".equals(methodName)
                 && !"changeRfParams".equals(methodName)) return;
 
