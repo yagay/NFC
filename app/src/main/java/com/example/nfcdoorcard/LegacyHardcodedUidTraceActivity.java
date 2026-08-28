@@ -124,14 +124,22 @@ public final class LegacyHardcodedUidTraceActivity extends AppCompatActivity {
 
     private String buildRuntimeTraceCommand() {
         return "set +e\n" +
-                "echo '=== NFC UID runtime diagnostic v2 ==='\n" +
+                "echo '=== NFC UID runtime diagnostic v3 ==='\n" +
                 "date\n" +
                 "echo\n" +
-                "echo '=== 1. LSPosed / app / framework NFC runtime logs ==='\n" +
-                "logcat -b all -d -v threadtime -t 6000 2>/dev/null | grep -iE 'NfcUIDSim|NfcDoorHCE|UidConfigProvider|NfcService|NativeNfcManager|DeviceHost|changeRfParams|changeRfParamsByConfig|doWriteData|nativeSendRawVendorCmd|setDiscoveryTech|restartRfDiscovery|doRestartRFDiscovery' | tail -n 650\n" +
+                "echo '=== 1A. Persistent LSPosed module logs ==='\n" +
+                "for d in /data/adb/lspd/log /data/adb/lspd/log/verbose; do\n" +
+                " [ -d \"$d\" ] || continue;\n" +
+                " find \"$d\" -type f 2>/dev/null | sort | tail -n 40 | while IFS= read -r f; do\n" +
+                "  grep -iE 'NfcUIDSim|com\\.example\\.nfcdoorcard|NFC-RUNTIME|NFC-TRACE|NxpNativeNfcManager|NativeNfcManager' \"$f\" 2>/dev/null;\n" +
+                " done;\n" +
+                "done | tail -n 1000\n" +
+                "echo\n" +
+                "echo '=== 1B. Current logcat NFC runtime logs ==='\n" +
+                "logcat -b all -d -v threadtime -t 12000 2>/dev/null | grep -iE 'NfcUIDSim|NfcDoorHCE|UidConfigProvider|NfcService|NativeNfcManager|DeviceHost|NFC-RUNTIME|NFC-TRACE|changeRfParams|changeRfParamsByConfig|doWriteData|nativeSendRawVendorCmd|setDiscoveryTech|restartRfDiscovery|doRestartRFDiscovery' | tail -n 900\n" +
                 "echo\n" +
                 "echo '=== 2. HAL/vendor crash clues ==='\n" +
-                "logcat -b all -d -v threadtime -t 6000 2>/dev/null | grep -iE 'libnfc|sn100|sn110|sn220|st21|nfc.*fatal|nfc.*abort|com.android.nfc.*crash|SIGABRT|WatchDogThread' | tail -n 360\n" +
+                "logcat -b all -d -v threadtime -t 12000 2>/dev/null | grep -iE 'libnfc|sn100|sn110|sn220|st21|nfc.*fatal|nfc.*abort|com.android.nfc.*crash|SIGABRT|WatchDogThread' | tail -n 420\n" +
                 "echo\n" +
                 "echo '=== 3. Android / device ==='\n" +
                 "getprop ro.product.manufacturer\n" +
