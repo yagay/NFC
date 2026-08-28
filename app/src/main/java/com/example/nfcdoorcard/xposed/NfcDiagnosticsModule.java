@@ -9,6 +9,8 @@ import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.Locale;
@@ -23,9 +25,11 @@ public class NfcDiagnosticsModule extends XposedModule {
     private static final Uri CONFIG_URI = Uri.parse("content://com.example.nfcdoorcard.uidconfig/target");
     private static final int MAX_STACK_FRAMES = 6;
     private static final int MAX_AUTO_TRACE_PARAMS = 4;
+
     private static final String[] CANDIDATE_KEYWORDS = {
             "config", "core", "vendor", "raw", "write", "rf", "listen", "discovery", "nfcid", "uid"
     };
+
     private static final String[] DIRECT_RUNTIME_CLASS_CANDIDATES = {
             "com.android.nfc.dhimpl.NxpNativeNfcManager",
             "com.android.nfc.NxpNativeNfcManager",
@@ -61,11 +65,11 @@ public class NfcDiagnosticsModule extends XposedModule {
 
         if (nfcService != null) {
             installNfcServiceConstructorProbe(nfcService, deviceHost);
-            installServiceTraceHook(nfcService, "getNfcListenTech");
-            installServiceTraceHook(nfcService, "saveNfcListenTech", int.class);
-            installServiceTraceHook(nfcService, "clearListenTech", boolean.class);
-            installServiceTraceHook(nfcService, "getNfcPollTech");
-            installServiceTraceHook(nfcService, "saveNfcPollTech", int.class);
+            installTraceHook(nfcService, "getNfcListenTech");
+            installTraceHook(nfcService, "saveNfcListenTech", int.class);
+            installTraceHook(nfcService, "clearListenTech", boolean.class);
+            installTraceHook(nfcService, "getNfcPollTech");
+            installTraceHook(nfcService, "saveNfcPollTech", int.class);
             installNamedTraceHooks(nfcService, "restoreSavedTech");
         } else {
             warn("NFC-TRACE NfcService class unavailable");
@@ -188,8 +192,7 @@ public class NfcDiagnosticsModule extends XposedModule {
                 info("NFC-RUNTIME candidate not auto-hooked (params=" + method.getParameterCount() + "): " + method.getName());
             }
         }
-        info("NFC-RUNTIME METHOD ENUM END class=" + runtime.getName()
-                + " total=" + total + " candidates=" + candidates);
+        info("NFC-RUNTIME METHOD ENUM END class=" + runtime.getName() + " total=" + total + " candidates=" + candidates);
     }
 
     private boolean isCandidateMethod(Method method) {
@@ -210,10 +213,6 @@ public class NfcDiagnosticsModule extends XposedModule {
         installTraceHook(runtime, "resetDiscoveryTech");
         installTraceHook(runtime, "restartRfDiscovery");
         installTraceHook(runtime, "doRestartRFDiscovery");
-    }
-
-    private void installServiceTraceHook(Class<?> serviceClass, String methodName, Class<?>... parameterTypes) {
-        installTraceHook(serviceClass, methodName, parameterTypes);
     }
 
     private void installNamedTraceHooks(Class<?> runtime, String methodName) {
@@ -237,8 +236,8 @@ public class NfcDiagnosticsModule extends XposedModule {
             hook(method).intercept(chain -> {
                 Object thisObject = chain.getThisObject();
                 Object[] argsArray = chain.getArgs().toArray();
-                info("NFC-TRACE ENTER " + runtime.getSimpleName() + "." + methodName
-                        + " args=" + summarizeArgs(argsArray));
+                info("NFC-TRACE ENTER " + runtime.getSimpleName() + "." + methodName + " args=" + summarizeArgs(argsArray));
+                logPayloadDigests(methodName, argsArray);
 
                 if ("restoreSavedTech".equals(methodName)) {
                     logActualSavedTech(thisObject, "BEFORE");
@@ -254,12 +253,10 @@ public class NfcDiagnosticsModule extends XposedModule {
                     if (result instanceof Integer) {
                         logIntBreakdown(methodName + ".result", (Integer) result);
                     }
-                    info("NFC-TRACE RETURN " + runtime.getSimpleName() + "." + methodName
-                            + " result=" + summarizeValue(result));
+                    info("NFC-TRACE RETURN " + runtime.getSimpleName() + "." + methodName + " result=" + summarizeValue(result));
                     return result;
                 } catch (Throwable t) {
-                    warn("NFC-TRACE THROW " + runtime.getSimpleName() + "." + methodName
-                            + " exception=" + t.getClass().getName());
+                    warn("NFC-TRACE THROW " + runtime.getSimpleName() + "." + methodName + " exception=" + t.getClass().getName());
                     throw t;
                 }
             });
@@ -270,18 +267,49 @@ public class NfcDiagnosticsModule extends XposedModule {
         } catch (NoSuchMethodException e) {
             info("NFC-TRACE method absent: " + runtime.getName() + "." + methodName);
         } catch (Throwable t) {
-            warn("NFC-TRACE hook failed: " + runtime.getName() + "." + methodName
-                    + " / " + t.getClass().getSimpleName(), t);
+            warn("NFC-TRACE hook failed: " + runtime.getName() + "." + methodName + " / " + t.getClass().getSimpleName(), t);
         }
     }
 
-    /** Read the actual framework values through the framework's own read-only getters. */
+    private void logPayloadDigests(String methodName, Object[] args) {
+        if (!"setTransitConfig".equals(methodName)
+                && !"changeRfParamsByConfig".equals(methodName)
+                && !"changeRfParams".equals(methodName)) return;
+
+        for (int i = 0; i < args.length; i++) {
+            byte[] payload = null;
+            String sourceType = null;
+            if (args[i] instanceof byte[]) {
+                payload = (byte[]) args[i];
+                sourceType = "byte[]";
+            } else if (args[i] instanceof String) {
+                payload = ((String) args[i]).getBytes(StandardCharsets.UTF_8);
+                sourceType = "String/UTF-8";
+            }
+            if (payload == null) continue;
+            info("NFC-TRACE DIGEST " + methodName + ".arg" + i
+                    + " type=" + sourceType
+                    + " bytes=" + payload.length
+                    + " sha256=" + sha256(payload));
+        }
+    }
+
+    private String sha256(byte[] data) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            byte[] hash = digest.digest(data);
+            StringBuilder sb = new StringBuilder(hash.length * 2);
+            for (byte b : hash) sb.append(String.format(Locale.ROOT, "%02x", b & 0xff));
+            return sb.toString();
+        } catch (Throwable t) {
+            return "unavailable:" + t.getClass().getSimpleName();
+        }
+    }
+
     private void logActualSavedTech(Object service, String phase) {
         Integer poll = invokeIntGetter(service, "getNfcPollTech");
         Integer listen = invokeIntGetter(service, "getNfcListenTech");
-        info("NFC-TRACE SAVED " + phase
-                + " poll=" + summarizeValue(poll)
-                + " listen=" + summarizeValue(listen));
+        info("NFC-TRACE SAVED " + phase + " poll=" + summarizeValue(poll) + " listen=" + summarizeValue(listen));
         if (poll != null) logIntBreakdown("SAVED." + phase + ".poll", poll);
         if (listen != null) logIntBreakdown("SAVED." + phase + ".listen", listen);
     }
@@ -376,7 +404,7 @@ public class NfcDiagnosticsModule extends XposedModule {
             int activeColumn = cursor.getColumnIndex("active");
             String uid = uidColumn >= 0 ? cursor.getString(uidColumn) : null;
             boolean active = activeColumn >= 0 && cursor.getInt(activeColumn) == 1;
-            info("UID test config observed: active=" + active + ", uid=" + (uid == null ? "unset" : uid));
+            info("UID test config observed: active=" + active + ", uidPresent=" + (uid != null && !uid.isBlank()));
         } catch (Throwable t) {
             warn("Unable to read UID test configuration: " + t.getClass().getSimpleName(), t);
         } finally {
