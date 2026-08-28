@@ -124,10 +124,16 @@ public final class LegacyHardcodedUidTraceActivity extends AppCompatActivity {
 
     private String buildRuntimeTraceCommand() {
         return "set +e\n" +
-                "echo '=== NFC UID runtime diagnostic ==='\n" +
+                "echo '=== NFC UID runtime diagnostic v2 ==='\n" +
                 "date\n" +
                 "echo\n" +
-                "echo '=== 1. Android / device ==='\n" +
+                "echo '=== 1. LSPosed / app / framework NFC runtime logs ==='\n" +
+                "logcat -b all -d -v threadtime -t 6000 2>/dev/null | grep -iE 'NfcUIDSim|NfcDoorHCE|UidConfigProvider|NfcService|NativeNfcManager|DeviceHost|changeRfParams|changeRfParamsByConfig|doWriteData|nativeSendRawVendorCmd|setDiscoveryTech|restartRfDiscovery|doRestartRFDiscovery' | tail -n 650\n" +
+                "echo\n" +
+                "echo '=== 2. HAL/vendor crash clues ==='\n" +
+                "logcat -b all -d -v threadtime -t 6000 2>/dev/null | grep -iE 'libnfc|sn100|sn110|sn220|st21|nfc.*fatal|nfc.*abort|com.android.nfc.*crash|SIGABRT|WatchDogThread' | tail -n 360\n" +
+                "echo\n" +
+                "echo '=== 3. Android / device ==='\n" +
                 "getprop ro.product.manufacturer\n" +
                 "getprop ro.product.model\n" +
                 "getprop ro.build.version.release\n" +
@@ -135,27 +141,22 @@ public final class LegacyHardcodedUidTraceActivity extends AppCompatActivity {
                 "getprop ro.hardware.nfc\n" +
                 "getprop ro.boot.hardware\n" +
                 "echo\n" +
-                "echo '=== 2. NFC service summary ==='\n" +
-                "dumpsys nfc 2>&1 | head -n 320\n" +
+                "echo '=== 4. NFC processes/services ==='\n" +
+                "ps -A 2>/dev/null | grep -iE 'nfc|ese' | head -n 80\n" +
+                "service list 2>/dev/null | grep -i nfc | head -n 80\n" +
                 "echo\n" +
-                "echo '=== 3. NFC processes/services ==='\n" +
-                "ps -A 2>/dev/null | grep -iE 'nfc|ese'\n" +
-                "service list 2>/dev/null | grep -i nfc\n" +
+                "echo '=== 5. NFC service summary ==='\n" +
+                "dumpsys nfc 2>&1 | grep -E 'mState=|listenTech=|pollTech=|mTechMask:|mEnableLPD:|mEnableReader:|mEnableHostRouting:|mIsSecureNfcEnabled=|mIsReaderOptionEnabled=|mIsObserveMode' | head -n 100\n" +
                 "echo\n" +
-                "echo '=== 4. Relevant properties ==='\n" +
-                "getprop 2>/dev/null | grep -iE 'nfc|nq|sn100|sn110|sn220|st21|pn5|ese' | head -n 240\n" +
+                "echo '=== 6. Relevant properties ==='\n" +
+                "getprop 2>/dev/null | grep -iE '(^|\\[)(ro\\.hardware\\.nfc|ro\\.nfc|nfc\\.|persist\\.nfc|persist\\.nfcuidsim|oplus.*nfc|sn220|st21)' | head -n 160\n" +
                 "echo\n" +
-                "echo '=== 5. NFC vendor/config file names ==='\n" +
-                "find /vendor/etc /odm/etc /product/etc /data/vendor/nfc /data/nfc -maxdepth 3 -type f \\( -iname '*nfc*' -o -iname 'libnfc*' \\) 2>/dev/null | sort | head -n 360\n" +
+                "echo '=== 7. Key config files only ==='\n" +
+                "for f in /data/vendor/nfc/libnfc-mtp-SN220.conf /data/vendor/nfc/libnfc-nci.conf /data/vendor/nfc/libnfc_accesscard_config.conf /data/vendor/nfc/libnfc_default_config.conf /data/vendor/nfc/libnfc_tap_config.conf /data/nfc/libnfc-nxpTransit.conf /vendor/etc/libnfc-hal-st.conf; do\n" +
+                " [ -f \"$f\" ] || continue; echo \"--- $f ---\"; stat -c 'size=%s mtime=%y' \"$f\" 2>/dev/null; grep -Ein 'LA_NFCID1|NFCID1|NXP_CORE_CONF|CORE_CONF_PROP|RF_CONF' \"$f\" 2>/dev/null | head -n 45; done\n" +
                 "echo\n" +
-                "echo '=== 6. UID/core configuration clues (read only) ==='\n" +
-                "grep -RInaE 'LA_NFCID1|NFCID1|NXP_CORE_CONF|CORE_CONF|RF_CONF|DISCOVERY' /data/vendor/nfc /data/nfc /vendor/etc /odm/etc 2>/dev/null | head -n 320\n" +
-                "echo\n" +
-                "echo '=== 7. LSPosed / app / framework NFC runtime logs ==='\n" +
-                "logcat -b all -d -v threadtime 2>/dev/null | grep -iE 'NfcUIDSim|NfcDoorHCE|UidConfigProvider|NfcService|NativeNfcManager|DeviceHost|changeRfParams|changeRfParamsByConfig|doWriteData|nativeSendRawVendorCmd|setDiscoveryTech|restartRfDiscovery|doRestartRFDiscovery' | tail -n 700\n" +
-                "echo\n" +
-                "echo '=== 8. HAL/vendor crash clues ==='\n" +
-                "logcat -b all -d -v threadtime 2>/dev/null | grep -iE 'libnfc|sn100|sn110|sn220|st21|nfc.*fatal|nfc.*abort|com.android.nfc.*crash|SIGABRT|WatchDogThread' | tail -n 420\n" +
+                "echo '=== 8. CardEmulator backup presence ==='\n" +
+                "find /data/nfc/CardEmulator/backup -maxdepth 5 -type f 2>/dev/null | grep -iE 'libnfc|nfc.*conf' | head -n 100\n" +
                 "echo\n" +
                 "echo '=== End ==='\n";
     }
