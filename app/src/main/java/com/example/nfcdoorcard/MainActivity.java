@@ -44,6 +44,7 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
 
     private final ExecutorService nfcExecutor = Executors.newSingleThreadExecutor();
     private final AtomicBoolean nfcOperationRunning = new AtomicBoolean(false);
+    private final AtomicBoolean hceStatusRunning = new AtomicBoolean(false);
 
     private NfcAdapter nfcAdapter;
     private TextView status;
@@ -55,6 +56,7 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
     private String currentUid;
     private String savedUid;
     private boolean readerRequested;
+    private volatile String observedHceStatus = "底层 HCE Type-A: 等待运行时观测";
 
     private SharedPreferences simulationPrefs() {
         return createDeviceProtectedStorageContext().getSharedPreferences("sim_prefs", Context.MODE_PRIVATE);
@@ -82,8 +84,9 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
             boolean scoped = NfcDoorApplication.isNfcScopeEnabled();
             sb.append("● 框架连接: ").append(connected ? "✅ 已连接" : "❌ 未连接").append("\n");
             sb.append("● NFC 作用域配置: ").append(scoped ? "✅ com.android.nfc 已启用" : "❌ 未启用").append("\n");
-            sb.append("● 实际 NFC 进程 Hook: 当前服务 API 未做可靠确认\n");
+            sb.append("● 实际 NFC 进程 Hook: 通过运行时 HCE 观测判断\n");
             sb.append("● 框架信息: ").append(NfcDoorApplication.getFrameworkSummary()).append("\n");
+            sb.append("● ").append(observedHceStatus).append("\n");
             sb.append("● 底层固定 UID 写入: 未启用\n\n");
 
             SharedPreferences prefs = simulationPrefs();
@@ -150,6 +153,7 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
         refreshStatus();
         refreshCardList();
         refreshRootStatusAsync(false);
+        refreshObservedHceStatusAsync();
     }
 
     @Override
@@ -159,12 +163,14 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
             if (logView != null) logView.setText(allLogs);
         }));
         refreshStatus();
+        refreshObservedHceStatusAsync();
     }
 
     @Override
     protected void onResume() {
         super.onResume();
         if (readerRequested) enableReaderModeInternal(false);
+        refreshObservedHceStatusAsync();
     }
 
     @Override
@@ -263,7 +269,10 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
 
         Button diagBtn = new Button(this);
         diagBtn.setText("刷新 NFC / LSPosed 实时诊断");
-        diagBtn.setOnClickListener(v -> runHardwareDiagnostic());
+        diagBtn.setOnClickListener(v -> {
+            refreshObservedHceStatusAsync();
+            runHardwareDiagnostic();
+        });
         content.addView(diagBtn, lp(-1, dp(52), 18));
 
         details = text("尚未读取卡片。\n\n把实体门禁卡贴到手机 NFC 区域。", 15, false);
@@ -313,18 +322,51 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
                 ? "LSPosed: 未连接框架"
                 : (!NfcDoorApplication.isNfcScopeEnabled()
                 ? "LSPosed: 已连接 · NFC 服务未在作用域"
-                : "LSPosed: 已连接 · NFC 作用域已配置（实际进程 Hook 待诊断确认）");
+                : "LSPosed: 已连接 · NFC 作用域已配置");
 
         SharedPreferences prefs = simulationPrefs();
-        String simStatus = prefs.getBoolean("request_active", false)
-                ? "\nUID 测试请求: 已开启 [" + prefs.getString("target_uid", "未设置") + "] · 底层固定 UID 写入未启用"
+        boolean requested = prefs.getBoolean("request_active", false);
+        String simStatus = requested
+                ? "\nUID 测试请求: 已保存 [" + prefs.getString("target_uid", "未设置") + "]"
                 : "\nUID 测试请求: 已停止";
+        String runtimeStatus = "\n" + observedHceStatus;
+        if (requested && observedHceStatus.contains("已关闭")) {
+            runtimeStatus += " · 请求未进入底层 HCE";
+        }
 
         status.setText(androidVersionName(sdk) + " / API " + sdk + "   ·   " + support +
-                "\n" + nfc + "   ·   Root: " + rootText + "\n" + moduleStatus + simStatus);
+                "\n" + nfc + "   ·   Root: " + rootText + "\n" + moduleStatus + simStatus + runtimeStatus);
         status.setOnClickListener(v -> {
             if (!NfcDoorApplication.isFrameworkConnected() || !NfcDoorApplication.isNfcScopeEnabled()) openLSPosedManager();
         });
+    }
+
+    private void refreshObservedHceStatusAsync() {
+        if (!hceStatusRunning.compareAndSet(false, true)) return;
+        new Thread(() -> {
+            String command = "set +e\n" +
+                    "for d in /data/adb/lspd/log /data/adb/lspd/log/verbose; do\n" +
+                    " [ -d \"$d\" ] || continue;\n" +
+                    " find \"$d\" -maxdepth 1 -type f 2>/dev/null | sort | tail -n 6 | while IFS= read -r f; do\n" +
+                    "  tail -n 5000 \"$f\" 2>/dev/null | grep -E 'NFC-TRACE ENTER (VendorNfcService\\.doSetHceTypeAConfig|NxpNativeNfcManager\\.setHceTypeAConfig) args=';\n" +
+                    " done;\n" +
+                    "done | tail -n 1";
+            RootShell.Result result = RootShell.execute(command);
+            String line = result.output() == null ? "" : result.output().trim();
+            String next;
+            if (line.contains("args=[0=true")) {
+                next = "底层 HCE Type-A: 已开启（运行时已观测）";
+            } else if (line.contains("args=[0=false")) {
+                next = "底层 HCE Type-A: 已关闭（OPlus/NXP 运行时已观测）";
+            } else if (!result.success()) {
+                next = "底层 HCE Type-A: 无法读取运行时日志";
+            } else {
+                next = "底层 HCE Type-A: 尚未观测到状态切换";
+            }
+            observedHceStatus = next;
+            hceStatusRunning.set(false);
+            runOnUiThreadIfAlive(this::refreshStatus);
+        }, "hce-runtime-status").start();
     }
 
     private void refreshRootStatusAsync(boolean showToast) {
@@ -391,7 +433,7 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
         String safeUid = currentUid.replaceAll("[^0-9A-Fa-f:]", "");
         new android.app.AlertDialog.Builder(this)
                 .setTitle("设置测试请求")
-                .setMessage("将先保存 UID " + safeUid + "，确认配置落盘后再重启 NFC。当前版本不会写入控制器固定 UID。")
+                .setMessage("将保存 UID " + safeUid + " 并重启 NFC，然后自动检查底层 HCE Type-A 实际状态。当前版本不会写入控制器固定 UID。")
                 .setPositiveButton("继续", (d, w) -> enqueueNfcRequest(true, safeUid))
                 .setNegativeButton("取消", null)
                 .show();
@@ -407,6 +449,7 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
             return;
         }
         setNfcButtonsEnabled(false);
+        observedHceStatus = "底层 HCE Type-A: 等待 NFC 重启后的运行时观测";
         AppLogger.i("Action", start ? "准备设置 UID 测试请求: " + uid : "准备停止 UID 测试请求并清理旧状态");
 
         nfcExecutor.execute(() -> {
@@ -418,8 +461,6 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
             }
             boolean currentPrefsSaved = editor.commit();
 
-            // Never migrate legacy UID values forward. Old builds used credential-protected
-            // sim_prefs and persist.nfcuidsim.* fallbacks, which could keep a fixed UID alive.
             boolean legacyPrefsCleared = legacySimulationPrefs().edit()
                     .remove("target_uid")
                     .putBoolean("request_active", false)
@@ -441,8 +482,8 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
 
             if (result.success()) {
                 AppLogger.i("Root", start
-                        ? "UID 请求已先保存，旧固定 UID 状态已清理，然后完成 NFC 重启"
-                        : "UID 请求和旧固定 UID 状态已清理，然后完成 NFC 重启");
+                        ? "UID 请求已保存；NFC 已重启，等待底层 HCE Type-A 状态观测"
+                        : "UID 请求和旧状态已清理，然后完成 NFC 重启");
             } else {
                 AppLogger.e("Root", "NFC 操作失败: " + result.describe());
             }
@@ -451,7 +492,8 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
                 setNfcButtonsEnabled(true);
                 refreshStatus();
                 if (result.success()) {
-                    toast(start ? "UID 测试请求已设置" : "UID 测试请求和旧状态已清理");
+                    toast(start ? "UID 请求已保存，正在核对底层 HCE 状态" : "UID 测试请求和旧状态已清理");
+                    refreshObservedHceStatusAsync();
                 } else {
                     Toast.makeText(this, "配置/Root/NFC 操作失败: " + result.describe(), Toast.LENGTH_LONG).show();
                 }
@@ -512,7 +554,6 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
                     continue;
                 }
             } else {
-                // Backward compatibility with legacy uid -> name entries.
                 uid = storageKey;
                 name = String.valueOf(entry.getValue());
             }
