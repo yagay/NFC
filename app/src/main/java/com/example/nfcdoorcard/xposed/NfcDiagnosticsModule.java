@@ -24,11 +24,12 @@ import io.github.libxposed.api.XposedModuleInterface;
 public class NfcDiagnosticsModule extends XposedModule {
     private static final String TAG = "NfcUIDSim";
     private static final Uri CONFIG_URI = Uri.parse("content://com.example.nfcdoorcard.uidconfig/target");
-    private static final int MAX_STACK_FRAMES = 6;
+    private static final int MAX_STACK_FRAMES = 10;
     private static final int MAX_AUTO_TRACE_PARAMS = 4;
 
     private static final String[] CANDIDATE_KEYWORDS = {
-            "config", "core", "vendor", "raw", "write", "rf", "listen", "discovery", "nfcid", "uid"
+            "config", "core", "vendor", "raw", "write", "rf", "listen", "discovery", "nfcid", "uid",
+            "hce", "polling", "card", "transit", "tap", "access"
     };
 
     private static final String[] DIRECT_RUNTIME_CLASS_CANDIDATES = {
@@ -39,7 +40,8 @@ public class NfcDiagnosticsModule extends XposedModule {
             "com.android.nfc.StNativeNfcManager"
     };
 
-    private static final String[] CONFIG_SELECTOR_CLASS_CANDIDATES = {
+    private static final String[] CONTROL_FLOW_CLASS_CANDIDATES = {
+            "com.android.nfc.VendorNfcService",
             "com.android.nfc.nxp.NxpNfcService$NxpNfcAdapterService",
             "com.android.nfc.nxp.NxpNfcService"
     };
@@ -58,17 +60,17 @@ public class NfcDiagnosticsModule extends XposedModule {
         super.onPackageLoaded(lp);
         if (!"com.android.nfc".equals(lp.getPackageName())) return;
         info("onPackageLoaded package=com.android.nfc");
-        installSlimTrace(lp.getDefaultClassLoader());
+        installComprehensiveTrace(lp.getDefaultClassLoader());
     }
 
-    private void installSlimTrace(ClassLoader cl) {
-        info("NFC-TRACE slim mode begin; observation only, no NFC/vendor command will be invoked");
+    private void installComprehensiveTrace(ClassLoader cl) {
+        info("NFC-FLOW comprehensive observation begin; no NFC/vendor command will be invoked");
 
         Class<?> deviceHost = loadOptional(cl, "com.android.nfc.DeviceHost");
         Class<?> nfcService = loadOptional(cl, "com.android.nfc.NfcService");
 
         probeKnownRuntimeClasses(cl);
-        probeConfigSelectorClasses(cl);
+        probeControlFlowClasses(cl);
 
         if (nfcService != null) {
             installNfcServiceConstructorProbe(nfcService, deviceHost);
@@ -78,11 +80,12 @@ public class NfcDiagnosticsModule extends XposedModule {
             installTraceHook(nfcService, "getNfcPollTech");
             installTraceHook(nfcService, "saveNfcPollTech", int.class);
             installNamedTraceHooks(nfcService, "restoreSavedTech");
+            installNamedTraceHooks(nfcService, "applyRouting");
         } else {
-            warn("NFC-TRACE NfcService class unavailable");
+            warn("NFC-FLOW NfcService class unavailable");
         }
 
-        info("NFC-TRACE slim mode hooks requested");
+        info("NFC-FLOW comprehensive hooks requested");
     }
 
     private void probeKnownRuntimeClasses(ClassLoader cl) {
@@ -104,38 +107,48 @@ public class NfcDiagnosticsModule extends XposedModule {
         info("NFC-RUNTIME DIRECT PROBE END found=" + found);
     }
 
-    private void probeConfigSelectorClasses(ClassLoader cl) {
-        info("NFC-SELECTOR PROBE BEGIN");
+    private void probeControlFlowClasses(ClassLoader cl) {
+        info("NFC-FLOW CONTROL PROBE BEGIN");
         int found = 0;
-        for (String className : CONFIG_SELECTOR_CLASS_CANDIDATES) {
+        for (String className : CONTROL_FLOW_CLASS_CANDIDATES) {
             try {
-                Class<?> selector = Class.forName(className, false, cl);
+                Class<?> control = Class.forName(className, false, cl);
                 found++;
-                info("NFC-SELECTOR CLASS FOUND " + selector.getName());
-                enumerateSelectorMethods(selector);
-                installNamedTraceHooks(selector, "setConfig");
-                installNamedTraceHooks(selector, "changeRfParamsByConfig");
+                info("NFC-FLOW CLASS FOUND " + control.getName());
+                enumerateAndHookControlMethods(control);
             } catch (ClassNotFoundException e) {
-                info("NFC-SELECTOR CLASS ABSENT " + className);
+                info("NFC-FLOW CLASS ABSENT " + className);
             } catch (Throwable t) {
-                warn("NFC-SELECTOR CLASS ERROR " + className + " / " + t.getClass().getSimpleName(), t);
+                warn("NFC-FLOW CLASS ERROR " + className + " / " + t.getClass().getSimpleName(), t);
             }
         }
-        info("NFC-SELECTOR PROBE END found=" + found);
+        info("NFC-FLOW CONTROL PROBE END found=" + found);
     }
 
-    private void enumerateSelectorMethods(Class<?> selector) {
+    private void enumerateAndHookControlMethods(Class<?> control) {
         int candidates = 0;
-        for (Method method : selector.getDeclaredMethods()) {
-            String name = method.getName().toLowerCase(Locale.ROOT);
-            if (!name.contains("config") && !name.contains("tap") && !name.contains("access")
-                    && !name.contains("card") && !name.contains("hce") && !name.contains("transit")) {
-                continue;
-            }
+        int hooked = 0;
+        for (Method method : control.getDeclaredMethods()) {
+            if (!isControlFlowMethod(method)) continue;
             candidates++;
-            info("NFC-SELECTOR METHOD " + formatMethod(method));
+            info("NFC-FLOW METHOD " + formatMethod(method));
+            if (method.getParameterCount() <= MAX_AUTO_TRACE_PARAMS) {
+                installTraceHook(control, method.getName(), method.getParameterTypes());
+                hooked++;
+            } else {
+                info("NFC-FLOW METHOD not auto-hooked params=" + method.getParameterCount() + " name=" + method.getName());
+            }
         }
-        info("NFC-SELECTOR METHOD ENUM END class=" + selector.getName() + " candidates=" + candidates);
+        info("NFC-FLOW METHOD ENUM END class=" + control.getName() + " candidates=" + candidates + " hookRequests=" + hooked);
+    }
+
+    private boolean isControlFlowMethod(Method method) {
+        if (method.isSynthetic() || method.isBridge()) return false;
+        String name = method.getName().toLowerCase(Locale.ROOT);
+        if (name.startsWith("access$")) return false;
+        return name.contains("config") || name.contains("hce") || name.contains("polling")
+                || name.contains("card") || name.contains("transit") || name.contains("tap")
+                || name.contains("access") || name.contains("rf") || name.contains("discovery");
     }
 
     private Class<?> loadOptional(ClassLoader cl, String name) {
@@ -277,15 +290,17 @@ public class NfcDiagnosticsModule extends XposedModule {
             hook(method).intercept(chain -> {
                 Object thisObject = chain.getThisObject();
                 Object[] argsArray = chain.getArgs().toArray();
-                info("NFC-TRACE ENTER " + runtime.getSimpleName() + "." + methodName + " args=" + summarizeArgs(argsArray));
+                String callName = runtime.getSimpleName() + "." + methodName;
+                info("NFC-TRACE ENTER " + callName + " args=" + summarizeArgs(argsArray));
                 logPayloadDigests(methodName, argsArray);
-                if ("setConfig".equals(methodName)) logBinderCaller();
+                if (shouldLogBinderCaller(runtime, methodName)) logBinderCaller(callName);
+                if (isImportantFlowMethod(methodName)) logConfiguredTestRequest();
 
                 if ("restoreSavedTech".equals(methodName)) {
                     logActualSavedTech(thisObject, "BEFORE");
                 }
                 logDiscoveryMasks(methodName, argsArray);
-                logShortStack(methodName);
+                logShortStack(callName);
 
                 try {
                     Object result = chain.proceed();
@@ -295,10 +310,10 @@ public class NfcDiagnosticsModule extends XposedModule {
                     if (result instanceof Integer) {
                         logIntBreakdown(methodName + ".result", (Integer) result);
                     }
-                    info("NFC-TRACE RETURN " + runtime.getSimpleName() + "." + methodName + " result=" + summarizeValue(result));
+                    info("NFC-TRACE RETURN " + callName + " result=" + summarizeValue(result));
                     return result;
                 } catch (Throwable t) {
-                    warn("NFC-TRACE THROW " + runtime.getSimpleName() + "." + methodName + " exception=" + t.getClass().getName());
+                    warn("NFC-TRACE THROW " + callName + " exception=" + t.getClass().getName());
                     throw t;
                 }
             });
@@ -313,7 +328,20 @@ public class NfcDiagnosticsModule extends XposedModule {
         }
     }
 
-    private void logBinderCaller() {
+    private boolean shouldLogBinderCaller(Class<?> runtime, String methodName) {
+        String className = runtime.getName();
+        if (className.contains("VendorNfcService") || className.contains("NxpNfcService")) return true;
+        return "setConfig".equals(methodName) || "doSetHceTypeAConfig".equals(methodName)
+                || "setPollingTechMask".equals(methodName);
+    }
+
+    private boolean isImportantFlowMethod(String methodName) {
+        String lower = methodName.toLowerCase(Locale.ROOT);
+        return lower.contains("hce") || lower.contains("config") || lower.contains("polling")
+                || lower.contains("transit") || lower.contains("rfparams");
+    }
+
+    private void logBinderCaller(String callName) {
         try {
             int uid = Binder.getCallingUid();
             int pid = Binder.getCallingPid();
@@ -323,17 +351,15 @@ public class NfcDiagnosticsModule extends XposedModule {
                 String[] names = app.getPackageManager().getPackagesForUid(uid);
                 packages = names == null ? "[]" : Arrays.toString(names);
             }
-            info("NFC-SELECTOR CALLER uid=" + uid + " pid=" + pid + " packages=" + packages);
+            info("NFC-FLOW CALLER method=" + callName + " uid=" + uid + " pid=" + pid + " packages=" + packages);
         } catch (Throwable t) {
-            info("NFC-SELECTOR CALLER unavailable=" + t.getClass().getSimpleName());
+            info("NFC-FLOW CALLER method=" + callName + " unavailable=" + t.getClass().getSimpleName());
         }
     }
 
     private void logPayloadDigests(String methodName, Object[] args) {
-        if (!"setConfig".equals(methodName)
-                && !"setTransitConfig".equals(methodName)
-                && !"changeRfParamsByConfig".equals(methodName)
-                && !"changeRfParams".equals(methodName)) return;
+        String lower = methodName.toLowerCase(Locale.ROOT);
+        if (!lower.contains("config") && !lower.contains("rfparams") && !lower.contains("transit")) return;
 
         for (int i = 0; i < args.length; i++) {
             byte[] payload = null;
