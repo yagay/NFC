@@ -26,6 +26,13 @@ public class NfcDiagnosticsModule extends XposedModule {
     private static final String[] CANDIDATE_KEYWORDS = {
             "config", "core", "vendor", "raw", "write", "rf", "listen", "discovery", "nfcid", "uid"
     };
+    private static final String[] DIRECT_RUNTIME_CLASS_CANDIDATES = {
+            "com.android.nfc.dhimpl.NxpNativeNfcManager",
+            "com.android.nfc.NxpNativeNfcManager",
+            "com.android.nfc.dhimpl.NativeNfcManager",
+            "com.android.nfc.dhimpl.StNativeNfcManager",
+            "com.android.nfc.StNativeNfcManager"
+    };
 
     private final Set<String> installedTraceHooks = new HashSet<>();
     private final Set<String> inspectedRuntimeClasses = new HashSet<>();
@@ -50,6 +57,8 @@ public class NfcDiagnosticsModule extends XposedModule {
         Class<?> deviceHost = loadOptional(cl, "com.android.nfc.DeviceHost");
         Class<?> nfcService = loadOptional(cl, "com.android.nfc.NfcService");
 
+        probeKnownRuntimeClasses(cl);
+
         if (nfcService != null) {
             installNfcServiceConstructorProbe(nfcService, deviceHost);
             installServiceTraceHook(nfcService, "getNfcListenTech");
@@ -63,6 +72,25 @@ public class NfcDiagnosticsModule extends XposedModule {
         }
 
         info("NFC-TRACE slim mode hooks requested");
+    }
+
+    private void probeKnownRuntimeClasses(ClassLoader cl) {
+        info("NFC-RUNTIME DIRECT PROBE BEGIN");
+        int found = 0;
+        for (String className : DIRECT_RUNTIME_CLASS_CANDIDATES) {
+            try {
+                Class<?> runtime = Class.forName(className, false, cl);
+                found++;
+                info("NFC-RUNTIME DIRECT CLASS FOUND " + runtime.getName());
+                inspectAndTraceRuntimeClass(runtime);
+                installHostTraceHooks(runtime);
+            } catch (ClassNotFoundException e) {
+                info("NFC-RUNTIME DIRECT CLASS ABSENT " + className);
+            } catch (Throwable t) {
+                warn("NFC-RUNTIME DIRECT CLASS ERROR " + className + " / " + t.getClass().getSimpleName(), t);
+            }
+        }
+        info("NFC-RUNTIME DIRECT PROBE END found=" + found);
     }
 
     private Class<?> loadOptional(ClassLoader cl, String name) {
