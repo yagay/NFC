@@ -96,16 +96,12 @@ class MainActivity : ComponentActivity() {
         if (readModeEnabled) handleIntent(intent)
     }
 
-    override fun onResume() { super.onResume(); applyReadDispatchState() }
+    override fun onResume() { super.onResume(); if (readModeEnabled) enableReadDispatch() }
     override fun onPause() { disableReadDispatch(); super.onPause() }
     override fun onDestroy() { disableReadDispatch(); executor.shutdownNow(); super.onDestroy() }
 
-    private fun applyReadDispatchState() {
-        if (readModeEnabled && !getSimulationEnabled()) enableReadDispatch() else disableReadDispatch()
-    }
-
     private fun enableReadDispatch() {
-        if (!readModeEnabled || getSimulationEnabled()) return
+        if (!readModeEnabled) return
         runCatching { nfcAdapter?.enableForegroundDispatch(this, pendingIntent, null, null) }
             .onSuccess { AppLogger.i("READ_MODE: foreground dispatch enabled") }
             .onFailure { AppLogger.i("READ_MODE: enable dispatch failed ${it.javaClass.simpleName}: ${it.message}") }
