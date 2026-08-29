@@ -1,0 +1,21 @@
+name: One-shot generic hook and stop restore patch
+on:
+  push:
+    paths:
+      - '.github/workflows/run-generic-hook-stop-patch.yml'
+permissions:
+  contents: write
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply patch
+        run: python3 scripts/patch_generic_hook_and_stop.py
+      - name: Commit patch
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add app/src/main/java/com/example/nfcdoorcard/MainActivity.kt app/src/main/java/com/example/nfcdoorcard/xposed/NfcInjectionModule.java
+          git commit -m 'fix: restore stock RF on stop and add generic NXP hook'
+          git push
