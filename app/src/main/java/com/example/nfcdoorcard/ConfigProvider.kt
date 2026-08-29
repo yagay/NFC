@@ -10,7 +10,7 @@ class ConfigProvider : ContentProvider() {
     companion object {
         const val AUTHORITY = "com.example.nfcdoorcard.config"
         const val PATH_SETTINGS = "settings"
-        const val APP_BUILD = 8
+        const val APP_BUILD = 9
 
         const val KEY_APP_BUILD = "app_build"
         const val KEY_HOOK_BUILD = "hook_build"
@@ -41,6 +41,18 @@ class ConfigProvider : ContentProvider() {
         const val KEY_TRACE_STAGE = "trace_stage"
         const val KEY_TRACE_SOURCE = "trace_source"
         const val KEY_TRACE_PID = "trace_pid"
+
+        const val KEY_TEXT_CONFIG_SEEN = "text_config_seen"
+        const val KEY_TEXT_CONFIG_SOURCE = "text_config_source"
+        const val KEY_TEXT_CONFIG_LENGTH = "text_config_length"
+        const val KEY_CONFIG_BLOCK_COUNT = "config_block_count"
+        const val KEY_NCI_FRAME_COUNT = "nci_frame_count"
+        const val KEY_NFCID1_COUNT = "nfcid1_count"
+        const val KEY_HCE_GET_UID = "hce_get_uid"
+        const val KEY_RF_FIELD_COUNT = "rf_field_count"
+        const val KEY_LAST_NATIVE_RESULT = "last_native_result"
+        const val KEY_FULL_DIAG_STAGE = "full_diag_stage"
+        const val KEY_FULL_DIAG_SUMMARY = "full_diag_summary"
 
         val URI: Uri = Uri.parse("content://$AUTHORITY/$PATH_SETTINGS")
     }
