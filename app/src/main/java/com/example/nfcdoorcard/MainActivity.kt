@@ -503,32 +503,32 @@ class MainActivity : ComponentActivity() {
             clearRuntimeHookStatus()
             val script = """
                 old=$(pidof com.android.nfc 2>/dev/null | awk '{print $1}')
-                echo "OLD_PID=$old"
+                echo "OLD_PID=${'$'}old"
                 svc nfc disable 2>/dev/null || true
                 sleep 1
-                if [ -n "$old" ]; then
-                  kill -TERM "$old" 2>/dev/null || true
+                if [ -n "${'$'}old" ]; then
+                  kill -TERM "${'$'}old" 2>/dev/null || true
                   sleep 1
-                  kill -0 "$old" 2>/dev/null && kill -KILL "$old" 2>/dev/null || true
+                  kill -0 "${'$'}old" 2>/dev/null && kill -KILL "${'$'}old" 2>/dev/null || true
                 fi
                 i=0
                 new=""
-                while [ $i -lt 40 ]; do
+                while [ ${'$'}i -lt 40 ]; do
                   new=$(pidof com.android.nfc 2>/dev/null | awk '{print $1}')
-                  if [ -n "$new" ] && [ "$new" != "$old" ]; then break; fi
+                  if [ -n "${'$'}new" ] && [ "${'$'}new" != "${'$'}old" ]; then break; fi
                   sleep 0.25
-                  i=$((i+1))
+                  i=${'$'}((i+1))
                 done
                 svc nfc enable 2>/dev/null || true
                 i=0
-                while [ $i -lt 40 ]; do
+                while [ ${'$'}i -lt 40 ]; do
                   state=$(dumpsys nfc 2>/dev/null | grep -m1 -E 'mState=|state=' | tr 'A-Z' 'a-z')
-                  echo "$state" | grep -Eq 'mstate=3|state_on|state=on|mstate=on| on' && break
+                  echo "${'$'}state" | grep -Eq 'mstate=3|state_on|state=on|mstate=on| on' && break
                   sleep 0.25
-                  i=$((i+1))
+                  i=${'$'}((i+1))
                 done
                 final=$(pidof com.android.nfc 2>/dev/null | awk '{print $1}')
-                echo "NEW_PID=$final"
+                echo "NEW_PID=${'$'}final"
                 echo "NFC_STATE=$(dumpsys nfc 2>/dev/null | grep -m1 -E 'mState=|state=' || true)"
             """.trimIndent()
 
@@ -566,7 +566,7 @@ class MainActivity : ComponentActivity() {
             }
         } catch (_: Exception) {}
 
-        val lsp = runRootCmd("pid=$(pidof com.android.nfc 2>/dev/null | awk '{print $1}'); if [ -n \"$pid\" ]; then grep -h -E 'com.example.nfcdoorcard|SCOPE: SUCCESS|HOOK: (SUCCESS|INSTALLED)|HIJACK: (SUCCESS|FAILED)' /data/adb/lspd/log/modules* 2>/dev/null | grep \": $pid:\" | tail -n 200; fi")
+        val lsp = runRootCmd("pid=\$(pidof com.android.nfc 2>/dev/null | awk '{print \$1}'); if [ -n \"\$pid\" ]; then grep -h -E 'com.example.nfcdoorcard|SCOPE: SUCCESS|HOOK: (SUCCESS|INSTALLED)|HIJACK: (SUCCESS|FAILED)' /data/adb/lspd/log/modules* 2>/dev/null | grep \": \$pid:\" | tail -n 200; fi")
         val scopeByLog = lsp.contains("SCOPE: SUCCESS package=com.android.nfc")
         val hookByLog = lsp.contains("HOOK: SUCCESS") || lsp.contains("HOOK: INSTALLED")
 
