@@ -1,1 +1,2 @@
 com.example.nfcdoorcard.xposed.NfcInjectionModule
+com.example.nfcdoorcard.xposed.HeyTapShareModeBridgeModule
