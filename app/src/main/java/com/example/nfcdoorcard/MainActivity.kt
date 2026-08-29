@@ -32,7 +32,7 @@ import com.google.gson.reflect.TypeToken
 import java.io.File
 import java.util.concurrent.Executors
 
-enum class LogSource { HIJACK, LSPosed, KernelSU }
+enum class LogSource { STATUS, LSPosed, KernelSU }
 
 data class RuntimeStatus(
     val appBuild: Int = 0,
@@ -41,32 +41,15 @@ data class RuntimeStatus(
     val scopePid: Int = 0,
     val hookPid: Int = 0,
     val scopeOk: Boolean = false,
-    val scopeProcess: String? = null,
     val hookInstalled: Boolean = false,
-    val hookClass: String? = null,
-    val hookCount: Int = 0,
     val simulationEnabled: Boolean = false,
     val selectedUid: String? = null,
-    val hijackStatus: String = "IDLE",
-    val hijackResult: String? = null,
-    val hijackUid: String? = null,
-    val hijackError: String? = null,
-    val hijackPid: Int = 0,
-    val rfStatus: String = "WAITING",
+    val rfStatus: String = "IDLE",
     val rfUid: String? = null,
     val rfSource: String? = null,
     val rfResult: String? = null,
     val rfError: String? = null,
     val rfPid: Int = 0,
-    val textConfigSeen: Boolean = false,
-    val textConfigSource: String? = null,
-    val textConfigLength: Int = 0,
-    val configBlockCount: Int = 0,
-    val nciFrameCount: Int = 0,
-    val nfcid1Count: Int = 0,
-    val hceGetUid: String? = null,
-    val rfFieldCount: Int = 0,
-    val lastNativeResult: String? = null,
     val fullDiagStage: String? = null,
     val fullDiagSummary: String? = null
 )
@@ -80,6 +63,7 @@ class MainActivity : ComponentActivity() {
     private var pendingIntent: PendingIntent? = null
     private val gson = Gson()
     private val executor = Executors.newSingleThreadExecutor()
+
     private var scannedCardState by mutableStateOf<CardModel?>(null)
     private var savedCardsState by mutableStateOf<List<CardModel>>(emptyList())
     private var readModeEnabled by mutableStateOf(false)
@@ -95,7 +79,13 @@ class MainActivity : ComponentActivity() {
         )
         savedCardsState = loadCards()
         AppLogger.i("NFC mode controller started")
-        setContent { MaterialTheme { Surface(modifier = Modifier.fillMaxSize()) { NfcAppContent() } } }
+        setContent {
+            MaterialTheme {
+                Surface(modifier = Modifier.fillMaxSize()) {
+                    NfcAppContent()
+                }
+            }
+        }
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -106,8 +96,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        if (readModeEnabled && !getSimulationEnabled()) enableReadDispatch()
-        else disableReadDispatch()
+        applyReadDispatchState()
     }
 
     override fun onPause() {
@@ -121,9 +110,14 @@ class MainActivity : ComponentActivity() {
         super.onDestroy()
     }
 
+    private fun applyReadDispatchState() {
+        if (readModeEnabled && !getSimulationEnabled()) enableReadDispatch() else disableReadDispatch()
+    }
+
     private fun enableReadDispatch() {
         if (!readModeEnabled || getSimulationEnabled()) return
         runCatching { nfcAdapter?.enableForegroundDispatch(this, pendingIntent, null, null) }
+            .onSuccess { AppLogger.i("READ_MODE: foreground dispatch enabled") }
             .onFailure { AppLogger.i("READ_MODE: enable dispatch failed ${it.javaClass.simpleName}: ${it.message}") }
     }
 
@@ -182,11 +176,10 @@ class MainActivity : ComponentActivity() {
         val cards = savedCardsState
         var status by remember { mutableStateOf(readRuntimeStatus()) }
         var logText by remember { mutableStateOf("") }
-        var selectedSource by remember { mutableStateOf(LogSource.HIJACK) }
+        var selectedSource by remember { mutableStateOf(LogSource.STATUS) }
         var diagnosticRunning by remember { mutableStateOf(false) }
-        var reloadRunning by remember { mutableStateOf(false) }
-        var reloadMessage by remember { mutableStateOf<String?>(null) }
         var expandedUid by remember { mutableStateOf<String?>(null) }
+        var operationMessage by remember { mutableStateOf<String?>(null) }
         val logListState = rememberLazyListState()
 
         LaunchedEffect(selectedSource) {
@@ -196,47 +189,37 @@ class MainActivity : ComponentActivity() {
                     val logs = fetchLogsSync(selectedSource)
                     runOnUiThread {
                         status = newStatus
-                        logText = if (selectedSource == LogSource.HIJACK) buildStatusSummary(newStatus) + "\n\n" + logs else logs
+                        logText = if (selectedSource == LogSource.STATUS) {
+                            buildStatusSummary(newStatus) + "\n\n" + logs
+                        } else logs
                     }
                 }
-                kotlinx.coroutines.delay(2500)
+                kotlinx.coroutines.delay(2000)
             }
         }
 
-        Scaffold(topBar = {
-            TopAppBar(title = { Text("NFC Expert Pro 1.0.14") }, actions = {
-                TextButton(onClick = {
-                    if (!diagnosticRunning) {
-                        diagnosticRunning = true
-                        runOneTapDiagnosticAndShare { diagnosticRunning = false }
-                    }
-                }) { Text("导出") }
-                TextButton(onClick = { AppLogger.clear(); logText = "" }) { Text("清空") }
-            })
-        }) { padding ->
-            LazyColumn(modifier = Modifier.padding(padding).fillMaxSize(), contentPadding = PaddingValues(bottom = 12.dp)) {
-                item {
-                    RuntimeStatusPanel(status, diagnosticRunning, reloadRunning, reloadMessage,
-                        onRefresh = { status = readRuntimeStatus() },
-                        onReload = {
-                            if (!reloadRunning) {
-                                reloadRunning = true
-                                reloadMessage = "正在重建 com.android.nfc 并等待 LSPosed 注入..."
-                                reloadNfcProcessAndHook { newStatus, message ->
-                                    runOnUiThread {
-                                        status = newStatus
-                                        reloadMessage = message
-                                        reloadRunning = false
-                                    }
-                                }
-                            }
-                        },
-                        onDiagnostic = {
+        Scaffold(
+            topBar = {
+                TopAppBar(
+                    title = { Text("NFC Expert Pro 1.0.15") },
+                    actions = {
+                        TextButton(onClick = {
                             if (!diagnosticRunning) {
                                 diagnosticRunning = true
                                 runOneTapDiagnosticAndShare { diagnosticRunning = false }
                             }
-                        })
+                        }) { Text("导出") }
+                        TextButton(onClick = { AppLogger.clear(); logText = "" }) { Text("清空") }
+                    }
+                )
+            }
+        ) { padding ->
+            LazyColumn(
+                modifier = Modifier.padding(padding).fillMaxSize(),
+                contentPadding = PaddingValues(bottom = 12.dp)
+            ) {
+                item {
+                    RuntimeStatusPanel(status, operationMessage)
                 }
 
                 item {
@@ -251,9 +234,23 @@ class MainActivity : ComponentActivity() {
                     )
                 }
 
-                item { Text("已保存卡片 (${cards.size})", modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp), fontWeight = FontWeight.Bold) }
+                item {
+                    Text(
+                        "已保存卡片 (${cards.size})",
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+
                 if (cards.isEmpty()) {
-                    item { Text("暂无保存卡片。进入读卡模式后贴卡，确认信息无误再保存。", modifier = Modifier.padding(12.dp), fontSize = 12.sp, color = Color.Gray) }
+                    item {
+                        Text(
+                            "暂无保存卡片。进入读卡模式后贴卡，确认信息无误再保存。",
+                            modifier = Modifier.padding(12.dp),
+                            fontSize = 12.sp,
+                            color = Color.Gray
+                        )
+                    }
                 } else {
                     items(cards, key = { it.uid }) { card ->
                         val active = status.simulationEnabled && card.uid.equals(status.selectedUid, true)
@@ -265,16 +262,33 @@ class MainActivity : ComponentActivity() {
                                 expandedUid = if (expandedUid?.equals(card.uid, true) == true) null else card.uid
                             },
                             onSimulate = {
-                                stopReadMode("simulation_start")
-                                simulateCardFullChain(card)
-                                status = status.copy(simulationEnabled = true, selectedUid = card.uid, hijackStatus = "WAITING", rfStatus = "WAITING")
+                                operationMessage = "正在应用 UID ${card.uid}，NFC 保持开启..."
+                                simulateCard(card) { newStatus, message ->
+                                    runOnUiThread {
+                                        status = newStatus
+                                        operationMessage = message
+                                    }
+                                }
+                                status = status.copy(
+                                    simulationEnabled = true,
+                                    selectedUid = card.uid,
+                                    rfStatus = "WAITING"
+                                )
                             },
                             onStop = {
-                                disableSimulation()
-                                status = status.copy(simulationEnabled = false, hijackStatus = "IDLE", rfStatus = "IDLE")
+                                operationMessage = "正在停止模拟并恢复原始 NFC 配置..."
+                                stopSimulation { newStatus, message ->
+                                    runOnUiThread {
+                                        status = newStatus
+                                        operationMessage = message
+                                    }
+                                }
+                                status = status.copy(simulationEnabled = false, rfStatus = "IDLE")
                             },
                             onDelete = {
-                                if (active) disableSimulation()
+                                if (active) {
+                                    stopSimulation { _, _ -> }
+                                }
                                 savedCardsState = savedCardsState.filterNot { it.uid.equals(card.uid, true) }
                                 if (expandedUid?.equals(card.uid, true) == true) expandedUid = null
                                 saveCards(savedCardsState)
@@ -286,24 +300,46 @@ class MainActivity : ComponentActivity() {
                 item {
                     Spacer(Modifier.height(6.dp))
                     TabRow(selectedTabIndex = selectedSource.ordinal) {
-                        LogSource.entries.forEach { source -> Tab(selected = selectedSource == source, onClick = { selectedSource = source }, text = { Text(source.name, fontSize = 11.sp) }) }
+                        LogSource.entries.forEach { source ->
+                            Tab(
+                                selected = selectedSource == source,
+                                onClick = { selectedSource = source },
+                                text = { Text(source.name, fontSize = 11.sp) }
+                            )
+                        }
                     }
                 }
+
                 item {
-                    Box(modifier = Modifier.fillMaxWidth().height(300.dp).padding(6.dp).background(Color(0xFF050505), RoundedCornerShape(4.dp)).padding(6.dp)) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(300.dp)
+                            .padding(6.dp)
+                            .background(Color(0xFF050505), RoundedCornerShape(4.dp))
+                            .padding(6.dp)
+                    ) {
                         val lines = logText.split("\n")
                         LazyColumn(state = logListState, modifier = Modifier.fillMaxSize()) {
                             items(lines) { line ->
-                                Text(line, color = when {
-                                    line.contains("SUCCESS") || line.contains("ACCEPTED") || line.contains("READY") -> Color.Cyan
-                                    line.contains("FAILED") || line.contains("ERROR") || line.contains("STALE") -> Color.Red
-                                    line.contains("WAITING") || line.contains("IDLE") -> Color.Yellow
-                                    line.contains("RF:") || line.contains("NFCID1") || line.contains("NCI:") -> Color.Green
-                                    else -> Color(0xFFD4D4D4)
-                                }, fontSize = 9.sp, lineHeight = 11.sp, fontFamily = FontFamily.Monospace)
+                                Text(
+                                    line,
+                                    color = when {
+                                        line.contains("SUCCESS") || line.contains("APPLIED") || line.contains("ACCEPTED") || line.contains("READY") -> Color.Cyan
+                                        line.contains("FAILED") || line.contains("ERROR") || line.contains("STALE") -> Color.Red
+                                        line.contains("WAITING") || line.contains("IDLE") -> Color.Yellow
+                                        line.contains("RF") || line.contains("NFCID1") -> Color.Green
+                                        else -> Color(0xFFD4D4D4)
+                                    },
+                                    fontSize = 9.sp,
+                                    lineHeight = 11.sp,
+                                    fontFamily = FontFamily.Monospace
+                                )
                             }
                         }
-                        LaunchedEffect(lines.size) { if (lines.isNotEmpty()) logListState.animateScrollToItem(lines.size - 1) }
+                        LaunchedEffect(lines.size) {
+                            if (lines.isNotEmpty()) logListState.animateScrollToItem(lines.size - 1)
+                        }
                     }
                 }
             }
@@ -311,33 +347,29 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun RuntimeStatusPanel(status: RuntimeStatus, diagnosticRunning: Boolean, reloadRunning: Boolean, reloadMessage: String?, onRefresh: () -> Unit, onReload: () -> Unit, onDiagnostic: () -> Unit) {
+    private fun RuntimeStatusPanel(status: RuntimeStatus, operationMessage: String?) {
         Card(modifier = Modifier.fillMaxWidth().padding(8.dp)) {
             Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Text("运行状态", fontWeight = FontWeight.Bold)
-                StatusRow("版本 / PID", status.appBuild == ConfigProvider.APP_BUILD && status.hookBuild == EXPECTED_HOOK_BUILD,
-                    "app=${status.appBuild} hook=${status.hookBuild} pid=${status.currentPid} scopePid=${status.scopePid} hookPid=${status.hookPid}")
-                StatusRow("LSPosed 范围", status.scopeOk, if (status.scopeOk) "SUCCESS · ${status.scopeProcess ?: "com.android.nfc"}" else "NOT DETECTED / STALE")
-                StatusRow("HCE Hook", status.hookInstalled, if (status.hookInstalled) "SUCCESS · count=${status.hookCount}" else "NOT INSTALLED / STALE")
-                StatusRow("模拟配置", status.simulationEnabled, if (status.simulationEnabled) "ENABLED · UID=${status.selectedUid}" else "IDLE")
-                StatusRow("HCE Native", status.hijackStatus == "NATIVE_ACCEPTED", "${status.hijackStatus} · uid=${status.hijackUid ?: "-"} · result=${status.hijackResult ?: "-"} · pid=${status.hijackPid}")
-                StatusRow("配置文本", status.textConfigSeen, "seen=${status.textConfigSeen} len=${status.textConfigLength} blocks=${status.configBlockCount} source=${status.textConfigSource ?: "-"}")
-                StatusRow("NCI / NFCID1", status.nciFrameCount > 0 || status.nfcid1Count > 0, "frames=${status.nciFrameCount} nfcid1=${status.nfcid1Count} rf=${status.rfStatus}")
-                StatusRow("RF Field", status.rfFieldCount > 0, "count=${status.rfFieldCount} HCE_GET_UID=${status.hceGetUid ?: "-"}")
-                Text("Stage: ${status.fullDiagStage ?: "-"}", fontSize = 10.sp, fontFamily = FontFamily.Monospace)
-                status.fullDiagSummary?.takeIf { it.isNotBlank() }?.let { Text(it, fontSize = 10.sp, fontFamily = FontFamily.Monospace) }
-                status.rfError?.takeIf { it.isNotBlank() }?.let { Text("RF error: $it", fontSize = 10.sp, color = Color.Red) }
-                HorizontalDivider()
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text("重新加载 Hook / 更新状态", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
-                        Text(reloadMessage ?: "会强制更换 NFC PID，并等待当前 Probe 注入", fontSize = 10.sp, color = Color.Gray)
-                    }
-                    Switch(checked = reloadRunning, enabled = !reloadRunning, onCheckedChange = { if (it) onReload() })
-                }
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    OutlinedButton(onClick = onRefresh, modifier = Modifier.weight(1f), enabled = !reloadRunning) { Text("刷新状态") }
-                    Button(onClick = onDiagnostic, modifier = Modifier.weight(1f), enabled = !diagnosticRunning && !reloadRunning) { Text(if (diagnosticRunning) "检测中..." else "一键检测 + 导出") }
+                StatusRow(
+                    "NFC / Hook",
+                    status.currentPid > 0 && status.hookInstalled,
+                    "pid=${status.currentPid} · hookBuild=${status.hookBuild} · hookPid=${status.hookPid}"
+                )
+                StatusRow(
+                    "模拟配置",
+                    status.simulationEnabled,
+                    if (status.simulationEnabled) "UID=${status.selectedUid ?: "-"}" else "IDLE"
+                )
+                StatusRow(
+                    "RF UID",
+                    status.rfStatus == "RF_UID_APPLIED",
+                    "${status.rfStatus} · uid=${status.rfUid ?: "-"} · result=${status.rfResult ?: "-"}"
+                )
+                Text("读卡模式: ${if (readModeEnabled) "开启" else "关闭"}", fontSize = 11.sp)
+                operationMessage?.let { Text(it, fontSize = 11.sp, color = Color.Gray) }
+                status.rfError?.takeIf { it.isNotBlank() }?.let {
+                    Text("RF error: $it", fontSize = 10.sp, color = Color.Red)
                 }
             }
         }
@@ -358,25 +390,37 @@ class MainActivity : ComponentActivity() {
                 Text("读卡模式", fontWeight = FontWeight.Bold)
                 when {
                     simulationActive -> {
-                        Text("当前正在模拟。读卡功能保持关闭，停止模拟后才能进入读卡模式。", fontSize = 12.sp)
-                        Button(onClick = {}, enabled = false, modifier = Modifier.fillMaxWidth()) { Text("模拟中 · 读卡已关闭") }
+                        Text("当前正在模拟。读卡功能保持关闭。", fontSize = 12.sp)
+                        Button(onClick = {}, enabled = false, modifier = Modifier.fillMaxWidth()) {
+                            Text("模拟中 · 读卡已关闭")
+                        }
                     }
                     readMode -> {
-                        Text("读卡已开启，请把门禁卡贴到手机背部。读取成功后会退出读卡模式并显示卡片信息。", fontSize = 12.sp)
-                        OutlinedButton(onClick = onStopRead, modifier = Modifier.fillMaxWidth()) { Text("退出读卡模式") }
+                        Text("读卡已开启，请把门禁卡贴到手机背部。", fontSize = 12.sp)
+                        OutlinedButton(onClick = onStopRead, modifier = Modifier.fillMaxWidth()) {
+                            Text("退出读卡模式")
+                        }
                     }
                     card == null -> {
                         Text("默认不读取卡片。需要添加新卡时再进入读卡模式。", fontSize = 12.sp)
-                        Button(onClick = onStartRead, modifier = Modifier.fillMaxWidth()) { Text("进入读卡模式") }
+                        Button(onClick = onStartRead, modifier = Modifier.fillMaxWidth()) {
+                            Text("进入读卡模式")
+                        }
                     }
                     else -> {
                         Text("读取成功", color = Color(0xFF2E7D32), fontWeight = FontWeight.Bold)
                         CardDetails(card)
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            Button(onClick = { onSave(card) }, modifier = Modifier.weight(1f)) { Text("保存卡片") }
-                            OutlinedButton(onClick = { onClear(); onStartRead() }, modifier = Modifier.weight(1f)) { Text("重新读取") }
+                            Button(onClick = { onSave(card) }, modifier = Modifier.weight(1f)) {
+                                Text("保存卡片")
+                            }
+                            OutlinedButton(onClick = { onClear(); onStartRead() }, modifier = Modifier.weight(1f)) {
+                                Text("重新读取")
+                            }
                         }
-                        TextButton(onClick = onClear, modifier = Modifier.fillMaxWidth()) { Text("关闭读取结果") }
+                        TextButton(onClick = onClear, modifier = Modifier.fillMaxWidth()) {
+                            Text("关闭读取结果")
+                        }
                     }
                 }
             }
@@ -390,7 +434,11 @@ class MainActivity : ComponentActivity() {
             Text("UID: ${card.uid}", fontFamily = FontFamily.Monospace, fontSize = 12.sp)
             Text("SAK: ${card.sak}", fontFamily = FontFamily.Monospace, fontSize = 12.sp)
             Text("ATQA: ${card.atqa}", fontFamily = FontFamily.Monospace, fontSize = 12.sp)
-            Text("UID 长度: ${card.uid.replace(Regex("[^0-9A-Fa-f]"), "").length / 2} bytes", fontSize = 11.sp, color = Color.Gray)
+            Text(
+                "UID 长度: ${card.uid.replace(Regex("[^0-9A-Fa-f]"), "").length / 2} bytes",
+                fontSize = 11.sp,
+                color = Color.Gray
+            )
             Text("类型: ISO/IEC 14443 Type A", fontSize = 11.sp, color = Color.Gray)
         }
     }
@@ -398,9 +446,16 @@ class MainActivity : ComponentActivity() {
     @Composable
     private fun StatusRow(label: String, ok: Boolean, detail: String) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Text(if (ok) "●" else "○", color = if (ok) Color(0xFF2E7D32) else Color(0xFFC62828), fontSize = 18.sp)
+            Text(
+                if (ok) "●" else "○",
+                color = if (ok) Color(0xFF2E7D32) else Color(0xFFC62828),
+                fontSize = 18.sp
+            )
             Spacer(Modifier.width(8.dp))
-            Column { Text(label, fontWeight = FontWeight.SemiBold, fontSize = 13.sp); Text(detail, fontSize = 11.sp) }
+            Column {
+                Text(label, fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                Text(detail, fontSize = 11.sp)
+            }
         }
     }
 
@@ -414,7 +469,12 @@ class MainActivity : ComponentActivity() {
         onStop: () -> Unit,
         onDelete: () -> Unit
     ) {
-        Card(modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 3.dp).clickable { onToggleDetails() }) {
+        Card(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 8.dp, vertical = 3.dp)
+                .clickable { onToggleDetails() }
+        ) {
             Column(modifier = Modifier.padding(8.dp), verticalArrangement = Arrangement.spacedBy(5.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Column(modifier = Modifier.weight(1f)) {
@@ -422,10 +482,19 @@ class MainActivity : ComponentActivity() {
                         Text("UID ${card.uid}", fontSize = 10.sp, color = Color.Gray)
                         Text(if (expanded) "点击收起详情" else "点击查看详情", fontSize = 9.sp, color = Color.Gray)
                     }
-                    if (isActive) Button(onClick = onStop, contentPadding = PaddingValues(horizontal = 10.dp)) { Text("停止模拟", fontSize = 10.sp) }
-                    else Button(onClick = onSimulate, contentPadding = PaddingValues(horizontal = 10.dp)) { Text("模拟", fontSize = 10.sp) }
+                    if (isActive) {
+                        Button(onClick = onStop, contentPadding = PaddingValues(horizontal = 10.dp)) {
+                            Text("停止模拟", fontSize = 10.sp)
+                        }
+                    } else {
+                        Button(onClick = onSimulate, contentPadding = PaddingValues(horizontal = 10.dp)) {
+                            Text("模拟", fontSize = 10.sp)
+                        }
+                    }
                     Spacer(Modifier.width(4.dp))
-                    TextButton(onClick = onDelete, contentPadding = PaddingValues(horizontal = 6.dp)) { Text("删除", fontSize = 10.sp) }
+                    TextButton(onClick = onDelete, contentPadding = PaddingValues(horizontal = 6.dp)) {
+                        Text("删除", fontSize = 10.sp)
+                    }
                 }
                 if (expanded) {
                     HorizontalDivider()
@@ -435,22 +504,44 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun simulateCardFullChain(card: CardModel) {
+    private fun simulateCard(card: CardModel, onDone: (RuntimeStatus, String) -> Unit) {
         stopReadMode("simulation_start")
         writeSimulationConfig(card)
-        AppLogger.i("FULLTEST: requested uid=${card.uid} sak=${card.sak} atqa=${card.atqa}")
+        AppLogger.i("SIMULATION: requested uid=${card.uid} sak=${card.sak} atqa=${card.atqa}")
         executor.execute {
-            val result = rebuildNfcProcess("simulation")
-            AppLogger.i("FULLTEST: rebuild result\n$result")
-            var state = waitForFreshHook(12_000)
-            AppLogger.i("FULLTEST: hook state ${buildStatusSummary(state)}")
-            if (!state.scopeOk || !state.hookInstalled) {
-                AppLogger.i("FULLTEST: FAILED fresh hook not ready")
-                return@execute
+            val restart = restartNfcProcessKeepingEnabled("simulation")
+            AppLogger.i("SIMULATION: process restart\n$restart")
+            var state = waitForHookAndRf(card.uid, 14_000)
+            val message = when {
+                state.rfStatus == "RF_UID_APPLIED" && state.rfUid.equals(card.uid, true) ->
+                    "模拟已应用 · UID=${card.uid}"
+                !state.hookInstalled ->
+                    "NFC 已保持开启，但 Hook 尚未就绪"
+                else ->
+                    "Hook 已加载，等待 RF UID 应用"
             }
-            Thread.sleep(2500)
-            state = readRuntimeStatus()
-            AppLogger.i("FULLTEST: init capture ${buildStatusSummary(state)}")
+            AppLogger.i("SIMULATION: result $message\n${buildStatusSummary(state)}")
+            onDone(state, message)
+        }
+    }
+
+    private fun stopSimulation(onDone: (RuntimeStatus, String) -> Unit) {
+        stopReadMode("simulation_stop")
+        contentResolver.insert(ConfigProvider.URI, ContentValues().apply {
+            put(ConfigProvider.KEY_SIMULATION_ENABLED, false)
+            put(ConfigProvider.KEY_RF_STATUS, "IDLE")
+            put(ConfigProvider.KEY_RF_UID, "")
+            put(ConfigProvider.KEY_RF_RESULT, "")
+            put(ConfigProvider.KEY_RF_ERROR, "")
+            put(ConfigProvider.KEY_FULL_DIAG_STAGE, "STOPPING")
+            put(ConfigProvider.KEY_FULL_DIAG_SUMMARY, "Restoring stock NFC config without disabling NFC")
+        })
+        AppLogger.i("SIMULATION: stop requested")
+        executor.execute {
+            val restart = restartNfcProcessKeepingEnabled("stop_simulation")
+            AppLogger.i("SIMULATION: stop restart\n$restart")
+            val state = waitForHookOnly(10_000)
+            onDone(state, "模拟已停止，NFC 保持开启")
         }
     }
 
@@ -468,55 +559,31 @@ class MainActivity : ComponentActivity() {
             put(ConfigProvider.KEY_HOOK_CLASS, "")
             put(ConfigProvider.KEY_HOOK_COUNT, 0)
             put(ConfigProvider.KEY_HOOK_PID, 0)
-            put(ConfigProvider.KEY_HIJACK_STATUS, "WAITING")
-            put(ConfigProvider.KEY_HIJACK_UID, "")
-            put(ConfigProvider.KEY_HIJACK_RESULT, "")
-            put(ConfigProvider.KEY_HIJACK_ERROR, "")
-            put(ConfigProvider.KEY_HIJACK_PID, 0)
             put(ConfigProvider.KEY_RF_STATUS, "WAITING")
             put(ConfigProvider.KEY_RF_UID, "")
             put(ConfigProvider.KEY_RF_SOURCE, "")
             put(ConfigProvider.KEY_RF_RESULT, "")
             put(ConfigProvider.KEY_RF_ERROR, "")
             put(ConfigProvider.KEY_RF_PID, 0)
-            put(ConfigProvider.KEY_TEXT_CONFIG_SEEN, false)
-            put(ConfigProvider.KEY_TEXT_CONFIG_SOURCE, "")
-            put(ConfigProvider.KEY_TEXT_CONFIG_LENGTH, 0)
-            put(ConfigProvider.KEY_CONFIG_BLOCK_COUNT, 0)
-            put(ConfigProvider.KEY_NCI_FRAME_COUNT, 0)
-            put(ConfigProvider.KEY_NFCID1_COUNT, 0)
-            put(ConfigProvider.KEY_HCE_GET_UID, "")
-            put(ConfigProvider.KEY_RF_FIELD_COUNT, 0)
-            put(ConfigProvider.KEY_LAST_NATIVE_RESULT, "")
             put(ConfigProvider.KEY_FULL_DIAG_STAGE, "APP_CONFIG_READY")
-            put(ConfigProvider.KEY_FULL_DIAG_SUMMARY, "UID saved before NFC process rebuild")
+            put(ConfigProvider.KEY_FULL_DIAG_SUMMARY, "UID saved; restarting NFC process without disabling NFC")
         })
     }
 
-    private fun disableSimulation() {
-        contentResolver.insert(ConfigProvider.URI, ContentValues().apply {
-            put(ConfigProvider.KEY_SIMULATION_ENABLED, false)
-            put(ConfigProvider.KEY_HIJACK_STATUS, "IDLE")
-            put(ConfigProvider.KEY_RF_STATUS, "IDLE")
-            put(ConfigProvider.KEY_FULL_DIAG_STAGE, "DISABLED")
-        })
-        AppLogger.i("CARD: simulation stopped")
-        executor.execute { AppLogger.i("NFC restart: ${runRootCmd("svc nfc disable; sleep 1; svc nfc enable; sleep 2; dumpsys nfc 2>/dev/null | grep -m1 -E 'mState=|state=' || true").trim()}") }
-    }
-
-    private fun rebuildNfcProcess(reason: String): String {
+    private fun restartNfcProcessKeepingEnabled(reason: String): String {
         val script = """
             old=${'$'}(pidof com.android.nfc 2>/dev/null | awk '{print ${'$'}1}')
+            before=${'$'}(dumpsys nfc 2>/dev/null | grep -m1 -E 'mState=|state=' || true)
             echo "REASON=$reason"
             echo "OLD_PID=${'$'}old"
-            svc nfc disable 2>/dev/null || true
-            sleep 1
+            echo "BEFORE_STATE=${'$'}before"
+
             if [ -n "${'$'}old" ]; then
               kill -TERM "${'$'}old" 2>/dev/null || true
               sleep 0.5
               kill -0 "${'$'}old" 2>/dev/null && kill -KILL "${'$'}old" 2>/dev/null || true
             fi
-            svc nfc enable 2>/dev/null || true
+
             i=0
             new=""
             while [ ${'$'}i -lt 60 ]; do
@@ -525,90 +592,85 @@ class MainActivity : ComponentActivity() {
               sleep 0.2
               i=${'$'}((i+1))
             done
+
+            state=${'$'}(dumpsys nfc 2>/dev/null | grep -m1 -E 'mState=|state=' || true)
+            if ! echo "${'$'}state" | grep -Eqi 'mState=on|state=on|STATE_ON|mState=3'; then
+              svc nfc enable 2>/dev/null || true
+            fi
+
             j=0
-            state=""
-            while [ ${'$'}j -lt 40 ]; do
+            while [ ${'$'}j -lt 60 ]; do
               state=${'$'}(dumpsys nfc 2>/dev/null | grep -m1 -E 'mState=|state=' || true)
               echo "${'$'}state" | grep -Eqi 'mState=on|state=on|STATE_ON|mState=3' && break
-              sleep 0.2
+              if [ ${'$'}((j % 10)) -eq 0 ]; then svc nfc enable 2>/dev/null || true; fi
+              sleep 0.25
               j=${'$'}((j+1))
             done
+
+            new=${'$'}(pidof com.android.nfc 2>/dev/null | awk '{print ${'$'}1}')
             echo "NEW_PID=${'$'}new"
             echo "NFC_STATE=${'$'}state"
         """.trimIndent()
         return runRootCmd(script)
     }
 
-    private fun reloadNfcProcessAndHook(onDone: (RuntimeStatus, String) -> Unit) {
-        stopReadMode("manual_reload")
-        executor.execute {
-            clearRuntimeHookStatus()
-            val result = rebuildNfcProcess("manual_reload")
-            val state = waitForFreshHook(12_000)
-            val oldPid = Regex("OLD_PID=(\\d+)").find(result)?.groupValues?.getOrNull(1)
-            val newPid = Regex("NEW_PID=(\\d+)").find(result)?.groupValues?.getOrNull(1)
-            val msg = when {
-                oldPid != null && newPid != null && oldPid != newPid && state.scopeOk && state.hookInstalled -> "更新成功：PID $oldPid → $newPid，build=${state.hookBuild}，Hook=${state.hookCount}"
-                oldPid != null && newPid != null && oldPid != newPid -> "PID 已更新：$oldPid → $newPid，但当前 Hook 未完成"
-                else -> "重新加载失败：NFC PID 未变化"
-            }
-            AppLogger.i("RELOAD: $msg\n$result")
-            onDone(state, msg)
-        }
-    }
-
-    private fun waitForFreshHook(timeoutMs: Long): RuntimeStatus {
+    private fun waitForHookAndRf(uid: String, timeoutMs: Long): RuntimeStatus {
         val end = System.currentTimeMillis() + timeoutMs
         var state = RuntimeStatus()
         while (System.currentTimeMillis() < end) {
             state = readRuntimeStatus()
-            if (state.scopeOk && state.hookInstalled && state.hookBuild == EXPECTED_HOOK_BUILD) return state
+            if (
+                state.hookInstalled &&
+                state.hookBuild == EXPECTED_HOOK_BUILD &&
+                state.rfStatus == "RF_UID_APPLIED" &&
+                state.rfUid.equals(uid, true)
+            ) return state
             Thread.sleep(250)
         }
         return state
     }
 
-    private fun clearRuntimeHookStatus() {
-        contentResolver.insert(ConfigProvider.URI, ContentValues().apply {
-            put(ConfigProvider.KEY_SCOPE_OK, false)
-            put(ConfigProvider.KEY_SCOPE_PROCESS, "")
-            put(ConfigProvider.KEY_SCOPE_PID, 0)
-            put(ConfigProvider.KEY_HOOK_INSTALLED, false)
-            put(ConfigProvider.KEY_HOOK_CLASS, "")
-            put(ConfigProvider.KEY_HOOK_COUNT, 0)
-            put(ConfigProvider.KEY_HOOK_PID, 0)
-            put(ConfigProvider.KEY_HIJACK_STATUS, if (getSimulationEnabled()) "WAITING" else "IDLE")
-            put(ConfigProvider.KEY_HIJACK_RESULT, "")
-            put(ConfigProvider.KEY_HIJACK_UID, "")
-            put(ConfigProvider.KEY_HIJACK_ERROR, "")
-            put(ConfigProvider.KEY_HIJACK_PID, 0)
-            put(ConfigProvider.KEY_RF_STATUS, if (getSimulationEnabled()) "WAITING" else "IDLE")
-            put(ConfigProvider.KEY_RF_UID, "")
-            put(ConfigProvider.KEY_RF_SOURCE, "")
-            put(ConfigProvider.KEY_RF_RESULT, "")
-            put(ConfigProvider.KEY_RF_ERROR, "")
-            put(ConfigProvider.KEY_RF_PID, 0)
-        })
+    private fun waitForHookOnly(timeoutMs: Long): RuntimeStatus {
+        val end = System.currentTimeMillis() + timeoutMs
+        var state = RuntimeStatus()
+        while (System.currentTimeMillis() < end) {
+            state = readRuntimeStatus()
+            if (state.hookInstalled && state.hookBuild == EXPECTED_HOOK_BUILD) return state
+            Thread.sleep(250)
+        }
+        return state
     }
 
-    private fun getSimulationEnabled(): Boolean = readProviderMap()[ConfigProvider.KEY_SIMULATION_ENABLED].toBoolean()
+    private fun getSimulationEnabled(): Boolean =
+        readProviderMap()[ConfigProvider.KEY_SIMULATION_ENABLED].toBoolean()
 
     private fun readProviderMap(): Map<String, String> {
         val map = mutableMapOf<String, String>()
-        runCatching { contentResolver.query(ConfigProvider.URI, null, null, null, null)?.use { c -> while (c.moveToNext()) map[c.getString(0)] = c.getString(1) } }
+        runCatching {
+            contentResolver.query(ConfigProvider.URI, null, null, null, null)?.use { c ->
+                while (c.moveToNext()) map[c.getString(0)] = c.getString(1)
+            }
+        }
         return map
     }
 
     private fun readRuntimeStatus(): RuntimeStatus {
         val map = readProviderMap()
-        val currentPid = runRootCmd("pidof com.android.nfc 2>/dev/null | awk '{print ${'$'}1}'").lineSequence().firstOrNull { it.trim().matches(Regex("\\d+")) }?.trim()?.toIntOrNull() ?: 0
+        val currentPid = runRootCmd("pidof com.android.nfc 2>/dev/null | awk '{print ${'$'}1}'")
+            .lineSequence()
+            .firstOrNull { it.trim().matches(Regex("\\d+")) }
+            ?.trim()
+            ?.toIntOrNull() ?: 0
+
         val scopePid = map[ConfigProvider.KEY_SCOPE_PID]?.toIntOrNull() ?: 0
         val hookPid = map[ConfigProvider.KEY_HOOK_PID]?.toIntOrNull() ?: 0
         val hookBuild = map[ConfigProvider.KEY_HOOK_BUILD]?.toIntOrNull() ?: 0
-        val scopeFresh = currentPid > 0 && scopePid == currentPid && hookBuild == EXPECTED_HOOK_BUILD && map[ConfigProvider.KEY_SCOPE_OK].toBoolean()
-        val hookFresh = currentPid > 0 && hookPid == currentPid && hookBuild == EXPECTED_HOOK_BUILD && map[ConfigProvider.KEY_HOOK_INSTALLED].toBoolean()
-        val hijackPid = map[ConfigProvider.KEY_HIJACK_PID]?.toIntOrNull() ?: 0
+        val hookFresh = currentPid > 0 && hookPid == currentPid && hookBuild == EXPECTED_HOOK_BUILD &&
+            map[ConfigProvider.KEY_HOOK_INSTALLED].toBoolean()
+        val scopeFresh = currentPid > 0 && scopePid == currentPid && hookBuild == EXPECTED_HOOK_BUILD &&
+            map[ConfigProvider.KEY_SCOPE_OK].toBoolean()
         val rfPid = map[ConfigProvider.KEY_RF_PID]?.toIntOrNull() ?: 0
+
         return RuntimeStatus(
             appBuild = map[ConfigProvider.KEY_APP_BUILD]?.toIntOrNull() ?: 0,
             hookBuild = hookBuild,
@@ -616,32 +678,21 @@ class MainActivity : ComponentActivity() {
             scopePid = scopePid,
             hookPid = hookPid,
             scopeOk = scopeFresh,
-            scopeProcess = map[ConfigProvider.KEY_SCOPE_PROCESS]?.takeIf { it.isNotBlank() },
             hookInstalled = hookFresh,
-            hookClass = map[ConfigProvider.KEY_HOOK_CLASS]?.takeIf { it.isNotBlank() },
-            hookCount = if (hookFresh) map[ConfigProvider.KEY_HOOK_COUNT]?.toIntOrNull() ?: 0 else 0,
             simulationEnabled = map[ConfigProvider.KEY_SIMULATION_ENABLED].toBoolean(),
             selectedUid = map[ConfigProvider.KEY_UID]?.takeIf { it.isNotBlank() },
-            hijackStatus = if (hijackPid == currentPid && currentPid > 0) map[ConfigProvider.KEY_HIJACK_STATUS] ?: "IDLE" else if (map[ConfigProvider.KEY_HIJACK_STATUS] == "IDLE") "IDLE" else "STALE",
-            hijackResult = if (hijackPid == currentPid) map[ConfigProvider.KEY_HIJACK_RESULT]?.takeIf { it.isNotBlank() } else null,
-            hijackUid = if (hijackPid == currentPid) map[ConfigProvider.KEY_HIJACK_UID]?.takeIf { it.isNotBlank() } else null,
-            hijackError = if (hijackPid == currentPid) map[ConfigProvider.KEY_HIJACK_ERROR]?.takeIf { it.isNotBlank() } else null,
-            hijackPid = hijackPid,
-            rfStatus = if (rfPid == currentPid && currentPid > 0) map[ConfigProvider.KEY_RF_STATUS] ?: "WAITING" else if (map[ConfigProvider.KEY_RF_STATUS] == "IDLE") "IDLE" else "STALE",
+            rfStatus = if (rfPid == currentPid && currentPid > 0) {
+                map[ConfigProvider.KEY_RF_STATUS] ?: "WAITING"
+            } else if (map[ConfigProvider.KEY_RF_STATUS] == "IDLE") {
+                "IDLE"
+            } else {
+                "STALE"
+            },
             rfUid = if (rfPid == currentPid) map[ConfigProvider.KEY_RF_UID]?.takeIf { it.isNotBlank() } else null,
             rfSource = if (rfPid == currentPid) map[ConfigProvider.KEY_RF_SOURCE]?.takeIf { it.isNotBlank() } else null,
             rfResult = if (rfPid == currentPid) map[ConfigProvider.KEY_RF_RESULT]?.takeIf { it.isNotBlank() } else null,
             rfError = if (rfPid == currentPid) map[ConfigProvider.KEY_RF_ERROR]?.takeIf { it.isNotBlank() } else null,
             rfPid = rfPid,
-            textConfigSeen = map[ConfigProvider.KEY_TEXT_CONFIG_SEEN].toBoolean(),
-            textConfigSource = map[ConfigProvider.KEY_TEXT_CONFIG_SOURCE]?.takeIf { it.isNotBlank() },
-            textConfigLength = map[ConfigProvider.KEY_TEXT_CONFIG_LENGTH]?.toIntOrNull() ?: 0,
-            configBlockCount = map[ConfigProvider.KEY_CONFIG_BLOCK_COUNT]?.toIntOrNull() ?: 0,
-            nciFrameCount = map[ConfigProvider.KEY_NCI_FRAME_COUNT]?.toIntOrNull() ?: 0,
-            nfcid1Count = map[ConfigProvider.KEY_NFCID1_COUNT]?.toIntOrNull() ?: 0,
-            hceGetUid = map[ConfigProvider.KEY_HCE_GET_UID]?.takeIf { it.isNotBlank() },
-            rfFieldCount = map[ConfigProvider.KEY_RF_FIELD_COUNT]?.toIntOrNull() ?: 0,
-            lastNativeResult = map[ConfigProvider.KEY_LAST_NATIVE_RESULT]?.takeIf { it.isNotBlank() },
             fullDiagStage = map[ConfigProvider.KEY_FULL_DIAG_STAGE]?.takeIf { it.isNotBlank() },
             fullDiagSummary = map[ConfigProvider.KEY_FULL_DIAG_SUMMARY]?.takeIf { it.isNotBlank() }
         )
@@ -650,26 +701,23 @@ class MainActivity : ComponentActivity() {
     private fun buildStatusSummary(s: RuntimeStatus): String = buildString {
         appendLine("=== CURRENT STATUS ===")
         appendLine("BUILD: app=${s.appBuild} hook=${s.hookBuild} expectedHook=$EXPECTED_HOOK_BUILD")
-        appendLine("PID: current=${s.currentPid} scope=${s.scopePid} hook=${s.hookPid} hce=${s.hijackPid} rf=${s.rfPid}")
-        appendLine("SCOPE: ${if (s.scopeOk) "SUCCESS" else "NOT DETECTED/STALE"} process=${s.scopeProcess}")
-        appendLine("HOOK: ${if (s.hookInstalled) "SUCCESS" else "NOT INSTALLED/STALE"} count=${s.hookCount}")
+        appendLine("PID: current=${s.currentPid} scope=${s.scopePid} hook=${s.hookPid} rf=${s.rfPid}")
+        appendLine("SCOPE: ${if (s.scopeOk) "SUCCESS" else "NOT DETECTED/STALE"}")
+        appendLine("HOOK: ${if (s.hookInstalled) "SUCCESS" else "NOT INSTALLED/STALE"}")
         appendLine("CONFIG: ${if (s.simulationEnabled) "ENABLED" else "IDLE"} uid=${s.selectedUid}")
         appendLine("READ_MODE: ${if (readModeEnabled) "ENABLED" else "IDLE"}")
-        appendLine("HCE_NATIVE: ${s.hijackStatus} uid=${s.hijackUid} result=${s.hijackResult} error=${s.hijackError}")
         appendLine("RF_NFCID1: ${s.rfStatus} uid=${s.rfUid} source=${s.rfSource} result=${s.rfResult} error=${s.rfError}")
-        appendLine("TEXT_CONFIG: seen=${s.textConfigSeen} source=${s.textConfigSource} len=${s.textConfigLength} blocks=${s.configBlockCount}")
-        appendLine("NCI: frames=${s.nciFrameCount} nfcid1=${s.nfcid1Count} native=${s.lastNativeResult}")
-        appendLine("HCE_GET_UID: ${s.hceGetUid} RF_FIELD_COUNT=${s.rfFieldCount}")
         append("FINAL: stage=${s.fullDiagStage} summary=${s.fullDiagSummary}")
     }
 
     private fun fetchLogsSync(source: LogSource): String {
-        val pid = runRootCmd("pidof com.android.nfc 2>/dev/null | awk '{print ${'$'}1}'").lineSequence().firstOrNull { it.trim().matches(Regex("\\d+")) }?.trim().orEmpty()
+        val pid = runRootCmd("pidof com.android.nfc 2>/dev/null | awk '{print ${'$'}1}'")
+            .lineSequence().firstOrNull { it.trim().matches(Regex("\\d+")) }?.trim().orEmpty()
         val pidFilter = if (pid.isNotBlank()) " | grep ': $pid:'" else ""
         val cmd = when (source) {
-            LogSource.HIJACK -> "grep -h -E 'NfcUIDSim|HCE:|RF:|NCI:|CONFIG_TEXT:|FULLDIAG:' /data/adb/lspd/log/modules* 2>/dev/null$pidFilter | tail -n 700; logcat -d -t 400 -s NfcUIDSim 2>/dev/null"
-            LogSource.LSPosed -> "grep -h -E 'com.example.nfcdoorcard|NfcUIDSim|SCOPE:|HOOK:|TRACE:|HCE:|RF:|NCI:|CONFIG_TEXT:' /data/adb/lspd/log/modules* 2>/dev/null$pidFilter | tail -n 900"
-            LogSource.KernelSU -> "ls -t /data/adb/ksu/log/sulog* 2>/dev/null | head -n 1 | xargs -r cat | tail -n 300"
+            LogSource.STATUS -> "logcat -d -t 250 -s NfcDoorCard NfcUIDSim 2>/dev/null"
+            LogSource.LSPosed -> "grep -h -E 'com.example.nfcdoorcard|NfcUIDSim|PROD MODULE|PROD HOOK|NFCID1' /data/adb/lspd/log/modules* 2>/dev/null$pidFilter | tail -n 600"
+            LogSource.KernelSU -> "ls -t /data/adb/ksu/log/sulog* 2>/dev/null | head -n 1 | xargs -r cat | tail -n 250"
         }
         return runRootCmd(cmd).ifBlank { "No matching logs found for $source" }
     }
@@ -684,7 +732,16 @@ class MainActivity : ComponentActivity() {
                 prefs.edit().putString("list", old).apply()
             }
         }
-        return if (json.isNullOrBlank()) emptyList() else runCatching { gson.fromJson<List<CardModel>>(json, object : TypeToken<List<CardModel>>() {}.type) ?: emptyList() }.getOrDefault(emptyList())
+        return if (json.isNullOrBlank()) {
+            emptyList()
+        } else {
+            runCatching {
+                gson.fromJson<List<CardModel>>(
+                    json,
+                    object : TypeToken<List<CardModel>>() {}.type
+                ) ?: emptyList()
+            }.getOrDefault(emptyList())
+        }
     }
 
     private fun saveCards(cards: List<CardModel>) {
@@ -695,21 +752,29 @@ class MainActivity : ComponentActivity() {
         stopReadMode("diagnostic_share")
         executor.execute {
             try {
-                val file = File(cacheDir, "nfc_fullcheck_1.0.14.txt")
+                val file = File(cacheDir, "nfc_fullcheck_1.0.15.txt")
                 file.writeText(buildFullDiagnosticReport())
                 AppLogger.i("Diagnostics exported: ${file.absolutePath}")
                 runOnUiThread {
                     onDone()
                     val uri = FileProvider.getUriForFile(this@MainActivity, "$packageName.fileprovider", file)
-                    startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {
-                        type = "text/plain"
-                        putExtra(Intent.EXTRA_STREAM, uri)
-                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                    }, "Share NFC Full Check"))
+                    startActivity(
+                        Intent.createChooser(
+                            Intent(Intent.ACTION_SEND).apply {
+                                type = "text/plain"
+                                putExtra(Intent.EXTRA_STREAM, uri)
+                                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                            },
+                            "Share NFC Full Check"
+                        )
+                    )
                 }
             } catch (e: Exception) {
                 AppLogger.i("Diagnostics failed ${e.javaClass.simpleName}: ${e.message}")
-                runOnUiThread { onDone(); Toast.makeText(this@MainActivity, "检测失败: ${e.message}", Toast.LENGTH_LONG).show() }
+                runOnUiThread {
+                    onDone()
+                    Toast.makeText(this@MainActivity, "检测失败: ${e.message}", Toast.LENGTH_LONG).show()
+                }
             }
         }
     }
@@ -717,13 +782,15 @@ class MainActivity : ComponentActivity() {
     private fun buildFullDiagnosticReport(): String = buildString {
         val s = readRuntimeStatus()
         val pid = s.currentPid
-        appendLine("=== NFC FULL CHECK 1.0.14 ===")
+        appendLine("=== NFC FULL CHECK 1.0.15 ===")
         appendLine("Generated: ${System.currentTimeMillis()}")
         appendLine("--- FINAL SUMMARY ---")
         appendLine(buildStatusSummary(s))
         appendLine()
         appendLine("--- SAVED CARDS ---")
-        val cards = loadCards(); appendLine("count=${cards.size}"); cards.forEach { appendLine("card uid=${it.uid} sak=${it.sak} atqa=${it.atqa}") }
+        val cards = loadCards()
+        appendLine("count=${cards.size}")
+        cards.forEach { appendLine("card uid=${it.uid} sak=${it.sak} atqa=${it.atqa}") }
         appendLine("--- APP / APK ---")
         appendLine(runRootCmd("dumpsys package $packageName 2>/dev/null | grep -E 'versionName=|versionCode=|path:' | head -n 20"))
         appendLine("--- ROOT ---")
@@ -732,11 +799,11 @@ class MainActivity : ComponentActivity() {
         appendLine(runRootCmd("pm path com.android.nfc; pidof com.android.nfc; ps -A | grep -E 'android.hardware.nfc|vendor.oplus.hardware.nfc|com.android.nfc|$packageName'"))
         appendLine("--- NFC SERVICE ---")
         appendLine(runRootCmd("dumpsys nfc 2>/dev/null | grep -E 'mState=|mScreenState=|listenTech=|pollTech=|mEnableHostRouting=|mTechMask' | head -n 160"))
-        appendLine("--- CURRENT PID LSPOSED FULL CHAIN ---")
+        appendLine("--- CURRENT PID LSPOSED ---")
         val filter = if (pid > 0) " | grep ': $pid:'" else ""
-        appendLine(runRootCmd("grep -h -E 'NfcUIDSim|SCOPE:|HOOK:|TRACE:|HCE:|RF:|NCI:|CONFIG_TEXT:|FULLDIAG:' /data/adb/lspd/log/modules* 2>/dev/null$filter | tail -n 1800"))
+        appendLine(runRootCmd("grep -h -E 'NfcUIDSim|PROD MODULE|PROD HOOK|NFCID1' /data/adb/lspd/log/modules* 2>/dev/null$filter | tail -n 1000"))
         appendLine("--- LOGCAT RF/NFC ---")
-        appendLine(runRootCmd("logcat -d -v threadtime 2>/dev/null | grep -E 'NfcUIDSim|NFCID1|LA_NFCID1|CORE_SET_CONFIG|setHceTypeAConfig|changeRfParamsByConfig|applyPreRfConfig' | tail -n 1200"))
+        appendLine(runRootCmd("logcat -d -v threadtime 2>/dev/null | grep -E 'NfcUIDSim|NFCID1|LA_NFCID1|CORE_SET_CONFIG|changeRfParamsByConfig|applyPreRfConfig' | tail -n 1000"))
         appendLine("--- APP LOG ---")
         appendLine(AppLogger.readAll())
     }
@@ -746,8 +813,15 @@ class MainActivity : ComponentActivity() {
         val out = process.inputStream.bufferedReader().readText()
         val err = process.errorStream.bufferedReader().readText()
         process.waitFor()
-        buildString { append(out); if (err.isNotBlank()) appendLine(err); appendLine("[exit=${process.exitValue()}]") }
-    } catch (t: Throwable) { "ERROR ${t.javaClass.simpleName}: ${t.message}" }
+        buildString {
+            append(out)
+            if (err.isNotBlank()) appendLine(err)
+            appendLine("[exit=${process.exitValue()}]")
+        }
+    } catch (t: Throwable) {
+        "ERROR ${t.javaClass.simpleName}: ${t.message}"
+    }
 
-    private fun bytesToHex(bytes: ByteArray): String = bytes.joinToString("") { "%02X".format(it) }
+    private fun bytesToHex(bytes: ByteArray): String =
+        bytes.joinToString("") { "%02X".format(it) }
 }
