@@ -10,7 +10,10 @@ class ConfigProvider : ContentProvider() {
     companion object {
         const val AUTHORITY = "com.example.nfcdoorcard.config"
         const val PATH_SETTINGS = "settings"
+        const val APP_BUILD = 8
 
+        const val KEY_APP_BUILD = "app_build"
+        const val KEY_HOOK_BUILD = "hook_build"
         const val KEY_SIMULATION_ENABLED = "simulation_enabled"
         const val KEY_UID = "uid"
         const val KEY_SAK = "sak"
@@ -42,7 +45,12 @@ class ConfigProvider : ContentProvider() {
         val URI: Uri = Uri.parse("content://$AUTHORITY/$PATH_SETTINGS")
     }
 
-    override fun onCreate(): Boolean = true
+    override fun onCreate(): Boolean {
+        context!!.getSharedPreferences("nfc_config", 0).edit()
+            .putInt(KEY_APP_BUILD, APP_BUILD)
+            .apply()
+        return true
+    }
 
     override fun query(
         uri: Uri,
@@ -82,7 +90,7 @@ class ConfigProvider : ContentProvider() {
     }
 
     override fun delete(uri: Uri, selection: String?, selectionArgs: Array<out String>?): Int {
-        context!!.getSharedPreferences("nfc_config", 0).edit().clear().apply()
+        context!!.getSharedPreferences("nfc_config", 0).edit().clear().putInt(KEY_APP_BUILD, APP_BUILD).apply()
         return 1
     }
 
