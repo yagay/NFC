@@ -187,16 +187,7 @@ class MainActivity : ComponentActivity() {
 
         Scaffold(topBar = {
             TopAppBar(
-                title = { Text("NFC Expert Pro 1.0.15") },
-                actions = {
-                    TextButton(onClick = {
-                        if (!diagnosticRunning) {
-                            diagnosticRunning = true
-                            saveDiagnosticWithoutSharing { diagnosticRunning = false }
-                        }
-                    }) { Text(if (diagnosticRunning) "保存中" else "导出") }
-                    TextButton(onClick = { AppLogger.clear(); logText = "" }) { Text("清空") }
-                }
+                title = { Text("NFC Expert Pro 1.0.15") }
             )
         }) { padding ->
             LazyColumn(
@@ -295,6 +286,27 @@ class MainActivity : ComponentActivity() {
                             LaunchedEffect(selectedSource, lines.size) {
                                 if (lines.isNotEmpty()) logListState.scrollToItem((lines.size - 1).coerceAtLeast(0))
                             }
+                        }
+                    }
+                    item {
+                        Row(
+                            Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Button(
+                                onClick = {
+                                    if (!diagnosticRunning) {
+                                        diagnosticRunning = true
+                                        saveDiagnosticWithoutSharing { diagnosticRunning = false }
+                                    }
+                                },
+                                enabled = !diagnosticRunning,
+                                modifier = Modifier.weight(1f)
+                            ) { Text(if (diagnosticRunning) "保存中" else "导出日志") }
+                            OutlinedButton(
+                                onClick = { AppLogger.clear(); logText = "" },
+                                modifier = Modifier.weight(1f)
+                            ) { Text("清空日志") }
                         }
                     }
                 }
