@@ -43,6 +43,6 @@ dependencies {
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("com.google.code.gson:gson:2.11.0")
-    compileOnly("io.github.libxposed:api:102")
+    compileOnly("io.github.libxposed:api:102.0.0")
     debugImplementation("androidx.compose.ui:ui-tooling")
 }
