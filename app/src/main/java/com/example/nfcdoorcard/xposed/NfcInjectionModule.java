@@ -4,6 +4,7 @@ import android.app.Application;
 import android.content.ContentValues;
 import android.database.Cursor;
 import android.net.Uri;
+import android.os.Binder;
 import android.os.Process;
 import android.util.Log;
 
@@ -27,7 +28,9 @@ public class NfcInjectionModule extends XposedModule {
 
     private static final String[] REFRESH_PROBE_CLASSES = new String[]{
             "com.android.nfc.VendorNfcService",
+            "com.android.nfc.VendorNfcService$VendorNfcAdapterService",
             "com.android.nfc.NfcService",
+            "com.oplus.nfc.taptoshare.TapToShareEvent",
             "com.oplus.nfc.common.NfcChipDeviceImpl",
             "com.android.nfc.nxp.NxpNfcService",
             "com.android.nfc.nxp.NxpNfcService$NxpNfcAdapterService",
@@ -136,8 +139,11 @@ public class NfcInjectionModule extends XposedModule {
                             Object[] args = chain.getArgs().toArray();
                             String argText = summarizeArgs(args);
                             String stack = compactCallStack(24);
+                            String binderCaller = isShareModeProbe(candidate)
+                                    ? " callingUid=" + Binder.getCallingUid() + " callingPid=" + Binder.getCallingPid()
+                                    : "";
                             String enter = "ENTER " + signature + " event=" + event +
-                                    " thread=" + Thread.currentThread().getName() +
+                                    " thread=" + Thread.currentThread().getName() + binderCaller +
                                     " args=" + argText + " stack=" + stack;
                             Log.i(TAG, "RFPROBE: " + enter);
                             persistRefreshProbeEvent(pid, enter);
@@ -169,10 +175,24 @@ public class NfcInjectionModule extends XposedModule {
         Log.i(TAG, "RFPROBE: READY candidates=" + installed.size() + " " + candidates);
     }
 
+    private boolean isShareModeProbe(Method method) {
+        String owner = method.getDeclaringClass().getName();
+        String name = method.getName().toLowerCase(Locale.ROOT);
+        return (owner.equals("com.android.nfc.VendorNfcService$VendorNfcAdapterService") ||
+                owner.equals("com.oplus.nfc.taptoshare.TapToShareEvent")) &&
+                (name.equals("enablenfcsharemode") || name.equals("enternfcsharemode") || name.equals("exitnfcsharemode"));
+    }
+
     private boolean isRefreshProbeCandidate(Method method) {
         String name = method.getName().toLowerCase(Locale.ROOT);
         String owner = method.getDeclaringClass().getName();
 
+        if (owner.equals("com.android.nfc.VendorNfcService$VendorNfcAdapterService")) {
+            return name.equals("enablenfcsharemode");
+        }
+        if (owner.equals("com.oplus.nfc.taptoshare.TapToShareEvent")) {
+            return name.equals("enablenfcsharemode") || name.equals("enternfcsharemode") || name.equals("exitnfcsharemode");
+        }
         if (owner.equals("com.android.nfc.cardemulation.RegisteredServicesCache")) {
             return name.equals("registeraidgroupforservice") || name.equals("removeaidgroupforservice") ||
                     name.equals("onservicesupdated") || name.contains("invalidatecache");
