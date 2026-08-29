@@ -18,9 +18,17 @@ class ConfigProvider : ContentProvider() {
         const val KEY_UID = "uid"
         const val KEY_SAK = "sak"
         const val KEY_ATQA = "atqa"
-        const val KEY_MODULE_ACTIVE = "module_active"
-        const val KEY_MODULE_PROCESS = "module_process"
-        const val KEY_MODULE_BOOT_COUNT = "module_boot_count"
+
+        // Runtime diagnostics. These are event/status values, not a heartbeat.
+        const val KEY_SCOPE_OK = "scope_ok"
+        const val KEY_SCOPE_PROCESS = "scope_process"
+        const val KEY_HOOK_INSTALLED = "hook_installed"
+        const val KEY_HOOK_CLASS = "hook_class"
+        const val KEY_HOOK_COUNT = "hook_count"
+        const val KEY_HIJACK_STATUS = "hijack_status"
+        const val KEY_HIJACK_RESULT = "hijack_result"
+        const val KEY_HIJACK_UID = "hijack_uid"
+        const val KEY_HIJACK_ERROR = "hijack_error"
 
         const val PREFS_NAME = "nfc_sim_prefs"
     }
@@ -41,9 +49,7 @@ class ConfigProvider : ContentProvider() {
         sortOrder: String?
     ): Cursor {
         val cursor = MatrixCursor(arrayOf("key", "value"))
-        prefs.all.forEach { (key, value) ->
-            cursor.addRow(arrayOf(key, value.toString()))
-        }
+        prefs.all.forEach { (key, value) -> cursor.addRow(arrayOf(key, value.toString())) }
         return cursor
     }
 
@@ -57,6 +63,7 @@ class ConfigProvider : ContentProvider() {
                 is Boolean -> editor.putBoolean(key, value)
                 is String -> editor.putString(key, value)
                 is Int -> editor.putInt(key, value)
+                is Long -> editor.putLong(key, value)
             }
         }
         editor.apply()
