@@ -1,50 +1,29 @@
-# NFC Expert Pro (v7)
+# NFC 门禁诊断 / UID 模拟实验
 
-A specialized NFC simulation and diagnostic tool for Android devices, optimized for OxygenOS 16 / Android 15+.
+这是一个面向已 Root Android 设备的 NFC / LSPosed 诊断项目。
 
-## Overview
+## V12 重点
 
-This project leverages the **LibXposed** framework to perform low-level NFC hardware abstraction layer (HAL) hijacking. It is designed to solve the common issue where system-level NFC resets or power management events interfere with UID simulation on modern Android devices.
+V12 不再把 `setHceTypeAConfig(...)=true` 视为“UID 已经固定”。状态被拆成两层：
 
-## Key Features
+- **HCE Native**：只表示 Java / JNI HCE 配置入口接受了调用。
+- **RF NFCID1**：只有观察到候选 RF/NCI 配置缓冲区中的 `LA_NFCID1 (0x33)`，并实际改写为目标 UID 后才进入 RF 配置状态。
 
-- **Real-time Module Status**: Visual indicator in the UI showing whether the Xposed module is successfully injected and active.
-- **Hardware-Level UID Simulation**: Directly hooks `NativeNfcManager` (NXP/ST/Standard variants) to force target UID, SAK, and ATQA values.
-- **State Enforcement**: Intercepts system events (screen state, wallet switches, routing updates) to prevent the system from "backstabbing" and resetting the simulated UID.
-- **Comprehensive Multi-Level Diagnostics**:
-    - **HIJACK**: Real-time logs from the Xposed hook.
-    - **LSPosed**: Framework-level loading and error logs.
-    - **KernelSU**: Root execution and system-level event logs.
-- **One-Click NFC Toggle**: Automatically restarts the NFC service to apply changes using root privileges.
+V12 会：
 
-## Project Structure
+1. 继续 Hook OxygenOS/NXP 的 `setHceTypeAConfig(boolean, byte[], byte[], byte[])` 作为已验证的 HCE 入口；
+2. 扫描 `NxpNativeNfcManager` / `StNativeNfcManager` 中带 `byte[]` 的 config/vendor/raw/rf/write 候选方法；
+3. 仅当参数中已经存在合法 `LA_NFCID1 (0x33)` TLV 时进行改写；
+4. 支持 4 / 7 / 10 字节 NFCID1；
+5. 不主动发送未知 raw vendor command，也不凭空构造未观察到的 NCI 包；
+6. 导出 V12 完整诊断，包含 `RF:`、`NFCID1`、`CORE_SET_CONFIG` 等关键日志。
 
-- `MainActivity.kt`: Modern Compose-based UI with integrated diagnostic console and card management.
-- `XposedEntry.kt`: Core LibXposed implementation using the latest API 102.
-- `ConfigProvider.kt`: Secure IPC mechanism for passing simulation parameters from the UI to the NFC process.
-- `AppLogger.kt`: Internal diagnostic buffer for tracking App-side events.
+## 状态含义
 
-## Installation & Setup
+- `WAITING`：尚未观察到真实 RF NFCID1 配置路径。
+- `OBSERVED`：发现了 `LA_NFCID1`，但模拟未启用。
+- `APPLYING`：已把现有 `LA_NFCID1` 替换为目标 UID，正在调用原始 native 方法。
+- `RF_CONFIG_ACCEPTED`：携带改写后 NFCID1 的原始 native 调用已返回成功/非布尔结果。
+- `FAILED`：参数长度或 native 调用失败。
 
-1. **Prerequisites**: 
-    - A rooted device with **KernelSU** or **Magisk**.
-    - **LSPosed (Dexposed/Mod)** installed and working.
-2. **Build**: Build the APK and install it on your device.
-3. **Activation**:
-    - Open LSPosed Manager.
-    - Enable the "NFC" module.
-    - **Crucial**: Ensure the scope includes "System Framework" and the **NFC Service** (usually `com.android.nfc` or `com.oplus.nfc`).
-    - Reboot the device or toggle NFC in the app.
-4. **Verification**: Check if the "Module Active" indicator at the top of the App is green.
-
-## Development
-
-- **Language**: 100% Kotlin
-- **UI**: Jetpack Compose (Material 3)
-- **Xposed API**: LibXposed (Service 102)
-- **Minimum SDK**: 31 (Android 12)
-- **Compile SDK**: 34
-
-## License
-
-Personal Research Project. Use responsibly for legal NFC diagnostics only.
+> `RF_CONFIG_ACCEPTED` 仍然不等同于门禁读卡器最终一定读到目标 UID。最终 RF 行为仍需由外部读卡器验证；V12 的目的就是把问题定位到真正的 `LA_NFCID1` 配置层，而不是继续依赖误导性的 HCE success。
