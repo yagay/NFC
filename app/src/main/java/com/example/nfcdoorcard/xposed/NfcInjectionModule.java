@@ -2,6 +2,7 @@ package com.example.nfcdoorcard.xposed;
 
 import android.app.Application;
 import android.content.ContentValues;
+import android.content.Intent;
 import android.database.Cursor;
 import android.net.Uri;
 import android.os.Binder;
@@ -123,10 +124,29 @@ public class NfcInjectionModule extends XposedModule {
 
             reportStatusWithRetry(pid, true, 1, "READY", "Adapter " + adapter.id() + " ready", adapter.id());
             Log.i(TAG, "PROD HOOK READY build=" + HOOK_BUILD + " adapter=" + adapter.id() + " pid=" + pid);
+            notifyAppHookReady(pid, adapter.id());
         } catch (Throwable t) {
             Log.e(TAG, "PROD HOOK FAILED build=" + HOOK_BUILD + " adapter=" + adapter.id() + " pid=" + pid + " " +
                     t.getClass().getSimpleName() + ": " + t.getMessage(), t);
             reportStatusWithRetry(pid, false, 0, "HOOK_FAILED", t.getClass().getSimpleName() + ": " + t.getMessage(), adapter.id());
+        }
+    }
+
+    private void notifyAppHookReady(int pid, String adapterId) {
+        Application app = currentApplication();
+        if (app == null) {
+            Log.w(TAG, "AUTO_RESTORE: currentApplication unavailable pid=" + pid);
+            return;
+        }
+        try {
+            Intent intent = new Intent("com.example.nfcdoorcard.action.NFC_HOOK_READY");
+            intent.setPackage("com.example.nfcdoorcard");
+            intent.putExtra("nfc_pid", pid);
+            intent.putExtra("adapter", adapterId == null ? "" : adapterId);
+            app.sendBroadcast(intent);
+            Log.i(TAG, "AUTO_RESTORE: hook-ready broadcast sent pid=" + pid + " adapter=" + adapterId);
+        } catch (Throwable t) {
+            Log.w(TAG, "AUTO_RESTORE: broadcast failed " + t.getClass().getSimpleName() + ": " + t.getMessage());
         }
     }
 
