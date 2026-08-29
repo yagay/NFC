@@ -18,19 +18,26 @@ class ConfigProvider : ContentProvider() {
 
         const val KEY_SCOPE_OK = "scope_ok"
         const val KEY_SCOPE_PROCESS = "scope_process"
+        const val KEY_SCOPE_PID = "scope_pid"
         const val KEY_HOOK_INSTALLED = "hook_installed"
         const val KEY_HOOK_CLASS = "hook_class"
         const val KEY_HOOK_COUNT = "hook_count"
+        const val KEY_HOOK_PID = "hook_pid"
         const val KEY_HIJACK_STATUS = "hijack_status"
         const val KEY_HIJACK_RESULT = "hijack_result"
         const val KEY_HIJACK_UID = "hijack_uid"
         const val KEY_HIJACK_ERROR = "hijack_error"
+        const val KEY_HIJACK_PID = "hijack_pid"
 
         const val KEY_RF_STATUS = "rf_status"
         const val KEY_RF_UID = "rf_uid"
         const val KEY_RF_SOURCE = "rf_source"
         const val KEY_RF_RESULT = "rf_result"
         const val KEY_RF_ERROR = "rf_error"
+        const val KEY_RF_PID = "rf_pid"
+        const val KEY_TRACE_STAGE = "trace_stage"
+        const val KEY_TRACE_SOURCE = "trace_source"
+        const val KEY_TRACE_PID = "trace_pid"
 
         val URI: Uri = Uri.parse("content://$AUTHORITY/$PATH_SETTINGS")
     }
