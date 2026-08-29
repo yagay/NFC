@@ -10,6 +10,7 @@ import android.util.Log;
 import com.example.nfcdoorcard.xposed.adapter.NfcStackAdapter;
 import com.example.nfcdoorcard.xposed.adapter.OplusNxpAdapter;
 
+import java.lang.reflect.Array;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.List;
@@ -26,7 +27,10 @@ public class NfcInjectionModule extends XposedModule {
 
     private static final String[] REFRESH_PROBE_CLASSES = new String[]{
             "com.android.nfc.VendorNfcService",
-            "com.android.nfc.NfcService"
+            "com.android.nfc.NfcService",
+            "com.oplus.nfc.common.NfcChipDeviceImpl",
+            "com.android.nfc.nxp.NxpNfcService",
+            "com.android.nfc.nxp.NxpNfcService$NxpNfcAdapterService"
     };
 
     private final NfcStackAdapter[] adapters = new NfcStackAdapter[]{
@@ -72,7 +76,7 @@ public class NfcInjectionModule extends XposedModule {
                 if (!cfg.active || cfg.uid == null || disabledAfterFailure) return chain.proceed();
 
                 String uidHex = cfg.uid.replaceAll("[^0-9A-Fa-f]", "").toUpperCase(Locale.ROOT);
-                String caller = compactCallStack();
+                String caller = compactCallStack(24);
                 Log.i(TAG, "RFPROBE: CHANGE_RF_CALLER pid=" + pid + " uid=" + uidHex + " stack=" + caller);
                 persistRfCaller(pid, caller);
 
@@ -125,11 +129,17 @@ public class NfcInjectionModule extends XposedModule {
                     try {
                         hook(candidate).intercept(chain -> {
                             int event = ++refreshProbeEventCount;
-                            String enter = "ENTER " + signature + " event=" + event + " thread=" + Thread.currentThread().getName();
+                            Object[] args = chain.getArgs().toArray();
+                            String argText = summarizeArgs(args);
+                            String stack = compactCallStack(24);
+                            String enter = "ENTER " + signature + " event=" + event +
+                                    " thread=" + Thread.currentThread().getName() +
+                                    " args=" + argText + " stack=" + stack;
                             Log.i(TAG, "RFPROBE: " + enter);
                             persistRefreshProbeEvent(pid, enter);
                             Object result = chain.proceed();
-                            String exit = "EXIT " + signature + " event=" + event + " result=" + summarizeResult(result);
+                            String exit = "EXIT " + signature + " event=" + event +
+                                    " result=" + summarizeValue(result);
                             Log.i(TAG, "RFPROBE: " + exit);
                             persistRefreshProbeEvent(pid, exit);
                             return result;
@@ -157,6 +167,17 @@ public class NfcInjectionModule extends XposedModule {
 
     private boolean isRefreshProbeCandidate(Method method) {
         String name = method.getName().toLowerCase(Locale.ROOT);
+        String owner = method.getDeclaringClass().getName();
+
+        if (owner.equals("com.oplus.nfc.common.NfcChipDeviceImpl")) {
+            return name.equals("setrfconfig") || name.equals("setconfig") || name.contains("transitconfig") ||
+                    name.contains("restore") || name.contains("rfconfig");
+        }
+        if (owner.startsWith("com.android.nfc.nxp.NxpNfcService")) {
+            return name.equals("setrfconfig") || name.equals("setconfig") || name.contains("transitconfig") ||
+                    name.equals("changerfparamsbyconfig");
+        }
+
         if (name.equals("applyprerfconfig")) return true;
         if (name.contains("transitconfig")) return true;
         if (name.contains("routing") && (name.contains("apply") || name.contains("update") || name.contains("commit") || name.contains("configure"))) return true;
@@ -175,37 +196,72 @@ public class NfcInjectionModule extends XposedModule {
         return sb.append(')').toString();
     }
 
-    private String compactCallStack() {
+    private String compactCallStack(int maxFrames) {
         StringBuilder sb = new StringBuilder();
         int kept = 0;
         for (StackTraceElement e : Thread.currentThread().getStackTrace()) {
             String c = e.getClassName();
             if (c.equals(Thread.class.getName()) || c.equals(NfcInjectionModule.class.getName())) continue;
-            if (c.startsWith("java.") || c.startsWith("android.") || c.startsWith("io.github.libxposed.")) continue;
+            if (c.startsWith("java.lang.Thread")) continue;
             if (kept++ > 0) sb.append(" <- ");
             sb.append(c).append('#').append(e.getMethodName()).append(':').append(e.getLineNumber());
-            if (kept >= 8) break;
+            if (kept >= maxFrames) break;
         }
         return sb.length() == 0 ? "unknown" : sb.toString();
     }
 
-    private String summarizeResult(Object result) {
-        if (result == null) return "null/void";
-        String s = String.valueOf(result);
-        return s.length() > 80 ? s.substring(0, 80) + "..." : s;
+    private String summarizeArgs(Object[] args) {
+        if (args == null || args.length == 0) return "[]";
+        StringBuilder sb = new StringBuilder("[");
+        for (int i = 0; i < args.length; i++) {
+            if (i > 0) sb.append(", ");
+            sb.append(i).append('=').append(summarizeValue(args[i]));
+        }
+        return sb.append(']').toString();
+    }
+
+    private String summarizeValue(Object value) {
+        if (value == null) return "null";
+        Class<?> type = value.getClass();
+        if (type == byte[].class) {
+            byte[] data = (byte[]) value;
+            StringBuilder hex = new StringBuilder();
+            int limit = Math.min(data.length, 96);
+            for (int i = 0; i < limit; i++) {
+                if (i > 0) hex.append(' ');
+                hex.append(String.format(Locale.ROOT, "%02X", data[i] & 0xFF));
+            }
+            if (data.length > limit) hex.append(" ...");
+            return "byte[" + data.length + "]{" + hex + "}";
+        }
+        if (type.isArray()) {
+            int length = Array.getLength(value);
+            StringBuilder sb = new StringBuilder(type.getComponentType().getSimpleName())
+                    .append('[').append(length).append("]{");
+            int limit = Math.min(length, 12);
+            for (int i = 0; i < limit; i++) {
+                if (i > 0) sb.append(", ");
+                sb.append(String.valueOf(Array.get(value, i)));
+            }
+            if (length > limit) sb.append(", ...");
+            return sb.append('}').toString();
+        }
+        String s = String.valueOf(value).replace('\n', ' ').replace('\r', ' ');
+        if (s.length() > 240) s = s.substring(0, 240) + "...";
+        return type.getSimpleName() + "{" + s + "}";
     }
 
     private void persistRefreshProbeEvent(int pid, String event) {
         ContentValues v = new ContentValues();
         v.put("refresh_probe_events", refreshProbeEventCount);
-        v.put("refresh_probe_last", event);
+        v.put("refresh_probe_last", event.length() > 3500 ? event.substring(0, 3500) : event);
         v.put("refresh_probe_pid", pid);
         writeValuesWithRetry(v, 8, 100L);
     }
 
     private void persistRfCaller(int pid, String caller) {
         ContentValues v = new ContentValues();
-        v.put("rf_caller", caller);
+        v.put("rf_caller", caller.length() > 3500 ? caller.substring(0, 3500) : caller);
         v.put("rf_caller_pid", pid);
         writeValuesWithRetry(v, 8, 100L);
     }
