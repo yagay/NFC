@@ -3,12 +3,10 @@ package com.example.nfcdoorcard
 import android.app.PendingIntent
 import android.content.ContentValues
 import android.content.Intent
-import android.net.Uri
 import android.nfc.NfcAdapter
 import android.nfc.Tag
 import android.nfc.tech.NfcA
 import android.os.Bundle
-import android.util.Log
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -21,16 +19,15 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Delete
-import androidx.compose.material.icons.filled.Warning
-import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Share
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.FileProvider
@@ -53,7 +50,6 @@ class MainActivity : ComponentActivity() {
     private val KEY_CARDS_LIST = "cards_list"
     private val executor = Executors.newSingleThreadExecutor()
 
-    // This method will be hooked by Xposed to return true
     private fun isXposedActive(): Boolean = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -86,7 +82,7 @@ class MainActivity : ComponentActivity() {
         val logListState = rememberLazyListState()
 
         LaunchedEffect(selectedSource) {
-            while(true) {
+            while (true) {
                 fetchLogs(selectedSource) { result ->
                     logText = if (selectedSource == LogSource.HIJACK) {
                         AppLogger.getAllLogs() + "\n--- BOTTOM TRACE ---\n" + result
@@ -106,9 +102,9 @@ class MainActivity : ComponentActivity() {
                         IconButton(onClick = { exportAllLogs() }) {
                             Icon(Icons.Default.Share, contentDescription = null)
                         }
-                        IconButton(onClick = { 
+                        IconButton(onClick = {
                             AppLogger.clear()
-                            logText = "" 
+                            logText = ""
                         }) {
                             Icon(Icons.Default.Delete, contentDescription = null)
                         }
@@ -117,7 +113,6 @@ class MainActivity : ComponentActivity() {
             }
         ) { padding ->
             Column(modifier = Modifier.padding(padding).fillMaxSize()) {
-                // Framework Status
                 Card(
                     modifier = Modifier.fillMaxWidth().padding(8.dp),
                     colors = CardDefaults.cardColors(
@@ -145,7 +140,6 @@ class MainActivity : ComponentActivity() {
                     }
                 }
 
-                // Simulation Control
                 Card(modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp)) {
                     Text(
                         text = if (activeSimUid != null) "LOCKED: $activeSimUid" else "STATUS: IDLE",
@@ -154,7 +148,6 @@ class MainActivity : ComponentActivity() {
                     )
                 }
 
-                // Wallet
                 LazyColumn(modifier = Modifier.height(160.dp).fillMaxWidth()) {
                     items(cards) { card ->
                         CardItem(card, card.uid == activeSimUid, {
@@ -177,7 +170,6 @@ class MainActivity : ComponentActivity() {
                     }
                 }
 
-                // Console
                 Box(modifier = Modifier.weight(1f).fillMaxWidth().padding(4.dp).background(Color(0xFF050505), RoundedCornerShape(4.dp)).padding(4.dp)) {
                     val lines = logText.split("\n")
                     LazyColumn(state = logListState, modifier = Modifier.fillMaxSize()) {
@@ -288,7 +280,7 @@ class MainActivity : ComponentActivity() {
 
     private fun fetchLogs(source: LogSource, callback: (String) -> Unit) {
         executor.execute {
-            val cmd = when(source) {
+            val cmd = when (source) {
                 LogSource.HIJACK -> "su -c logcat -d -t 200 -s NfcUIDSim"
                 LogSource.LSPosed -> "su -c 'ls -t /data/adb/lspd/log/modules* | head -n 1 | xargs cat | tail -n 200'"
                 LogSource.KernelSU -> "su -c 'ls -t /data/adb/ksu/log/sulog* | head -n 1 | xargs cat | tail -n 200'"
@@ -300,7 +292,7 @@ class MainActivity : ComponentActivity() {
                 var line: String?
                 while (reader.readLine().also { line = it } != null) output.append(line).append("\n")
                 p.waitFor()
-                callback(if(output.isEmpty()) "No logs found for $source" else output.toString())
+                callback(if (output.isEmpty()) "No logs found for $source" else output.toString())
             } catch (e: Exception) { callback("Error: ${e.message}") }
         }
     }
