@@ -9,6 +9,7 @@ import android.util.Log;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
+import java.util.Arrays;
 
 import io.github.libxposed.api.XposedModule;
 import io.github.libxposed.api.XposedModuleInterface;
@@ -89,10 +90,13 @@ public class VendorBinderMetadataModule extends XposedModule {
         inspectClass("com.android.nfc.VendorNfcService$VendorNfcAdapterService", cl, report);
         inspectClass("com.android.nfc.VendorNfcService", cl, report);
         inspectClass("com.android.nfc.NfcService", cl, report);
+        inspectClass("com.android.nfc.NfcService$NfcAdapterService", cl, report);
+        inspectClass("android.nfc.INfcAdapter", cl, report);
+        inspectClass("android.nfc.INfcAdapter$Stub", cl, report);
 
         values.put("vendor_meta_ready", ifaceOk && stubOk && txOk);
         values.put("vendor_meta_error", "");
-        String text = report.length() > 3500 ? report.substring(0, 3500) : report.toString();
+        String text = report.length() > 7000 ? report.substring(0, 7000) : report.toString();
         values.put("vendor_meta_report", text);
         writeValues(values);
         Log.i(TAG, text);
@@ -111,16 +115,22 @@ public class VendorBinderMetadataModule extends XposedModule {
                 String name = f.getName();
                 String lower = (name + " " + type).toLowerCase();
                 if (lower.contains("vendor") || lower.contains("binder") || lower.contains("nfcadapter") || lower.contains("service")) {
-                    report.append(" | FIELD=").append(c.getSimpleName()).append('#').append(name).append(':').append(type);
+                    report.append(" | FIELD=").append(c.getSimpleName()).append('#').append(name).append(':').append(type)
+                            .append(" mods=").append(Modifier.toString(f.getModifiers()));
                 }
             }
 
             for (Method m : c.getDeclaredMethods()) {
                 String ret = m.getReturnType().getName();
-                String lower = (m.getName() + " " + ret).toLowerCase();
-                if (lower.contains("vendor") || lower.contains("binder") || lower.contains("nfcadapter") || ret.contains("IVendorNfcAdapter")) {
-                    report.append(" | GETTER=").append(c.getSimpleName()).append('#').append(m.getName())
-                            .append("->").append(ret).append(" args=").append(m.getParameterCount());
+                String lower = (m.getName() + " " + ret + " " + Arrays.toString(m.getParameterTypes())).toLowerCase();
+                boolean interesting = lower.contains("vendor") || lower.contains("binder") || lower.contains("nfcadapter") ||
+                        ret.contains("IVendorNfcAdapter") || "getNfcAdapterVendorInterface".equals(m.getName());
+                if (interesting) {
+                    report.append(" | METHOD_SIG=").append(c.getSimpleName()).append('#').append(m.getName())
+                            .append(" params=").append(Arrays.toString(m.getParameterTypes()))
+                            .append(" ->").append(ret)
+                            .append(" mods=").append(Modifier.toString(m.getModifiers()))
+                            .append(" generic=").append(m.toGenericString());
                 }
             }
         } catch (Throwable t) {
