@@ -72,7 +72,6 @@ class MainActivity : ComponentActivity() {
     private var pendingIntent: PendingIntent? = null
     private val gson = Gson()
     private val executor = Executors.newSingleThreadExecutor()
-    private val vendorNfcController = VendorNfcController()
     private var scannedCardState by mutableStateOf<CardModel?>(null)
     private var savedCardsState by mutableStateOf<List<CardModel>>(emptyList())
     private var readModeEnabled by mutableStateOf(false)
@@ -86,7 +85,7 @@ class MainActivity : ComponentActivity() {
             PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
         savedCardsState = loadCards()
-        AppLogger.i("NFC mode controller started; production vendor binder enabled")
+        AppLogger.i("NFC mode controller started; HeyTap background bridge enabled")
         setContent { MaterialTheme { Surface(Modifier.fillMaxSize()) { NfcAppContent() } } }
     }
 
@@ -215,7 +214,7 @@ class MainActivity : ComponentActivity() {
                             card, active, expandedUid?.equals(card.uid, true) == true,
                             { expandedUid = if (expandedUid?.equals(card.uid, true) == true) null else card.uid },
                             {
-                                operationMessage = "正在直接应用 UID ${card.uid}..."
+                                operationMessage = "正在应用 UID ${card.uid}..."
                                 simulateCard(card) { newStatus, message -> runOnUiThread { status = newStatus; operationMessage = message } }
                                 status = status.copy(simulationEnabled = true, selectedUid = card.uid, rfStatus = "WAITING")
                             },
@@ -279,7 +278,7 @@ class MainActivity : ComponentActivity() {
                 StatusRow("NFC / Hook", status.currentPid > 0 && status.hookInstalled, "pid=${status.currentPid} · hookBuild=${status.hookBuild} · hookPid=${status.hookPid}")
                 StatusRow("模拟配置", status.simulationEnabled, if (status.simulationEnabled) "UID=${status.selectedUid ?: "-"}" else "IDLE")
                 StatusRow("RF UID", status.rfStatus == "RF_UID_APPLIED", "${status.rfStatus} · uid=${status.rfUid ?: "-"} · result=${status.rfResult ?: "-"}")
-                Text("触发方式: Vendor Binder transaction 6 → 15", fontSize = 11.sp)
+                Text("触发方式: 后台 HeyTap Hook", fontSize = 11.sp)
                 Text("读卡模式: ${if (readModeEnabled) "开启" else "关闭"}", fontSize = 11.sp)
                 operationMessage?.let { Text(it, fontSize = 11.sp, color = Color.Gray) }
                 status.rfError?.takeIf { it.isNotBlank() }?.let { Text("RF error: $it", fontSize = 10.sp, color = Color.Red) }
@@ -363,84 +362,44 @@ class MainActivity : ComponentActivity() {
     private fun simulateCard(card: CardModel, onDone: (RuntimeStatus, String) -> Unit) {
         stopReadMode("simulation_start")
         writeSimulationConfig(card)
-        AppLogger.i("SIMULATION: DIRECT_BINDER requested uid=${card.uid} sak=${card.sak} atqa=${card.atqa}")
+        AppLogger.i("SIMULATION: HEYTAP_BACKGROUND requested uid=${card.uid}")
         executor.execute {
-            var state = readRuntimeStatus()
-            var restarted = false
-
-            if (!state.hookInstalled || state.hookBuild != EXPECTED_HOOK_BUILD) {
-                val restart = restartNfcProcessKeepingEnabled("ensure_hook_before_direct_binder")
-                restarted = true
-                AppLogger.i("SIMULATION: fallback restart for stale hook\n$restart")
-                state = waitForHookOnly(10_000)
-            }
-
-            var binderResult = if (state.hookInstalled) {
-                vendorNfcController.setShareMode(true)
-            } else {
-                VendorNfcController.Result(false, true, "HOOK", "Hook not ready")
-            }
-            AppLogger.i("SIMULATION: VENDOR_BINDER enable success=${binderResult.success} stage=${binderResult.stage} detail=${binderResult.detail} descriptor=${binderResult.vendorDescriptor}")
-
-            if (!binderResult.success && !restarted) {
-                val restart = restartNfcProcessKeepingEnabled("binder_retry")
-                AppLogger.i("SIMULATION: binder retry restart\n$restart")
-                state = waitForHookOnly(10_000)
-                if (state.hookInstalled) {
-                    binderResult = vendorNfcController.setShareMode(true)
-                    AppLogger.i("SIMULATION: VENDOR_BINDER retry success=${binderResult.success} stage=${binderResult.stage} detail=${binderResult.detail}")
-                }
-            }
-
-            state = if (binderResult.success) waitForHookAndRf(card.uid, 5_000) else readRuntimeStatus()
-            val applied = binderResult.success && state.rfStatus == "RF_UID_APPLIED" && state.rfUid.equals(card.uid, true) && state.rfResult == "0"
-            val message = when {
-                applied -> "模拟已应用 · UID=${card.uid} · Binder直连"
-                !binderResult.success -> "Vendor Binder 调用失败 · ${binderResult.stage}: ${binderResult.detail}"
-                !state.hookInstalled -> "Binder 已返回，但 Hook 未就绪"
-                else -> "Binder 已触发，等待 RF UID 确认"
-            }
-            AppLogger.i("SIMULATION: DIRECT_BINDER result=$message\n${buildStatusSummary(state)}")
+            val state = waitForHookAndRf(card.uid, 7_000)
+            val bridge = readProviderMap()
+            val applied = state.rfStatus == "RF_UID_APPLIED" && state.rfUid.equals(card.uid, true) && state.rfResult == "0"
+            val stage = bridge["heytap_bridge_stage"].orEmpty()
+            val detail = bridge["heytap_bridge_detail"].orEmpty()
+            val message = if (applied) "模拟已应用 · UID=${card.uid}" else "后台 HeyTap Hook: ${stage.ifBlank { "WAITING" }} ${detail}".trim()
             onDone(state, message)
         }
     }
 
     private fun stopSimulation(onDone: (RuntimeStatus, String) -> Unit) {
         stopReadMode("simulation_stop")
-        // Important: turn injection off before asking the OEM service to restore default RF config.
         contentResolver.insert(ConfigProvider.URI, ContentValues().apply {
             put(ConfigProvider.KEY_SIMULATION_ENABLED, false)
             put(ConfigProvider.KEY_RF_STATUS, "STOPPING")
             put(ConfigProvider.KEY_RF_UID, "")
             put(ConfigProvider.KEY_RF_RESULT, "")
             put(ConfigProvider.KEY_RF_ERROR, "")
-            put(ConfigProvider.KEY_FULL_DIAG_STAGE, "STOPPING")
-            put(ConfigProvider.KEY_FULL_DIAG_SUMMARY, "Disabling share mode through verified Vendor Binder")
         })
-        AppLogger.i("SIMULATION: DIRECT_BINDER stop requested")
+        AppLogger.i("SIMULATION: HEYTAP_BACKGROUND stop requested")
         executor.execute {
-            var result = vendorNfcController.setShareMode(false)
-            AppLogger.i("SIMULATION: VENDOR_BINDER disable success=${result.success} stage=${result.stage} detail=${result.detail}")
-
-            if (!result.success) {
-                val restart = restartNfcProcessKeepingEnabled("stop_fallback")
-                AppLogger.i("SIMULATION: stop fallback restart\n$restart")
-                waitForHookOnly(10_000)
-                result = vendorNfcController.setShareMode(false)
-                AppLogger.i("SIMULATION: VENDOR_BINDER disable retry success=${result.success} stage=${result.stage} detail=${result.detail}")
+            val end = System.currentTimeMillis() + 5_000L
+            var bridge = readProviderMap()
+            while (System.currentTimeMillis() < end) {
+                bridge = readProviderMap()
+                if (bridge["heytap_bridge_stage"] == "DONE" && bridge["heytap_bridge_enabled"] == "false") break
+                Thread.sleep(100L)
             }
-
             contentResolver.insert(ConfigProvider.URI, ContentValues().apply {
                 put(ConfigProvider.KEY_RF_STATUS, "IDLE")
                 put(ConfigProvider.KEY_RF_UID, "")
                 put(ConfigProvider.KEY_RF_RESULT, "")
                 put(ConfigProvider.KEY_RF_ERROR, "")
                 put(ConfigProvider.KEY_RF_PID, 0)
-                put(ConfigProvider.KEY_FULL_DIAG_STAGE, if (result.success) "IDLE" else "STOP_FAILED")
-                put(ConfigProvider.KEY_FULL_DIAG_SUMMARY, if (result.success) "Stock RF restored by Vendor Binder" else result.detail)
             })
-            val state = readRuntimeStatus()
-            onDone(state, if (result.success) "模拟已停止 · 默认 RF 已恢复" else "停止模拟失败 · ${result.stage}")
+            onDone(readRuntimeStatus(), "模拟已停止")
         }
     }
 
