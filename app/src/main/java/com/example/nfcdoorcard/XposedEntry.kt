@@ -33,12 +33,12 @@ class XposedEntry : XposedModule() {
         val pkg = lp.packageName
         val cl = lp.defaultClassLoader
 
-        Log.e(TAG, "MODULE: onPackageLoaded package=$pkg first=${lp.isFirstPackage}")
+        frameworkLog("MODULE: onPackageLoaded package=$pkg first=${lp.isFirstPackage}")
         if (!pkg.contains("nfc", ignoreCase = true)) return
 
-        Log.e(TAG, "MODULE: Loaded into NFC package $pkg")
+        frameworkLog("MODULE: Loaded into NFC package $pkg")
         reportModuleActive(pkg)
-        Log.e(TAG, "NFC-HIJACK: Armed in package: $pkg (Thread: ${Thread.currentThread().name})")
+        frameworkLog("NFC-HIJACK: Armed in package: $pkg (Thread: ${Thread.currentThread().name})")
 
         val managerClasses = arrayOf(
             "com.android.nfc.dhimpl.NxpNativeNfcManager",
@@ -52,35 +52,38 @@ class XposedEntry : XposedModule() {
             try {
                 val clazz = Class.forName(className, false, cl)
                 managerClassFound = true
-                Log.e(TAG, "NFC-HIJACK: Found manager class $className")
+                frameworkLog("NFC-HIJACK: Found manager class $className")
 
                 clazz.declaredConstructors.forEach { constructor ->
-                    hook(constructor).intercept { chain ->
-                        val inst = chain.proceed()
-                        if (inst != null) {
-                            Log.e(TAG, "NFC-HIJACK: Captured manager instance: ${inst.javaClass.name}")
-                            synchronized(nativeManagers) {
-                                nativeManagers.add(inst)
+                    try {
+                        hook(constructor).intercept { chain ->
+                            val inst = chain.proceed()
+                            if (inst != null) {
+                                frameworkLog("NFC-HIJACK: Captured manager instance: ${inst.javaClass.name}")
+                                synchronized(nativeManagers) { nativeManagers.add(inst) }
+                                reportModuleActive(pkg)
                             }
+                            inst
                         }
-                        inst
+                    } catch (t: Throwable) {
+                        frameworkLog("NFC-HIJACK: Constructor hook failed: $constructor", t)
                     }
                 }
 
                 clazz.declaredMethods.forEach { method ->
                     val name = method.name.lowercase(Locale.ROOT)
                     if (name.contains("sethcetypeaconfig") || name.contains("dosethcetypeaconfig")) {
-                        Log.e(TAG, "NFC-HIJACK: Hooking ${clazz.name}.${method.name}(${method.parameterTypes.joinToString { it.simpleName }})")
+                        frameworkLog("NFC-HIJACK: Candidate ${methodSignature(method)}")
                         applyHceHijack(method)
                     }
                 }
             } catch (t: Throwable) {
-                Log.w(TAG, "NFC-HIJACK: Manager class unavailable: $className (${t.javaClass.simpleName})")
+                frameworkLog("NFC-HIJACK: Manager class unavailable: $className (${t.javaClass.simpleName})")
             }
         }
 
         if (!managerClassFound) {
-            Log.e(TAG, "NFC-HIJACK: No known NativeNfcManager class found in $pkg")
+            frameworkLog("NFC-HIJACK: No known NativeNfcManager class found in $pkg")
         }
 
         val serviceClasses = arrayOf(
@@ -91,21 +94,20 @@ class XposedEntry : XposedModule() {
         for (className in serviceClasses) {
             try {
                 val serviceClass = Class.forName(className, false, cl)
-                Log.e(TAG, "NFC-HIJACK: Found service class $className")
+                frameworkLog("NFC-HIJACK: Found service class $className")
                 serviceClass.declaredMethods.forEach { method ->
                     val name = method.name.lowercase(Locale.ROOT)
                     if (name.contains("routing") || name.contains("screenstate") || name.contains("applyconfig")) {
                         hook(method).intercept { chain ->
                             lastFetchTime = 0
                             val result = chain.proceed()
-                            Log.e(TAG, "NFC-HIJACK: System event ($name) intercepted; re-enforcing state")
-                            enforceState()
+                            reportModuleActive(pkg)
                             result
                         }
                     }
                 }
             } catch (t: Throwable) {
-                Log.w(TAG, "NFC-HIJACK: Service class unavailable: $className (${t.javaClass.simpleName})")
+                frameworkLog("NFC-HIJACK: Service class unavailable: $className (${t.javaClass.simpleName})")
             }
         }
     }
@@ -113,7 +115,7 @@ class XposedEntry : XposedModule() {
     private fun reportModuleActive(processName: String) {
         try {
             val app = currentApplication() ?: run {
-                Log.w(TAG, "MODULE: currentApplication unavailable; cannot persist load state")
+                frameworkLog("MODULE: currentApplication unavailable; heartbeat deferred")
                 return
             }
             val bootCount = Settings.Global.getInt(app.contentResolver, Settings.Global.BOOT_COUNT, -1)
@@ -123,63 +125,73 @@ class XposedEntry : XposedModule() {
                 put("module_boot_count", bootCount)
             }
             app.contentResolver.insert(CONFIG_URI, values)
-            Log.e(TAG, "MODULE: Load state persisted for $processName, boot=$bootCount")
+            frameworkLog("MODULE: heartbeat persisted for $processName, boot=$bootCount")
         } catch (t: Throwable) {
-            Log.e(TAG, "MODULE: Failed to persist load state", t)
-        }
-    }
-
-    private fun enforceState() {
-        val config = fetchConfig()
-        if (!config.active || config.uid == null) return
-
-        val managers = synchronized(nativeManagers) { nativeManagers.toList() }
-        managers.forEach { manager ->
-            try {
-                manager.javaClass.declaredMethods.forEach { method ->
-                    if (method.name.contains("setHceTypeAConfig", ignoreCase = true)) {
-                        method.isAccessible = true
-                        val params = method.parameterTypes.size
-                        if (params < 2 || params > 4) {
-                            Log.w(TAG, "NFC-HIJACK: Skip unsupported ${method.name} parameter count=$params")
-                            return@forEach
-                        }
-                        val invokeArgs = arrayOfNulls<Any>(params)
-                        invokeArgs[0] = true
-                        method.invoke(manager, *invokeArgs)
-                    }
-                }
-            } catch (t: Throwable) {
-                Log.e(TAG, "NFC-HIJACK: Proactive lock failed for ${manager.javaClass.name}", t)
-            }
+            frameworkLog("MODULE: Failed to persist heartbeat", t)
         }
     }
 
     private fun applyHceHijack(method: Method) {
+        val types = method.parameterTypes
+        if (!isSupportedSignature(types)) {
+            frameworkLog("NFC-HIJACK: SAFE-SKIP unsupported signature ${methodSignature(method)}")
+            return
+        }
+
         try {
             hook(method).intercept { chain ->
                 val config = fetchConfig()
-                if (!config.active || config.uid == null) {
-                    return@intercept chain.proceed()
-                }
+                if (!config.active || config.uid == null) return@intercept chain.proceed()
 
                 val args = chain.args.toMutableList()
-                if (args.size < 2) {
-                    Log.e(TAG, "NFC-HIJACK: Unsupported ${method.name}: only ${args.size} args")
-                    return@intercept chain.proceed()
-                }
+                val uid = hexToBytes(config.uid)
+                val sak = (config.sak ?: "08").replace("0x", "", ignoreCase = true).toInt(16)
+                val atqa = hexToBytes(config.atqa ?: "0400")
 
                 args[0] = true
-                args[1] = hexToBytes(config.uid)
-                if (args.size >= 3) args[2] = hexToBytes(config.sak ?: "08")
-                if (args.size >= 4) args[3] = hexToBytes(config.atqa ?: "0400")
+                args[1] = uid
+                args[2] = when (types[2]) {
+                    ByteArray::class.java -> byteArrayOf((sak and 0xFF).toByte())
+                    Int::class.javaPrimitiveType, Int::class.javaObjectType -> sak
+                    Short::class.javaPrimitiveType, Short::class.javaObjectType -> sak.toShort()
+                    Byte::class.javaPrimitiveType, Byte::class.javaObjectType -> sak.toByte()
+                    else -> args[2]
+                }
+                args[3] = when (types[3]) {
+                    ByteArray::class.java -> atqa
+                    Int::class.javaPrimitiveType, Int::class.javaObjectType -> bytesToInt(atqa)
+                    Short::class.javaPrimitiveType, Short::class.javaObjectType -> bytesToInt(atqa).toShort()
+                    else -> args[3]
+                }
 
-                Log.e(TAG, "NFC-HIJACK: [STRICT LOCK] Forced UID ${config.uid} via ${method.declaringClass.simpleName}.${method.name}")
+                reportModuleActive(method.declaringClass.name)
+                frameworkLog(
+                    "NFC-HIJACK: APPLY uid=${config.uid} sak=${config.sak} atqa=${config.atqa} via ${methodSignature(method)}"
+                )
                 chain.proceed(args.toTypedArray())
             }
         } catch (t: Throwable) {
-            Log.e(TAG, "NFC-HIJACK: Hook failed: ${method.declaringClass.name}.${method.name}", t)
+            frameworkLog("NFC-HIJACK: Hook failed: ${methodSignature(method)}", t)
         }
+    }
+
+    private fun isSupportedSignature(types: Array<Class<*>>): Boolean {
+        if (types.size != 4) return false
+        if (types[0] != Boolean::class.javaPrimitiveType && types[0] != Boolean::class.javaObjectType) return false
+        if (types[1] != ByteArray::class.java) return false
+        val sakOk = types[2] == ByteArray::class.java ||
+            types[2] == Int::class.javaPrimitiveType || types[2] == Int::class.javaObjectType ||
+            types[2] == Short::class.javaPrimitiveType || types[2] == Short::class.javaObjectType ||
+            types[2] == Byte::class.javaPrimitiveType || types[2] == Byte::class.javaObjectType
+        val atqaOk = types[3] == ByteArray::class.java ||
+            types[3] == Int::class.javaPrimitiveType || types[3] == Int::class.javaObjectType ||
+            types[3] == Short::class.javaPrimitiveType || types[3] == Short::class.javaObjectType
+        return sakOk && atqaOk
+    }
+
+    private fun methodSignature(method: Method): String {
+        return "${method.declaringClass.name}.${method.name}(" +
+            method.parameterTypes.joinToString(",") { it.name } + "):${method.returnType.name}"
     }
 
     data class SimConfig(
@@ -213,7 +225,7 @@ class XposedEntry : XposedModule() {
                 lastFetchTime = now
             }
         } catch (t: Throwable) {
-            Log.e(TAG, "NFC-HIJACK: Config read failed", t)
+            frameworkLog("NFC-HIJACK: Config read failed", t)
         } finally {
             cursor?.close()
         }
@@ -225,7 +237,7 @@ class XposedEntry : XposedModule() {
             Class.forName("android.app.ActivityThread")
                 .getDeclaredMethod("currentApplication")
                 .invoke(null) as? Application
-        } catch (t: Throwable) {
+        } catch (_: Throwable) {
             null
         }
     }
@@ -236,6 +248,22 @@ class XposedEntry : XposedModule() {
         return ByteArray(s.length / 2) { index ->
             val offset = index * 2
             s.substring(offset, offset + 2).toInt(16).toByte()
+        }
+    }
+
+    private fun bytesToInt(bytes: ByteArray): Int {
+        var value = 0
+        bytes.take(4).forEach { value = (value shl 8) or (it.toInt() and 0xFF) }
+        return value
+    }
+
+    private fun frameworkLog(message: String, throwable: Throwable? = null) {
+        if (throwable == null) {
+            Log.e(TAG, message)
+            try { log(Log.INFO, TAG, message) } catch (_: Throwable) { }
+        } else {
+            Log.e(TAG, message, throwable)
+            try { log(Log.ERROR, TAG, message, throwable) } catch (_: Throwable) { }
         }
     }
 }
