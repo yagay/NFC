@@ -32,7 +32,16 @@ import com.google.gson.reflect.TypeToken
 import java.io.File
 import java.util.concurrent.Executors
 
-enum class LogSource { STATUS, LSPosed, KernelSU, System, NFC }
+enum class LogSource(val label: String) {
+    STATUS("状态"),
+    LSPOSED("LSPosed"),
+    KERNEL_SU("KernelSU"),
+    SYSTEM("系统"),
+    NFC("NFC"),
+    HAL("HAL"),
+    PROVIDER("Provider"),
+    APP("App")
+}
 
 data class RuntimeStatus(
     val appBuild: Int = 0,
@@ -195,9 +204,7 @@ class MainActivity : ComponentActivity() {
                         { startReadMode() }, { stopReadMode() }, { saveScannedCard(it) }, { scannedCardState = null }
                     )
                 }
-                item {
-                    Text("已保存卡片 (${cards.size})", Modifier.padding(horizontal = 12.dp, vertical = 8.dp), fontWeight = FontWeight.Bold)
-                }
+                item { Text("已保存卡片 (${cards.size})", Modifier.padding(horizontal = 12.dp, vertical = 8.dp), fontWeight = FontWeight.Bold) }
                 if (cards.isEmpty()) {
                     item { Text("暂无保存卡片。进入读卡模式后贴卡，确认信息无误再保存。", Modifier.padding(12.dp), fontSize = 12.sp, color = Color.Gray) }
                 } else {
@@ -229,17 +236,13 @@ class MainActivity : ComponentActivity() {
                     Spacer(Modifier.height(6.dp))
                     ScrollableTabRow(selectedTabIndex = selectedSource.ordinal, edgePadding = 4.dp) {
                         LogSource.entries.forEach { source ->
-                            Tab(
-                                selected = selectedSource == source,
-                                onClick = { selectedSource = source },
-                                text = { Text(source.name, fontSize = 11.sp) }
-                            )
+                            Tab(selected = selectedSource == source, onClick = { selectedSource = source }, text = { Text(source.label, fontSize = 11.sp) })
                         }
                     }
                 }
                 item {
                     Box(
-                        Modifier.fillMaxWidth().height(320.dp).padding(6.dp)
+                        Modifier.fillMaxWidth().height(340.dp).padding(6.dp)
                             .background(Color(0xFF050505), RoundedCornerShape(4.dp)).padding(6.dp)
                     ) {
                         val lines = logText.split("\n")
@@ -249,16 +252,18 @@ class MainActivity : ComponentActivity() {
                                     line,
                                     color = when {
                                         line.contains("SUCCESS") || line.contains("APPLIED") || line.contains("ACCEPTED") || line.contains("READY") -> Color.Cyan
-                                        line.contains("FAILED") || line.contains("ERROR") || line.contains("STALE") -> Color.Red
+                                        line.contains("FAILED") || line.contains("ERROR") || line.contains("STALE") || line.contains("FATAL") -> Color.Red
                                         line.contains("WAITING") || line.contains("IDLE") -> Color.Yellow
-                                        line.contains("RF") || line.contains("NFCID1") || line.contains("NfcNfc") -> Color.Green
+                                        line.contains("RF") || line.contains("NFCID1") || line.contains("NfcUIDSim") -> Color.Green
                                         else -> Color(0xFFD4D4D4)
                                     },
                                     fontSize = 9.sp, lineHeight = 11.sp, fontFamily = FontFamily.Monospace
                                 )
                             }
                         }
-                        LaunchedEffect(lines.size) { if (lines.isNotEmpty()) logListState.animateScrollToItem(lines.size - 1) }
+                        LaunchedEffect(selectedSource, lines.size) {
+                            if (lines.isNotEmpty()) logListState.scrollToItem((lines.size - 1).coerceAtLeast(0))
+                        }
                     }
                 }
             }
@@ -281,10 +286,7 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun ReadCardPanel(
-        card: CardModel?, readMode: Boolean, simulationActive: Boolean,
-        onStartRead: () -> Unit, onStopRead: () -> Unit, onSave: (CardModel) -> Unit, onClear: () -> Unit
-    ) {
+    private fun ReadCardPanel(card: CardModel?, readMode: Boolean, simulationActive: Boolean, onStartRead: () -> Unit, onStopRead: () -> Unit, onSave: (CardModel) -> Unit, onClear: () -> Unit) {
         Card(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp)) {
             Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Text("读卡模式", fontWeight = FontWeight.Bold)
@@ -337,10 +339,7 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun CardItem(
-        card: CardModel, isActive: Boolean, expanded: Boolean,
-        onToggleDetails: () -> Unit, onSimulate: () -> Unit, onStop: () -> Unit, onDelete: () -> Unit
-    ) {
+    private fun CardItem(card: CardModel, isActive: Boolean, expanded: Boolean, onToggleDetails: () -> Unit, onSimulate: () -> Unit, onStop: () -> Unit, onDelete: () -> Unit) {
         Card(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 3.dp).clickable { onToggleDetails() }) {
             Column(Modifier.padding(8.dp), verticalArrangement = Arrangement.spacedBy(5.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -392,7 +391,8 @@ class MainActivity : ComponentActivity() {
         executor.execute {
             val restart = restartNfcProcessKeepingEnabled("stop_simulation")
             AppLogger.i("SIMULATION: stop restart\n$restart")
-            onDone(waitForHookOnly(10_000), "模拟已停止，NFC 保持开启")
+            val state = waitForHookOnly(10_000)
+            onDone(state, "模拟已停止，NFC 保持开启")
         }
     }
 
@@ -433,11 +433,13 @@ class MainActivity : ComponentActivity() {
               sleep 0.5
               kill -0 "${'$'}old" 2>/dev/null && kill -KILL "${'$'}old" 2>/dev/null || true
             fi
-            i=0; new=""
+            i=0
+            new=""
             while [ ${'$'}i -lt 60 ]; do
               new=${'$'}(pidof com.android.nfc 2>/dev/null | awk '{print ${'$'}1}')
               if [ -n "${'$'}new" ] && [ "${'$'}new" != "${'$'}old" ]; then break; fi
-              sleep 0.2; i=${'$'}((i+1))
+              sleep 0.2
+              i=${'$'}((i+1))
             done
             state=${'$'}(dumpsys nfc 2>/dev/null | grep -m1 -E 'mState=|state=' || true)
             if ! echo "${'$'}state" | grep -Eqi 'mState=on|state=on|STATE_ON|mState=3'; then svc nfc enable 2>/dev/null || true; fi
@@ -446,7 +448,8 @@ class MainActivity : ComponentActivity() {
               state=${'$'}(dumpsys nfc 2>/dev/null | grep -m1 -E 'mState=|state=' || true)
               echo "${'$'}state" | grep -Eqi 'mState=on|state=on|STATE_ON|mState=3' && break
               if [ ${'$'}((j % 10)) -eq 0 ]; then svc nfc enable 2>/dev/null || true; fi
-              sleep 0.25; j=${'$'}((j+1))
+              sleep 0.25
+              j=${'$'}((j+1))
             done
             new=${'$'}(pidof com.android.nfc 2>/dev/null | awk '{print ${'$'}1}')
             echo "NEW_PID=${'$'}new"
@@ -481,18 +484,13 @@ class MainActivity : ComponentActivity() {
 
     private fun readProviderMap(): Map<String, String> {
         val map = mutableMapOf<String, String>()
-        runCatching {
-            contentResolver.query(ConfigProvider.URI, null, null, null, null)?.use { c ->
-                while (c.moveToNext()) map[c.getString(0)] = c.getString(1)
-            }
-        }
+        runCatching { contentResolver.query(ConfigProvider.URI, null, null, null, null)?.use { c -> while (c.moveToNext()) map[c.getString(0)] = c.getString(1) } }
         return map
     }
 
     private fun readRuntimeStatus(): RuntimeStatus {
         val map = readProviderMap()
-        val currentPid = runRootCmd("pidof com.android.nfc 2>/dev/null | awk '{print ${'$'}1}'")
-            .lineSequence().firstOrNull { it.trim().matches(Regex("\\d+")) }?.trim()?.toIntOrNull() ?: 0
+        val currentPid = currentNfcPid().toIntOrNull() ?: 0
         val scopePid = map[ConfigProvider.KEY_SCOPE_PID]?.toIntOrNull() ?: 0
         val hookPid = map[ConfigProvider.KEY_HOOK_PID]?.toIntOrNull() ?: 0
         val hookBuild = map[ConfigProvider.KEY_HOOK_BUILD]?.toIntOrNull() ?: 0
@@ -533,38 +531,42 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun fetchLogsSync(source: LogSource): String {
-        val cmd = when (source) {
-            LogSource.STATUS -> "logcat -b all -d -t 300 -v threadtime -s NfcDoorCard NfcUIDSim 2>/dev/null"
-            LogSource.LSPosed -> """
-                echo '### LSPOSED LOG FILES ###'
-                find /data/adb/lspd /data/adb/lsposed -maxdepth 4 -type f \( -name '*.log' -o -name 'modules*' \) -print 2>/dev/null | sort
-                echo '### LSPOSED MATCHES ###'
-                files=${'$'}(find /data/adb/lspd /data/adb/lsposed -maxdepth 4 -type f \( -name '*.log' -o -name 'modules*' \) -print 2>/dev/null)
-                for f in ${'$'}files; do
-                  grep -H -E 'com.example.nfcdoorcard|NfcUIDSim|PROD MODULE|PROD HOOK|RFPROBE|NFCID1|NfcInjectionModule' "${'$'}f" 2>/dev/null || true
-                done | tail -n 1600
-            """.trimIndent()
-            LogSource.KernelSU -> """
-                echo '### KERNELSU LOG FILES ###'
-                find /data/adb/ksu /data/adb/ksud -maxdepth 4 -type f -name '*.log' -print 2>/dev/null | sort | tail -n 50
-                echo '### KERNELSU RECENT ###'
-                find /data/adb/ksu /data/adb/ksud -maxdepth 4 -type f \( -name '*.log' -o -name 'sulog*' \) -print 2>/dev/null | while read f; do tail -n 200 "${'$'}f" 2>/dev/null; done | tail -n 900
-            """.trimIndent()
-            LogSource.System -> """
-                echo '### SYSTEM LOGCAT (ALL BUFFERS, RECENT) ###'
-                logcat -b all -d -v threadtime -t 1400 2>/dev/null
-                echo '### DMESG RECENT ###'
-                dmesg 2>/dev/null | tail -n 500
-            """.trimIndent()
-            LogSource.NFC -> """
-                echo '### NFC PROCESSES ###'
-                ps -A | grep -E 'com.android.nfc|android.hardware.nfc|vendor.oplus.hardware.nfc' || true
-                echo '### NFC LOGCAT ###'
-                logcat -b all -d -v threadtime 2>/dev/null | grep -Ei 'NfcUIDSim|RFPROBE|NFCID1|NfcInjectionModule|NxpNfcService|NxpNativeNfcManager|NfcChipDeviceImpl|changeRfParamsByConfig|setRfConfig|setConfig|applyPreRfConfig|commitRouting|NfcService|VendorNfcService|android.hardware.nfc|vendor.oplus.hardware.nfc|NfcNci' | tail -n 1800
-            """.trimIndent()
+        val pid = currentNfcPid()
+        val output = when (source) {
+            LogSource.STATUS -> runRootCmd("logcat -d -t 350 -v threadtime -s NfcDoorCard NfcUIDSim 2>/dev/null")
+            LogSource.LSPOSED -> runRootCmd("""
+                {
+                  grep -R -h -E 'NfcUIDSim|com.example.nfcdoorcard|PROD MODULE|PROD HOOK|RFPROBE|NFCID1|LSPosed' /data/adb/lspd/log 2>/dev/null || true
+                  logcat -b all -d -v threadtime 2>/dev/null | grep -E 'NfcUIDSim|PROD MODULE|PROD HOOK|RFPROBE|NFCID1' || true
+                } | tail -n 1500
+            """.trimIndent())
+            LogSource.KERNEL_SU -> runRootCmd("for f in ${'$'}(ls -t /data/adb/ksu/log/sulog* 2>/dev/null | head -n 3); do echo === ${'$'}f ===; tail -n 300 ${'$'}f; done")
+            LogSource.SYSTEM -> runRootCmd("logcat -b all -d -v threadtime 2>/dev/null | tail -n 1800")
+            LogSource.NFC -> {
+                val filter = "NfcUIDSim|NfcService|NxpNfcService|NfcChipDeviceImpl|NFCID1|changeRfParamsByConfig|setRfConfig|commitRouting|applyPreRfConfig|VendorNfcService"
+                val pidFilter = if (pid.isNotBlank()) "${'$'}0 ~ / $pid / || ${'$'}0 ~ /$filter/" else "${'$'}0 ~ /$filter/"
+                runRootCmd("logcat -b all -d -v threadtime 2>/dev/null | awk '$pidFilter' | tail -n 1800")
+            }
+            LogSource.HAL -> runRootCmd("""
+                echo '--- NFC PROCESSES ---'
+                ps -A | grep -E 'android.hardware.nfc|vendor.oplus.hardware.nfc|com.android.nfc' || true
+                echo '--- NFC PROPERTIES ---'
+                getprop | grep -i -E 'nfc|nxp|st21|st54|sn100|sn220|oplus' | head -n 300 || true
+                echo '--- HAL LOGCAT ---'
+                logcat -b all -d -v threadtime 2>/dev/null | grep -i -E 'android.hardware.nfc|vendor.oplus.hardware.nfc|NxpNfc|NfcHal|libnfc|nfc-service|NFC HAL|STNfc|sn100|sn220' | tail -n 1200 || true
+            """.trimIndent())
+            LogSource.PROVIDER -> buildString {
+                appendLine("=== PROVIDER STATE ===")
+                readProviderMap().toSortedMap().forEach { (k, v) -> appendLine("$k=$v") }
+                appendLine("current_nfc_pid=${currentNfcPid()}")
+            }
+            LogSource.APP -> AppLogger.readAll().ifBlank { "No app logs" }
         }
-        return runRootCmd(cmd).ifBlank { "No matching logs found for $source" }
+        return output.ifBlank { "No matching logs found for ${source.label}" }
     }
+
+    private fun currentNfcPid(): String = runRootCmd("pidof com.android.nfc 2>/dev/null | awk '{print ${'$'}1}'")
+        .lineSequence().firstOrNull { it.trim().matches(Regex("\\d+")) }?.trim().orEmpty()
 
     private fun loadCards(): List<CardModel> {
         val prefs = getSharedPreferences("cards", 0)
@@ -573,9 +575,7 @@ class MainActivity : ComponentActivity() {
             val old = getSharedPreferences("saved_cards", 0).getString("cards_list", null)
             if (!old.isNullOrBlank()) { json = old; prefs.edit().putString("list", old).apply() }
         }
-        return if (json.isNullOrBlank()) emptyList() else runCatching {
-            gson.fromJson<List<CardModel>>(json, object : TypeToken<List<CardModel>>() {}.type) ?: emptyList()
-        }.getOrDefault(emptyList())
+        return if (json.isNullOrBlank()) emptyList() else runCatching { gson.fromJson<List<CardModel>>(json, object : TypeToken<List<CardModel>>() {}.type) ?: emptyList() }.getOrDefault(emptyList())
     }
 
     private fun saveCards(cards: List<CardModel>) { getSharedPreferences("cards", 0).edit().putString("list", gson.toJson(cards)).apply() }
@@ -591,7 +591,9 @@ class MainActivity : ComponentActivity() {
                     onDone()
                     val uri = FileProvider.getUriForFile(this@MainActivity, "$packageName.fileprovider", file)
                     startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {
-                        type = "text/plain"; putExtra(Intent.EXTRA_STREAM, uri); addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                        type = "text/plain"
+                        putExtra(Intent.EXTRA_STREAM, uri)
+                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                     }, "Share NFC Full Check"))
                 }
             } catch (e: Exception) {
@@ -608,31 +610,23 @@ class MainActivity : ComponentActivity() {
         appendLine("--- FINAL SUMMARY ---")
         appendLine(buildStatusSummary(s))
         appendLine()
-        appendLine("--- PROVIDER RAW STATE ---")
-        readProviderMap().toSortedMap().forEach { (k, v) -> appendLine("$k=$v") }
         appendLine("--- SAVED CARDS ---")
-        val cards = loadCards(); appendLine("count=${cards.size}")
+        val cards = loadCards()
+        appendLine("count=${cards.size}")
         cards.forEach { appendLine("card uid=${it.uid} sak=${it.sak} atqa=${it.atqa}") }
         appendLine("--- APP / APK ---")
         appendLine(runRootCmd("dumpsys package $packageName 2>/dev/null | grep -E 'versionName=|versionCode=|path:' | head -n 30"))
         appendLine("--- ROOT ---")
-        appendLine(runRootCmd("id; su -v 2>/dev/null || true; getenforce 2>/dev/null || true"))
+        appendLine(runRootCmd("id; su -v 2>/dev/null || true"))
         appendLine("--- NFC PROCESS / HAL ---")
         appendLine(runRootCmd("pm path com.android.nfc; pidof com.android.nfc; ps -A | grep -E 'android.hardware.nfc|vendor.oplus.hardware.nfc|com.android.nfc|$packageName'"))
         appendLine("--- NFC SERVICE FULL ---")
-        appendLine(runRootCmd("dumpsys nfc 2>&1 | tail -n 2500"))
-        appendLine("--- LSPPOSED ---")
-        appendLine(fetchLogsSync(LogSource.LSPosed))
-        appendLine("--- KERNELSU ---")
-        appendLine(fetchLogsSync(LogSource.KernelSU))
-        appendLine("--- NFC LOG ---")
-        appendLine(fetchLogsSync(LogSource.NFC))
-        appendLine("--- SYSTEM LOG ---")
-        appendLine(fetchLogsSync(LogSource.System))
-        appendLine("--- APP / STATUS LOG ---")
-        appendLine(fetchLogsSync(LogSource.STATUS))
-        appendLine("--- APP INTERNAL LOG ---")
-        appendLine(AppLogger.readAll())
+        appendLine(runRootCmd("dumpsys nfc 2>/dev/null | head -n 1000"))
+        LogSource.entries.forEach { source ->
+            appendLine()
+            appendLine("=== LOG SOURCE: ${source.name} / ${source.label} ===")
+            appendLine(fetchLogsSync(source))
+        }
     }
 
     private fun runRootCmd(command: String): String = try {
