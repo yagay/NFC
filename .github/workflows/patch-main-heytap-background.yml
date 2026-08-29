@@ -1,0 +1,82 @@
+name: Patch legacy UI HeyTap background
+on:
+  push:
+    paths:
+      - '.github/workflows/patch-main-heytap-background.yml'
+permissions:
+  contents: write
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Patch MainActivity
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('app/src/main/java/com/example/nfcdoorcard/MainActivity.kt')
+          s = p.read_text()
+          s = s.replace('    private val vendorNfcController = VendorNfcController()\n', '')
+          a = s.index('    private fun simulateCard(')
+          b = s.index('    private fun stopSimulation(', a)
+          c = s.index('    private fun writeSimulationConfig(', b)
+          sim = '''    private fun simulateCard(card: CardModel, onDone: (RuntimeStatus, String) -> Unit) {
+        stopReadMode("simulation_start")
+        writeSimulationConfig(card)
+        AppLogger.i("SIMULATION: HEYTAP_BACKGROUND requested uid=${card.uid}")
+        executor.execute {
+            val state = waitForHookAndRf(card.uid, 7_000)
+            val bridge = readProviderMap()
+            val applied = state.rfStatus == "RF_UID_APPLIED" && state.rfUid.equals(card.uid, true) && state.rfResult == "0"
+            val stage = bridge["heytap_bridge_stage"].orEmpty()
+            val detail = bridge["heytap_bridge_detail"].orEmpty()
+            val message = if (applied) "模拟已应用 · UID=${card.uid}" else "后台 HeyTap Hook: ${stage.ifBlank { "WAITING" }} ${detail}".trim()
+            onDone(state, message)
+        }
+    }
+
+'''
+          stop = '''    private fun stopSimulation(onDone: (RuntimeStatus, String) -> Unit) {
+        stopReadMode("simulation_stop")
+        contentResolver.insert(ConfigProvider.URI, ContentValues().apply {
+            put(ConfigProvider.KEY_SIMULATION_ENABLED, false)
+            put(ConfigProvider.KEY_RF_STATUS, "STOPPING")
+            put(ConfigProvider.KEY_RF_UID, "")
+            put(ConfigProvider.KEY_RF_RESULT, "")
+            put(ConfigProvider.KEY_RF_ERROR, "")
+        })
+        AppLogger.i("SIMULATION: HEYTAP_BACKGROUND stop requested")
+        executor.execute {
+            val end = System.currentTimeMillis() + 5_000L
+            var bridge = readProviderMap()
+            while (System.currentTimeMillis() < end) {
+                bridge = readProviderMap()
+                if (bridge["heytap_bridge_stage"] == "DONE" && bridge["heytap_bridge_enabled"] == "false") break
+                Thread.sleep(100L)
+            }
+            contentResolver.insert(ConfigProvider.URI, ContentValues().apply {
+                put(ConfigProvider.KEY_RF_STATUS, "IDLE")
+                put(ConfigProvider.KEY_RF_UID, "")
+                put(ConfigProvider.KEY_RF_RESULT, "")
+                put(ConfigProvider.KEY_RF_ERROR, "")
+                put(ConfigProvider.KEY_RF_PID, 0)
+            })
+            onDone(readRuntimeStatus(), "模拟已停止")
+        }
+    }
+
+'''
+          s = s[:a] + sim + stop + s[c:]
+          s = s.replace('Text("触发方式: Vendor Binder transaction 6 → 15", fontSize = 11.sp)', 'Text("触发方式: 后台 HeyTap Hook", fontSize = 11.sp)')
+          s = s.replace('operationMessage = "正在直接应用 UID ${card.uid}..."', 'operationMessage = "正在应用 UID ${card.uid}..."')
+          s = s.replace('AppLogger.i("NFC mode controller started; production vendor binder enabled")', 'AppLogger.i("NFC mode controller started; HeyTap background bridge enabled")')
+          p.write_text(s)
+          PY
+      - name: Commit
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add app/src/main/java/com/example/nfcdoorcard/MainActivity.kt
+          git commit -m 'refactor: keep legacy UI with HeyTap background bridge'
+          git push
