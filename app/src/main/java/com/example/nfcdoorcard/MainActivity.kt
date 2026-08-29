@@ -162,21 +162,26 @@ class MainActivity : ComponentActivity() {
         var logText by remember { mutableStateOf("") }
         var selectedSource by remember { mutableStateOf(LogSource.STATUS) }
         var diagnosticRunning by remember { mutableStateOf(false) }
+        var logsEnabled by remember { mutableStateOf(false) }
         var expandedUid by remember { mutableStateOf<String?>(null) }
         var operationMessage by remember { mutableStateOf<String?>(null) }
         val logListState = rememberLazyListState()
 
-        LaunchedEffect(selectedSource) {
+        LaunchedEffect(selectedSource, logsEnabled) {
             while (true) {
                 executor.execute {
                     val newStatus = readRuntimeStatus()
-                    val logs = fetchLogsSync(selectedSource)
+                    val logs = if (logsEnabled) fetchLogsSync(selectedSource) else ""
                     runOnUiThread {
                         status = newStatus
-                        logText = if (selectedSource == LogSource.STATUS) buildStatusSummary(newStatus) + "\n\n" + logs else logs
+                        if (logsEnabled) {
+                            logText = if (selectedSource == LogSource.STATUS) buildStatusSummary(newStatus) + "\n\n" + logs else logs
+                        } else {
+                            logText = ""
+                        }
                     }
                 }
-                kotlinx.coroutines.delay(2000)
+                kotlinx.coroutines.delay(if (logsEnabled) 2000 else 3000)
             }
         }
 
@@ -234,36 +239,62 @@ class MainActivity : ComponentActivity() {
                     }
                 }
                 item {
-                    Spacer(Modifier.height(6.dp))
-                    ScrollableTabRow(selectedTabIndex = selectedSource.ordinal, edgePadding = 4.dp) {
-                        LogSource.entries.forEach { source ->
-                            Tab(selected = selectedSource == source, onClick = { selectedSource = source }, text = { Text(source.label, fontSize = 11.sp) })
+                    Card(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp)) {
+                        Row(
+                            Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(Modifier.weight(1f)) {
+                                Text("日志显示", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                                Text(
+                                    if (logsEnabled) "已开启 · 正在抓取日志" else "已关闭 · 不抓取日志，减少性能影响",
+                                    fontSize = 11.sp,
+                                    color = Color.Gray
+                                )
+                            }
+                            Switch(
+                                checked = logsEnabled,
+                                onCheckedChange = { enabled ->
+                                    logsEnabled = enabled
+                                    if (!enabled) logText = ""
+                                }
+                            )
                         }
                     }
                 }
-                item {
-                    Box(
-                        Modifier.fillMaxWidth().height(340.dp).padding(6.dp)
-                            .background(Color(0xFF050505), RoundedCornerShape(4.dp)).padding(6.dp)
-                    ) {
-                        val lines = logText.split("\n")
-                        LazyColumn(state = logListState, modifier = Modifier.fillMaxSize()) {
-                            items(lines) { line ->
-                                Text(
-                                    line,
-                                    color = when {
-                                        line.contains("SUCCESS") || line.contains("APPLIED") || line.contains("ACCEPTED") || line.contains("READY") -> Color.Cyan
-                                        line.contains("FAILED") || line.contains("ERROR") || line.contains("STALE") || line.contains("FATAL") -> Color.Red
-                                        line.contains("WAITING") || line.contains("IDLE") -> Color.Yellow
-                                        line.contains("RF") || line.contains("NFCID1") || line.contains("NfcUIDSim") || line.contains("VENDOR_BINDER") -> Color.Green
-                                        else -> Color(0xFFD4D4D4)
-                                    },
-                                    fontSize = 9.sp, lineHeight = 11.sp, fontFamily = FontFamily.Monospace
-                                )
+                if (logsEnabled) {
+                    item {
+                        Spacer(Modifier.height(6.dp))
+                        ScrollableTabRow(selectedTabIndex = selectedSource.ordinal, edgePadding = 4.dp) {
+                            LogSource.entries.forEach { source ->
+                                Tab(selected = selectedSource == source, onClick = { selectedSource = source }, text = { Text(source.label, fontSize = 11.sp) })
                             }
                         }
-                        LaunchedEffect(selectedSource, lines.size) {
-                            if (lines.isNotEmpty()) logListState.scrollToItem((lines.size - 1).coerceAtLeast(0))
+                    }
+                    item {
+                        Box(
+                            Modifier.fillMaxWidth().height(340.dp).padding(6.dp)
+                                .background(Color(0xFF050505), RoundedCornerShape(4.dp)).padding(6.dp)
+                        ) {
+                            val lines = logText.split("\n")
+                            LazyColumn(state = logListState, modifier = Modifier.fillMaxSize()) {
+                                items(lines) { line ->
+                                    Text(
+                                        line,
+                                        color = when {
+                                            line.contains("SUCCESS") || line.contains("APPLIED") || line.contains("ACCEPTED") || line.contains("READY") -> Color.Cyan
+                                            line.contains("FAILED") || line.contains("ERROR") || line.contains("STALE") || line.contains("FATAL") -> Color.Red
+                                            line.contains("WAITING") || line.contains("IDLE") -> Color.Yellow
+                                            line.contains("RF") || line.contains("NFCID1") || line.contains("NfcUIDSim") || line.contains("VENDOR_BINDER") -> Color.Green
+                                            else -> Color(0xFFD4D4D4)
+                                        },
+                                        fontSize = 9.sp, lineHeight = 11.sp, fontFamily = FontFamily.Monospace
+                                    )
+                                }
+                            }
+                            LaunchedEffect(selectedSource, lines.size) {
+                                if (lines.isNotEmpty()) logListState.scrollToItem((lines.size - 1).coerceAtLeast(0))
+                            }
                         }
                     }
                 }
