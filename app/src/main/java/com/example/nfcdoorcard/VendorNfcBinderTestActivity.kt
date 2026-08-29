@@ -77,7 +77,6 @@ class VendorNfcBinderTestActivity : ComponentActivity() {
                     return@buildString
                 }
 
-                // Clear only diagnostic RF result fields so a previous success cannot create a false PASS.
                 runCatching {
                     contentResolver.insert(ConfigProvider.URI, ContentValues().apply {
                         put(ConfigProvider.KEY_RF_STATUS, "WAITING_BINDER_TEST")
@@ -169,7 +168,6 @@ class VendorNfcBinderTestActivity : ComponentActivity() {
     )
 
     private fun discoverVendorHandle(log: StringBuilder): VendorHandle? {
-        // Preferred path: obtain the vendor interface exactly as framework NfcAdapter does.
         try {
             val serviceField = NfcAdapter::class.java.getDeclaredField("sService")
             serviceField.isAccessible = true
@@ -189,7 +187,7 @@ class VendorNfcBinderTestActivity : ComponentActivity() {
                     val vendor = getter.invoke(nfcService)
                     val binder = asBinder(vendor)
                     if (vendor != null && binder != null) {
-                        val descriptor = runCatching { binder.interfaceDescriptor }.getOrDefault("")
+                        val descriptor = runCatching { binder.interfaceDescriptor }.getOrNull().orEmpty()
                         return VendorHandle("NfcAdapter.sService/${getter.name}", descriptor, null, binder, vendor)
                     }
                 } else {
@@ -200,7 +198,6 @@ class VendorNfcBinderTestActivity : ComponentActivity() {
             log.appendLine("DISCOVERY_A_ERROR=${describeThrowable(t)}")
         }
 
-        // Fallback path: enumerate ServiceManager from the app UID and match the actual interface descriptor.
         try {
             val sm = Class.forName("android.os.ServiceManager")
             val listMethod = sm.getDeclaredMethod("listServices").apply { isAccessible = true }
@@ -210,7 +207,7 @@ class VendorNfcBinderTestActivity : ComponentActivity() {
             val ordered = names.mapNotNull { it as? String }.sortedBy { if (it.contains("nfc", true)) 0 else 1 }
             for (name in ordered) {
                 val binder = getMethod.invoke(null, name) as? IBinder ?: continue
-                val descriptor = runCatching { binder.interfaceDescriptor }.getOrDefault("")
+                val descriptor = runCatching { binder.interfaceDescriptor }.getOrNull().orEmpty()
                 if (descriptor == "com.vendor.nfc.IVendorNfcAdapter" || descriptor.endsWith(".IVendorNfcAdapter")) {
                     val vendor = asVendorInterface(binder, log)
                     return VendorHandle("ServiceManager", descriptor, name, binder, vendor)
@@ -241,7 +238,6 @@ class VendorNfcBinderTestActivity : ComponentActivity() {
             }
         }
 
-        // Last fallback: direct Binder transaction using the generated AIDL Stub transaction constant.
         val stub = Class.forName("com.vendor.nfc.IVendorNfcAdapter\$Stub")
         val field = stub.getDeclaredField("TRANSACTION_enableNfcShareMode").apply { isAccessible = true }
         val code = field.getInt(null)
