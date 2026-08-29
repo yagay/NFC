@@ -11,6 +11,7 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -159,18 +160,20 @@ class MainActivity : ComponentActivity() {
                 atqa = bytesToHex(it.atqa.reversedArray()).uppercase()
             }
         }
-        val card = CardModel("Card ${uid.takeLast(4)}", uid, sak, atqa)
-        scannedCardState = card
-        if (savedCardsState.none { it.uid.equals(uid, true) }) {
-            savedCardsState = savedCardsState + card
-            saveCards(savedCardsState)
-            Toast.makeText(this, "读取成功，已自动加入卡片", Toast.LENGTH_SHORT).show()
-            AppLogger.i("CARD: READ_AND_SAVED uid=$uid sak=$sak atqa=$atqa")
-        } else {
-            Toast.makeText(this, "读取成功，该卡片已存在", Toast.LENGTH_SHORT).show()
-            AppLogger.i("CARD: READ_EXISTING uid=$uid sak=$sak atqa=$atqa")
-        }
+        scannedCardState = CardModel("Card ${uid.takeLast(4)}", uid, sak, atqa)
+        AppLogger.i("CARD: READ uid=$uid sak=$sak atqa=$atqa")
         stopReadMode("card_read_complete")
+    }
+
+    private fun saveScannedCard(card: CardModel) {
+        if (savedCardsState.any { it.uid.equals(card.uid, true) }) {
+            Toast.makeText(this, "该卡片已经保存", Toast.LENGTH_SHORT).show()
+            return
+        }
+        savedCardsState = savedCardsState + card
+        saveCards(savedCardsState)
+        AppLogger.i("CARD: SAVED uid=${card.uid} sak=${card.sak} atqa=${card.atqa}")
+        Toast.makeText(this, "卡片已保存", Toast.LENGTH_SHORT).show()
     }
 
     @OptIn(ExperimentalMaterial3Api::class)
@@ -183,6 +186,7 @@ class MainActivity : ComponentActivity() {
         var diagnosticRunning by remember { mutableStateOf(false) }
         var reloadRunning by remember { mutableStateOf(false) }
         var reloadMessage by remember { mutableStateOf<String?>(null) }
+        var expandedUid by remember { mutableStateOf<String?>(null) }
         val logListState = rememberLazyListState()
 
         LaunchedEffect(selectedSource) {
@@ -241,17 +245,25 @@ class MainActivity : ComponentActivity() {
                         readMode = readModeEnabled,
                         simulationActive = status.simulationEnabled,
                         onStartRead = { startReadMode() },
-                        onStopRead = { stopReadMode() }
+                        onStopRead = { stopReadMode() },
+                        onSave = { saveScannedCard(it) },
+                        onClear = { scannedCardState = null }
                     )
                 }
 
                 item { Text("已保存卡片 (${cards.size})", modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp), fontWeight = FontWeight.Bold) }
                 if (cards.isEmpty()) {
-                    item { Text("暂无保存卡片。进入读卡模式后贴卡，读取成功会自动加入。", modifier = Modifier.padding(12.dp), fontSize = 12.sp, color = Color.Gray) }
+                    item { Text("暂无保存卡片。进入读卡模式后贴卡，确认信息无误再保存。", modifier = Modifier.padding(12.dp), fontSize = 12.sp, color = Color.Gray) }
                 } else {
                     items(cards, key = { it.uid }) { card ->
                         val active = status.simulationEnabled && card.uid.equals(status.selectedUid, true)
-                        CardItem(card, active,
+                        CardItem(
+                            card = card,
+                            isActive = active,
+                            expanded = expandedUid?.equals(card.uid, true) == true,
+                            onToggleDetails = {
+                                expandedUid = if (expandedUid?.equals(card.uid, true) == true) null else card.uid
+                            },
                             onSimulate = {
                                 stopReadMode("simulation_start")
                                 simulateCardFullChain(card)
@@ -264,8 +276,10 @@ class MainActivity : ComponentActivity() {
                             onDelete = {
                                 if (active) disableSimulation()
                                 savedCardsState = savedCardsState.filterNot { it.uid.equals(card.uid, true) }
+                                if (expandedUid?.equals(card.uid, true) == true) expandedUid = null
                                 saveCards(savedCardsState)
-                            })
+                            }
+                        )
                     }
                 }
 
@@ -330,7 +344,15 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun ReadCardPanel(card: CardModel?, readMode: Boolean, simulationActive: Boolean, onStartRead: () -> Unit, onStopRead: () -> Unit) {
+    private fun ReadCardPanel(
+        card: CardModel?,
+        readMode: Boolean,
+        simulationActive: Boolean,
+        onStartRead: () -> Unit,
+        onStopRead: () -> Unit,
+        onSave: (CardModel) -> Unit,
+        onClear: () -> Unit
+    ) {
         Card(modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp)) {
             Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Text("读卡模式", fontWeight = FontWeight.Bold)
@@ -340,19 +362,36 @@ class MainActivity : ComponentActivity() {
                         Button(onClick = {}, enabled = false, modifier = Modifier.fillMaxWidth()) { Text("模拟中 · 读卡已关闭") }
                     }
                     readMode -> {
-                        Text("读卡已开启，请把门禁卡贴到手机背部。读取成功后会自动加入并退出读卡模式。", fontSize = 12.sp)
+                        Text("读卡已开启，请把门禁卡贴到手机背部。读取成功后会退出读卡模式并显示卡片信息。", fontSize = 12.sp)
                         OutlinedButton(onClick = onStopRead, modifier = Modifier.fillMaxWidth()) { Text("退出读卡模式") }
                     }
-                    else -> {
+                    card == null -> {
                         Text("默认不读取卡片。需要添加新卡时再进入读卡模式。", fontSize = 12.sp)
                         Button(onClick = onStartRead, modifier = Modifier.fillMaxWidth()) { Text("进入读卡模式") }
                     }
-                }
-                card?.let {
-                    Text("最近读取: ${it.uid}", color = Color(0xFF2E7D32), fontWeight = FontWeight.Bold, fontSize = 12.sp)
-                    Text("SAK ${it.sak} · ATQA ${it.atqa} · 已自动加入", fontFamily = FontFamily.Monospace, fontSize = 10.sp)
+                    else -> {
+                        Text("读取成功", color = Color(0xFF2E7D32), fontWeight = FontWeight.Bold)
+                        CardDetails(card)
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(onClick = { onSave(card) }, modifier = Modifier.weight(1f)) { Text("保存卡片") }
+                            OutlinedButton(onClick = { onClear(); onStartRead() }, modifier = Modifier.weight(1f)) { Text("重新读取") }
+                        }
+                        TextButton(onClick = onClear, modifier = Modifier.fillMaxWidth()) { Text("关闭读取结果") }
+                    }
                 }
             }
+        }
+    }
+
+    @Composable
+    private fun CardDetails(card: CardModel) {
+        Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+            Text("名称: ${card.name}", fontSize = 12.sp)
+            Text("UID: ${card.uid}", fontFamily = FontFamily.Monospace, fontSize = 12.sp)
+            Text("SAK: ${card.sak}", fontFamily = FontFamily.Monospace, fontSize = 12.sp)
+            Text("ATQA: ${card.atqa}", fontFamily = FontFamily.Monospace, fontSize = 12.sp)
+            Text("UID 长度: ${card.uid.replace(Regex("[^0-9A-Fa-f]"), "").length / 2} bytes", fontSize = 11.sp, color = Color.Gray)
+            Text("类型: ISO/IEC 14443 Type A", fontSize = 11.sp, color = Color.Gray)
         }
     }
 
@@ -366,18 +405,32 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun CardItem(card: CardModel, isActive: Boolean, onSimulate: () -> Unit, onStop: () -> Unit, onDelete: () -> Unit) {
-        Card(modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 3.dp)) {
-            Row(modifier = Modifier.padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(card.name, fontWeight = FontWeight.Bold)
-                    Text("UID ${card.uid}", fontSize = 10.sp, color = Color.Gray)
-                    Text("SAK ${card.sak} · ATQA ${card.atqa}", fontSize = 9.sp, color = Color.Gray)
+    private fun CardItem(
+        card: CardModel,
+        isActive: Boolean,
+        expanded: Boolean,
+        onToggleDetails: () -> Unit,
+        onSimulate: () -> Unit,
+        onStop: () -> Unit,
+        onDelete: () -> Unit
+    ) {
+        Card(modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 3.dp).clickable { onToggleDetails() }) {
+            Column(modifier = Modifier.padding(8.dp), verticalArrangement = Arrangement.spacedBy(5.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(card.name, fontWeight = FontWeight.Bold)
+                        Text("UID ${card.uid}", fontSize = 10.sp, color = Color.Gray)
+                        Text(if (expanded) "点击收起详情" else "点击查看详情", fontSize = 9.sp, color = Color.Gray)
+                    }
+                    if (isActive) Button(onClick = onStop, contentPadding = PaddingValues(horizontal = 10.dp)) { Text("停止模拟", fontSize = 10.sp) }
+                    else Button(onClick = onSimulate, contentPadding = PaddingValues(horizontal = 10.dp)) { Text("模拟", fontSize = 10.sp) }
+                    Spacer(Modifier.width(4.dp))
+                    TextButton(onClick = onDelete, contentPadding = PaddingValues(horizontal = 6.dp)) { Text("删除", fontSize = 10.sp) }
                 }
-                if (isActive) Button(onClick = onStop, contentPadding = PaddingValues(horizontal = 10.dp)) { Text("停止模拟", fontSize = 10.sp) }
-                else Button(onClick = onSimulate, contentPadding = PaddingValues(horizontal = 10.dp)) { Text("模拟", fontSize = 10.sp) }
-                Spacer(Modifier.width(4.dp))
-                TextButton(onClick = onDelete, contentPadding = PaddingValues(horizontal = 6.dp)) { Text("删除", fontSize = 10.sp) }
+                if (expanded) {
+                    HorizontalDivider()
+                    CardDetails(card)
+                }
             }
         }
     }
