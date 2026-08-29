@@ -46,18 +46,15 @@ class ConfigProvider : ContentProvider() {
     ): Cursor {
         val prefs = context!!.getSharedPreferences("nfc_config", 0)
         val cursor = MatrixCursor(arrayOf("key", "value"))
-        prefs.all.forEach { (key, value) ->
-            cursor.addRow(arrayOf(key, value?.toString() ?: ""))
-        }
+        prefs.all.forEach { (key, value) -> cursor.addRow(arrayOf(key, value?.toString() ?: "")) }
         return cursor
     }
 
-    override fun insert(uri: Uri, values: ContentValues?): Uri? {
+    override fun insert(uri: Uri, values: ContentValues?): Uri {
         if (values == null) return uri
         val editor = context!!.getSharedPreferences("nfc_config", 0).edit()
         values.keySet().forEach { key ->
-            val value = values.get(key)
-            when (value) {
+            when (val value = values.get(key)) {
                 is Boolean -> editor.putBoolean(key, value)
                 is Int -> editor.putInt(key, value)
                 is Long -> editor.putLong(key, value)
@@ -72,8 +69,9 @@ class ConfigProvider : ContentProvider() {
     }
 
     override fun update(uri: Uri, values: ContentValues?, selection: String?, selectionArgs: Array<out String>?): Int {
+        if (values == null) return 0
         insert(uri, values)
-        return values?.size() ?: 0
+        return values.size()
     }
 
     override fun delete(uri: Uri, selection: String?, selectionArgs: Array<out String>?): Int {
