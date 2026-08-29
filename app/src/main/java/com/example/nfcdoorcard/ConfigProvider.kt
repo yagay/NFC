@@ -5,6 +5,9 @@ import android.content.ContentValues
 import android.database.Cursor
 import android.database.MatrixCursor
 import android.net.Uri
+import android.os.Binder
+import android.os.Process
+import android.util.Log
 
 class ConfigProvider : ContentProvider() {
     companion object {
@@ -15,6 +18,7 @@ class ConfigProvider : ContentProvider() {
         const val KEY_APP_BUILD = "app_build"
         const val KEY_HOOK_BUILD = "hook_build"
         const val KEY_SIMULATION_ENABLED = "simulation_enabled"
+        const val KEY_DIAGNOSTIC_LOGGING_ENABLED = "diagnostic_logging_enabled"
         const val KEY_UID = "uid"
         const val KEY_SAK = "sak"
         const val KEY_ATQA = "atqa"
@@ -82,6 +86,10 @@ class ConfigProvider : ContentProvider() {
 
     override fun insert(uri: Uri, values: ContentValues?): Uri {
         if (values == null) return uri
+        if (!isTrustedWriter()) {
+            Log.w("NfcConfigProvider", "Rejected config write from uid=${Binder.getCallingUid()}")
+            return uri
+        }
         val prefs = context!!.getSharedPreferences("nfc_config", 0)
         val editor = prefs.edit()
         values.keySet().forEach { key ->
@@ -105,12 +113,13 @@ class ConfigProvider : ContentProvider() {
         selection: String?,
         selectionArgs: Array<out String>?
     ): Int {
-        if (values == null) return 0
+        if (values == null || !isTrustedWriter()) return 0
         insert(uri, values)
         return values.size()
     }
 
     override fun delete(uri: Uri, selection: String?, selectionArgs: Array<out String>?): Int {
+        if (!isTrustedWriter()) return 0
         context!!.getSharedPreferences("nfc_config", 0)
             .edit()
             .clear()
@@ -118,6 +127,13 @@ class ConfigProvider : ContentProvider() {
             .apply()
         context?.contentResolver?.notifyChange(uri, null)
         return 1
+    }
+
+    private fun isTrustedWriter(): Boolean {
+        val callingUid = Binder.getCallingUid()
+        if (callingUid == Process.myUid()) return true
+        val packages = runCatching { context?.packageManager?.getPackagesForUid(callingUid) }.getOrNull()
+        return packages?.any { it == "com.android.nfc" } == true
     }
 
     override fun getType(uri: Uri): String = "vnd.android.cursor.dir/vnd.$AUTHORITY.settings"
