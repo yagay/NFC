@@ -1,47 +1,48 @@
 plugins {
-    id("com.android.application")
-    id("org.jetbrains.kotlin.android")
-    id("org.jetbrains.kotlin.plugin.compose")
+    id("com.android.application") version "8.7.3"
+    id("org.jetbrains.kotlin.android") version "2.1.0"
+    id("org.jetbrains.kotlin.plugin.compose") version "2.1.0"
 }
 
 android {
     namespace = "com.example.nfcdoorcard"
-    compileSdk = 34
+    compileSdk = 35
 
     defaultConfig {
         applicationId = "com.example.nfcdoorcard"
         minSdk = 31
-        targetSdk = 34
-        versionCode = 5
-        versionName = "1.0.4"
-    }
-
-    buildTypes {
-        release {
-            isMinifyEnabled = false
-        }
+        targetSdk = 35
+        versionCode = 6
+        versionName = "1.0.5"
     }
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
+
     kotlinOptions {
         jvmTarget = "17"
     }
+
     buildFeatures {
         compose = true
+        buildConfig = true
+    }
+
+    packaging {
+        resources.excludes += "/META-INF/{AL2.0,LGPL2.1}"
     }
 }
 
 dependencies {
-    implementation("androidx.core:core-ktx:1.12.0")
-    implementation("androidx.appcompat:appcompat:1.6.1")
-    implementation("androidx.activity:activity-compose:1.8.2")
-    implementation(platform("androidx.compose:compose-bom:2024.02.00"))
-    implementation("androidx.compose.ui:ui")
-    implementation("androidx.compose.ui:ui-graphics")
+    implementation("androidx.core:core-ktx:1.15.0")
+    implementation("androidx.activity:activity-compose:1.10.0")
+    implementation(platform("androidx.compose:compose-bom:2025.01.00"))
     implementation("androidx.compose.material3:material3")
-    implementation("com.google.code.gson:gson:2.10.1")
-    compileOnly("io.github.libxposed:api:102.0.0")
+    implementation("androidx.compose.ui:ui")
+    implementation("androidx.compose.ui:ui-tooling-preview")
+    implementation("com.google.code.gson:gson:2.11.0")
+    compileOnly("io.github.libxposed:api:102")
+    debugImplementation("androidx.compose.ui:ui-tooling")
 }
