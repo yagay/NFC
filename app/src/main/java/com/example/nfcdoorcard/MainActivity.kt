@@ -20,9 +20,6 @@ import androidx.compose.ui.unit.dp
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
 import java.io.File
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 import java.util.concurrent.Executors
 
 class MainActivity : ComponentActivity() {
@@ -93,6 +90,7 @@ class MainActivity : ComponentActivity() {
         AppLogger.i("CARD: READ uid=$uid sak=$sak atqa=$atqa")
     }
 
+    @OptIn(ExperimentalMaterial3Api::class)
     @Composable
     private fun AppUi() {
         MaterialTheme {
@@ -289,7 +287,6 @@ class MainActivity : ComponentActivity() {
             repeat(20) {
                 Thread.sleep(250)
                 state = readRuntimeStatus()
-                if (state.scopeOk && state.hookInstalled) return@repeat
             }
             val oldPid = Regex("OLD_PID=(\\d+)").find(result)?.groupValues?.getOrNull(1)
             val newPid = Regex("NEW_PID=(\\d+)").find(result)?.groupValues?.getOrNull(1)
@@ -413,7 +410,7 @@ class MainActivity : ComponentActivity() {
                 appendLine(runRootCmd("logcat -d -v threadtime 2>/dev/null | grep -E 'NfcUIDSim|NFCID1|LA_NFCID1|CORE_SET_CONFIG|setHceTypeAConfig' | tail -n 700"))
                 appendLine()
                 appendLine("--- APP LOG ---")
-                appendLine(AppLogger.dump())
+                appendLine(AppLogger.readAll())
             }
             val file = File(getExternalFilesDir(null), "nfc_fullcheck_v12.txt")
             file.writeText(report)
