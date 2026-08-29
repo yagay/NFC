@@ -1,2 +1,3 @@
 com.example.nfcdoorcard.xposed.NfcInjectionModule
 com.example.nfcdoorcard.xposed.VendorBinderMetadataModule
+com.example.nfcdoorcard.xposed.VendorNameObserverModule
