@@ -37,10 +37,10 @@ class VendorNfcBinderTestActivity : ComponentActivity() {
         output = TextView(this).apply {
             textSize = 12f
             setTextIsSelectable(true)
-            text = "V3 会由 App UID 直接对 NFC 主 Binder 发送只读 _EXT transaction。\n不会调用 root，也不会自动打开分享页。\n\n请先在主界面启动目标卡模拟，再开始测试。"
+            text = "V4 会由 App UID 直接从 ServiceManager 获取 NFC 主 Binder，再发送只读 _EXT transaction。\n不会调用 root，也不会自动打开分享页。\n\n请先在主界面启动目标卡模拟，再开始测试。"
         }
         runButton = Button(this).apply {
-            text = "开始一次完整测试 V3"
+            text = "开始一次完整测试 V4"
             setOnClickListener { runTest() }
         }
 
@@ -64,7 +64,7 @@ class VendorNfcBinderTestActivity : ComponentActivity() {
         output.text = "测试中..."
         executor.execute {
             val report = buildString {
-                appendLine("=== VENDOR NFC BINDER ONE-SHOT TEST V3 ===")
+                appendLine("=== VENDOR NFC BINDER ONE-SHOT TEST V4 ===")
                 appendLine("time=${System.currentTimeMillis()}")
                 appendLine("app_uid=${Process.myUid()} app_pid=${Process.myPid()} package=$packageName")
 
@@ -80,7 +80,7 @@ class VendorNfcBinderTestActivity : ComponentActivity() {
 
                 runCatching {
                     contentResolver.insert(ConfigProvider.URI, ContentValues().apply {
-                        put(ConfigProvider.KEY_RF_STATUS, "WAITING_BINDER_TEST_V3")
+                        put(ConfigProvider.KEY_RF_STATUS, "WAITING_BINDER_TEST_V4")
                         put(ConfigProvider.KEY_RF_UID, "")
                         put(ConfigProvider.KEY_RF_RESULT, "")
                         put(ConfigProvider.KEY_RF_ERROR, "")
@@ -88,15 +88,23 @@ class VendorNfcBinderTestActivity : ComponentActivity() {
                     })
                 }.onFailure { appendLine("provider_reset_error=${describeThrowable(it)}") }
 
-                val nfcService = try {
+                val defaultAdapter = runCatching { NfcAdapter.getDefaultAdapter(this@VendorNfcBinderTestActivity) }.getOrNull()
+                appendLine("NFC_ADAPTER_INIT=${defaultAdapter?.javaClass?.name ?: "null"}")
+
+                val serviceBinder = getNfcServiceBinder(this)
+                val reflectedService = try {
                     NfcAdapter::class.java.getDeclaredField("sService").apply { isAccessible = true }.get(null)
                 } catch (t: Throwable) {
-                    appendLine("DISCOVERY_A_ERROR=${describeThrowable(t)}")
+                    appendLine("DISCOVERY_REFLECT_ERROR=${describeThrowable(t)}")
                     null
                 }
-                appendLine("DISCOVERY_A:NfcAdapter.sService=${nfcService?.javaClass?.name}")
+                appendLine("DISCOVERY_REFLECT:NfcAdapter.sService=${reflectedService?.javaClass?.name}")
+                val reflectedBinder = asBinder(reflectedService)
+                if (reflectedBinder != null) {
+                    appendLine("REFLECT_BINDER=${reflectedBinder.javaClass.name} descriptor=${runCatching { reflectedBinder.interfaceDescriptor }.getOrNull().orEmpty()}")
+                }
 
-                val mainBinder = asBinder(nfcService)
+                val mainBinder = serviceBinder ?: reflectedBinder
                 if (mainBinder == null) {
                     appendLine("RESULT=TEST_FAIL stage=MAIN_BINDER reason=cannot_obtain_INfcAdapter_binder")
                     return@buildString
@@ -104,6 +112,10 @@ class VendorNfcBinderTestActivity : ComponentActivity() {
 
                 val mainDesc = runCatching { mainBinder.interfaceDescriptor }.getOrNull().orEmpty()
                 appendLine("MAIN_BINDER=${mainBinder.javaClass.name} descriptor=$mainDesc")
+                if (mainDesc != "android.nfc.INfcAdapter") {
+                    appendLine("RESULT=TEST_FAIL stage=MAIN_BINDER_DESCRIPTOR reason=unexpected_descriptor")
+                    return@buildString
+                }
                 appendLine("EXT_TRANSACTION=0x${EXTENSION_TRANSACTION.toString(16).uppercase()}")
 
                 val ext = queryExtension(mainBinder, this)
@@ -163,12 +175,26 @@ class VendorNfcBinderTestActivity : ComponentActivity() {
                 appendLine("RESULT=${if (enterResult == true && rfApplied) "TEST_PASS" else "TEST_FAIL_CALL_OR_RF"}")
             }
 
-            AppLogger.i("VENDOR_BINDER_TEST_V3:\n$report")
+            AppLogger.i("VENDOR_BINDER_TEST_V4:\n$report")
             runCatching { File(cacheDir, "vendor_nfc_binder_test.txt").writeText(report) }
             runOnUiThread {
                 output.text = report
                 runButton.isEnabled = true
             }
+        }
+    }
+
+    private fun getNfcServiceBinder(log: StringBuilder): IBinder? {
+        return try {
+            val sm = Class.forName("android.os.ServiceManager")
+            val getService = sm.getDeclaredMethod("getService", String::class.java).apply { isAccessible = true }
+            val binder = getService.invoke(null, "nfc") as? IBinder
+            val desc = binder?.let { runCatching { it.interfaceDescriptor }.getOrNull().orEmpty() }.orEmpty()
+            log.appendLine("SERVICE_MANAGER:nfc binder=${binder?.javaClass?.name ?: "null"} descriptor=$desc")
+            binder
+        } catch (t: Throwable) {
+            log.appendLine("SERVICE_MANAGER_ERROR=${describeThrowable(t)}")
+            null
         }
     }
 
