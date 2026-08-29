@@ -11,6 +11,8 @@ import com.example.nfcdoorcard.xposed.adapter.NfcStackAdapter;
 import com.example.nfcdoorcard.xposed.adapter.OplusNxpAdapter;
 
 import java.lang.reflect.Method;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Locale;
 
 import io.github.libxposed.api.XposedModule;
@@ -22,12 +24,18 @@ public class NfcInjectionModule extends XposedModule {
     private static final int HOOK_BUILD = 9;
     private static final Uri CONFIG_URI = Uri.parse("content://com.example.nfcdoorcard.config/settings");
 
+    private static final String[] REFRESH_PROBE_CLASSES = new String[]{
+            "com.android.nfc.VendorNfcService",
+            "com.android.nfc.NfcService"
+    };
+
     private final NfcStackAdapter[] adapters = new NfcStackAdapter[]{
             new OplusNxpAdapter()
     };
 
     private volatile boolean disabledAfterFailure;
     private volatile NfcStackAdapter activeAdapter;
+    private volatile int refreshProbeEventCount;
 
     @Override
     public void onModuleLoaded(XposedModuleInterface.ModuleLoadedParam param) {
@@ -52,6 +60,8 @@ public class NfcInjectionModule extends XposedModule {
         }
         activeAdapter = adapter;
 
+        installRefreshProbes(cl, pid);
+
         try {
             Method method = adapter.resolveInjectionMethod(cl);
             hook(method).intercept(chain -> {
@@ -62,6 +72,10 @@ public class NfcInjectionModule extends XposedModule {
                 if (!cfg.active || cfg.uid == null || disabledAfterFailure) return chain.proceed();
 
                 String uidHex = cfg.uid.replaceAll("[^0-9A-Fa-f]", "").toUpperCase(Locale.ROOT);
+                String caller = compactCallStack();
+                Log.i(TAG, "RFPROBE: CHANGE_RF_CALLER pid=" + pid + " uid=" + uidHex + " stack=" + caller);
+                persistRfCaller(pid, caller);
+
                 if (uidHex.length() != 8) {
                     writeRfStatus("UID_INVALID", uidHex, "UID must be 4 bytes", "");
                     return chain.proceed();
@@ -98,6 +112,102 @@ public class NfcInjectionModule extends XposedModule {
                     t.getClass().getSimpleName() + ": " + t.getMessage(), t);
             reportStatusWithRetry(pid, false, 0, "HOOK_FAILED", t.getClass().getSimpleName() + ": " + t.getMessage(), adapter.id());
         }
+    }
+
+    private void installRefreshProbes(ClassLoader cl, int pid) {
+        List<String> installed = new ArrayList<>();
+        for (String className : REFRESH_PROBE_CLASSES) {
+            try {
+                Class<?> clazz = Class.forName(className, false, cl);
+                for (Method candidate : clazz.getDeclaredMethods()) {
+                    if (!isRefreshProbeCandidate(candidate)) continue;
+                    String signature = methodSignature(candidate);
+                    try {
+                        hook(candidate).intercept(chain -> {
+                            int event = ++refreshProbeEventCount;
+                            String enter = "ENTER " + signature + " event=" + event + " thread=" + Thread.currentThread().getName();
+                            Log.i(TAG, "RFPROBE: " + enter);
+                            persistRefreshProbeEvent(pid, enter);
+                            Object result = chain.proceed();
+                            String exit = "EXIT " + signature + " event=" + event + " result=" + summarizeResult(result);
+                            Log.i(TAG, "RFPROBE: " + exit);
+                            persistRefreshProbeEvent(pid, exit);
+                            return result;
+                        });
+                        installed.add(signature);
+                        Log.i(TAG, "RFPROBE: CANDIDATE INSTALLED " + signature);
+                    } catch (Throwable t) {
+                        Log.w(TAG, "RFPROBE: hook candidate failed " + signature + " " + t.getClass().getSimpleName() + ": " + t.getMessage());
+                    }
+                }
+            } catch (Throwable t) {
+                Log.i(TAG, "RFPROBE: class unavailable " + className + " " + t.getClass().getSimpleName());
+            }
+        }
+
+        String candidates = String.join(" | ", installed);
+        ContentValues v = new ContentValues();
+        v.put("refresh_probe_count", installed.size());
+        v.put("refresh_probe_candidates", candidates);
+        v.put("refresh_probe_last", "INSTALLED");
+        v.put("refresh_probe_pid", pid);
+        writeValuesWithRetry(v, 30, 200L);
+        Log.i(TAG, "RFPROBE: READY candidates=" + installed.size() + " " + candidates);
+    }
+
+    private boolean isRefreshProbeCandidate(Method method) {
+        String name = method.getName().toLowerCase(Locale.ROOT);
+        if (name.equals("applyprerfconfig")) return true;
+        if (name.contains("transitconfig")) return true;
+        if (name.contains("routing") && (name.contains("apply") || name.contains("update") || name.contains("commit") || name.contains("configure"))) return true;
+        if (name.contains("discovery") && (name.contains("start") || name.contains("stop") || name.contains("enable") || name.contains("disable") || name.contains("restart") || name.contains("update"))) return true;
+        return name.contains("rf") && name.contains("config") && !name.equals("changerfparamsbyconfig");
+    }
+
+    private String methodSignature(Method method) {
+        StringBuilder sb = new StringBuilder();
+        sb.append(method.getDeclaringClass().getName()).append('#').append(method.getName()).append('(');
+        Class<?>[] types = method.getParameterTypes();
+        for (int i = 0; i < types.length; i++) {
+            if (i > 0) sb.append(',');
+            sb.append(types[i].getSimpleName());
+        }
+        return sb.append(')').toString();
+    }
+
+    private String compactCallStack() {
+        StringBuilder sb = new StringBuilder();
+        int kept = 0;
+        for (StackTraceElement e : Thread.currentThread().getStackTrace()) {
+            String c = e.getClassName();
+            if (c.equals(Thread.class.getName()) || c.equals(NfcInjectionModule.class.getName())) continue;
+            if (c.startsWith("java.") || c.startsWith("android.") || c.startsWith("io.github.libxposed.")) continue;
+            if (kept++ > 0) sb.append(" <- ");
+            sb.append(c).append('#').append(e.getMethodName()).append(':').append(e.getLineNumber());
+            if (kept >= 8) break;
+        }
+        return sb.length() == 0 ? "unknown" : sb.toString();
+    }
+
+    private String summarizeResult(Object result) {
+        if (result == null) return "null/void";
+        String s = String.valueOf(result);
+        return s.length() > 80 ? s.substring(0, 80) + "..." : s;
+    }
+
+    private void persistRefreshProbeEvent(int pid, String event) {
+        ContentValues v = new ContentValues();
+        v.put("refresh_probe_events", refreshProbeEventCount);
+        v.put("refresh_probe_last", event);
+        v.put("refresh_probe_pid", pid);
+        writeValuesWithRetry(v, 8, 100L);
+    }
+
+    private void persistRfCaller(int pid, String caller) {
+        ContentValues v = new ContentValues();
+        v.put("rf_caller", caller);
+        v.put("rf_caller_pid", pid);
+        writeValuesWithRetry(v, 8, 100L);
     }
 
     private NfcStackAdapter selectAdapter(ClassLoader cl, int pid) {
@@ -149,18 +259,24 @@ public class NfcInjectionModule extends XposedModule {
     }
 
     private void writeValuesWithRetry(ContentValues values, int attempts, long delayMs) {
+        ContentValues copy = new ContentValues(values);
         Thread t = new Thread(() -> {
             for (int i = 0; i < attempts; i++) {
                 Application app = currentApplication();
                 if (app != null) {
                     try {
-                        app.getContentResolver().insert(CONFIG_URI, values);
+                        app.getContentResolver().insert(CONFIG_URI, copy);
                         return;
                     } catch (Throwable e) {
                         Log.w(TAG, "status write attempt " + (i + 1) + " failed: " + e.getMessage());
                     }
                 }
-                try { Thread.sleep(delayMs); } catch (InterruptedException e) { return; }
+                try {
+                    Thread.sleep(delayMs);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
             }
             Log.w(TAG, "status write gave up after " + attempts + " attempts");
         }, "NfcUIDSim-StateSync");
@@ -208,6 +324,7 @@ public class NfcInjectionModule extends XposedModule {
     private static final class SimConfig {
         final boolean active;
         final String uid;
+
         SimConfig(boolean active, String uid) {
             this.active = active;
             this.uid = uid;
