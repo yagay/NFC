@@ -1,22 +1,24 @@
 package com.example.nfcdoorcard
 
 import java.text.SimpleDateFormat
-import java.util.*
+import java.util.Date
+import java.util.Locale
 
 object AppLogger {
-    private val logs = mutableListOf<String>()
-    private val dateFormat = SimpleDateFormat("HH:mm:ss.SSS", Locale.getDefault())
+    private val lines = mutableListOf<String>()
+    private val format = SimpleDateFormat("HH:mm:ss.SSS", Locale.ROOT)
 
-    fun i(msg: String) {
-        val time = dateFormat.format(Date())
-        val line = "[$time] APP: $msg"
-        logs.add(line)
-        if (logs.size > 1000) logs.removeAt(0)
+    @Synchronized
+    fun i(message: String) {
+        val line = "[${format.format(Date())}] APP: $message"
+        lines += line
+        if (lines.size > 1000) lines.removeAt(0)
+        android.util.Log.i("NfcDoorCard", message)
     }
 
-    fun getAllLogs(): String = logs.joinToString("\n")
+    @Synchronized
+    fun readAll(): String = lines.joinToString("\n")
 
-    fun clear() {
-        logs.clear()
-    }
+    @Synchronized
+    fun clear() = lines.clear()
 }
