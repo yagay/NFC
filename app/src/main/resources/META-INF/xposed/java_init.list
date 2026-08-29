@@ -1,1 +1,1 @@
-com.example.nfcdoorcard.XposedEntry
+com.example.nfcdoorcard.xposed.NfcDiagnosticsModule
