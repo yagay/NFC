@@ -29,7 +29,6 @@ import io.github.libxposed.api.XposedModuleInterface;
 public class NfcDiagnosticsModule extends XposedModule {
     private static final String TAG = "NfcUIDSim";
     private static final Uri CONFIG_URI = Uri.parse("content://com.example.nfcdoorcard.config/settings");
-
     private static final int PARAM_LA_NFCID1 = 0x33;
 
     private static final String KEY_SIMULATION_ENABLED = "simulation_enabled";
@@ -48,6 +47,7 @@ public class NfcDiagnosticsModule extends XposedModule {
     private static final String KEY_RF_STATUS = "rf_status";
     private static final String KEY_RF_UID = "rf_uid";
     private static final String KEY_RF_SOURCE = "rf_source";
+    private static final String KEY_RF_RESULT = "rf_result";
     private static final String KEY_RF_ERROR = "rf_error";
 
     @Override
@@ -220,7 +220,7 @@ public class NfcDiagnosticsModule extends XposedModule {
                         boolean success = !(result instanceof Boolean) || Boolean.TRUE.equals(result);
                         writeStatus(values(
                                 KEY_RF_STATUS, success ? "RF_CONFIG_ACCEPTED" : "FAILED",
-                                KEY_RF_RESULT_KEY(), String.valueOf(result),
+                                KEY_RF_RESULT, String.valueOf(result),
                                 KEY_RF_ERROR, success ? "" : "RF config returned false"
                         ));
                         info("RF: CONFIG " + (success ? "ACCEPTED" : "FAILED")
@@ -249,10 +249,6 @@ public class NfcDiagnosticsModule extends XposedModule {
         return false;
     }
 
-    /**
-     * Searches for a simple NCI TLV representation [tag][len][value...].
-     * We only rewrite an already present 0x33 TLV; we never fabricate a packet.
-     */
     private Nfcid1Tlv findNfcid1Tlv(byte[] data) {
         if (data == null || data.length < 2) return null;
         for (int i = 0; i + 1 < data.length; i++) {
@@ -304,8 +300,6 @@ public class NfcDiagnosticsModule extends XposedModule {
             if (cursor != null) cursor.close();
         }
     }
-
-    private String KEY_RF_RESULT_KEY() { return "rf_result"; }
 
     private ContentValues values(Object... pairs) {
         ContentValues values = new ContentValues();
