@@ -1,8 +1,0 @@
-name=NFC 门禁诊断
-author=Developer
-description=NFC / LSPosed 诊断与 UID 测试配置（不写入控制器固定 UID）
-minApiVersion=102
-targetApiVersion=102
-staticScope=true
-exceptionMode=protective
-autoHotReload=false
