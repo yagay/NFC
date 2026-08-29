@@ -28,10 +28,6 @@ public class NfcInjectionModule extends XposedModule {
     private static final Pattern HEX_TOKEN = Pattern.compile("(?i)(?<![0-9A-F])([0-9A-F]{2})(?![0-9A-F])");
     private volatile boolean disabledAfterFailure;
 
-    public NfcInjectionModule(XposedModuleInterface.ModuleLoadedParam param) {
-        super(param);
-    }
-
     @Override
     public void onModuleLoaded(XposedModuleInterface.ModuleLoadedParam param) {
         super.onModuleLoaded(param);
