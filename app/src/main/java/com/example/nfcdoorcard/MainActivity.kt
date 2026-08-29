@@ -1,7 +1,10 @@
 package com.example.nfcdoorcard
 
 import android.app.PendingIntent
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.ContentValues
+import android.content.Context
 import android.content.Intent
 import android.nfc.NfcAdapter
 import android.nfc.Tag
@@ -26,7 +29,6 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.core.content.FileProvider
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
 import java.io.File
@@ -70,6 +72,7 @@ class MainActivity : ComponentActivity() {
     private var pendingIntent: PendingIntent? = null
     private val gson = Gson()
     private val executor = Executors.newSingleThreadExecutor()
+    private val vendorNfcController = VendorNfcController()
     private var scannedCardState by mutableStateOf<CardModel?>(null)
     private var savedCardsState by mutableStateOf<List<CardModel>>(emptyList())
     private var readModeEnabled by mutableStateOf(false)
@@ -83,7 +86,7 @@ class MainActivity : ComponentActivity() {
             PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
         savedCardsState = loadCards()
-        AppLogger.i("NFC mode controller started")
+        AppLogger.i("NFC mode controller started; production vendor binder enabled")
         setContent { MaterialTheme { Surface(Modifier.fillMaxSize()) { NfcAppContent() } } }
     }
 
@@ -112,7 +115,8 @@ class MainActivity : ComponentActivity() {
 
     private fun startReadMode() {
         if (getSimulationEnabled()) {
-            Toast.makeText(this, "请先停止模拟，再进入读卡模式", Toast.LENGTH_SHORT).show(); return
+            Toast.makeText(this, "请先停止模拟，再进入读卡模式", Toast.LENGTH_SHORT).show()
+            return
         }
         scannedCardState = null
         readModeEnabled = true
@@ -145,7 +149,8 @@ class MainActivity : ComponentActivity() {
 
     private fun saveScannedCard(card: CardModel) {
         if (savedCardsState.any { it.uid.equals(card.uid, true) }) {
-            Toast.makeText(this, "该卡片已经保存", Toast.LENGTH_SHORT).show(); return
+            Toast.makeText(this, "该卡片已经保存", Toast.LENGTH_SHORT).show()
+            return
         }
         savedCardsState = savedCardsState + card
         saveCards(savedCardsState)
@@ -186,9 +191,9 @@ class MainActivity : ComponentActivity() {
                     TextButton(onClick = {
                         if (!diagnosticRunning) {
                             diagnosticRunning = true
-                            runOneTapDiagnosticAndShare { diagnosticRunning = false }
+                            saveDiagnosticWithoutSharing { diagnosticRunning = false }
                         }
-                    }) { Text(if (diagnosticRunning) "导出中" else "导出") }
+                    }) { Text(if (diagnosticRunning) "保存中" else "导出") }
                     TextButton(onClick = { AppLogger.clear(); logText = "" }) { Text("清空") }
                 }
             )
@@ -214,12 +219,12 @@ class MainActivity : ComponentActivity() {
                             card, active, expandedUid?.equals(card.uid, true) == true,
                             { expandedUid = if (expandedUid?.equals(card.uid, true) == true) null else card.uid },
                             {
-                                operationMessage = "正在应用 UID ${card.uid}，NFC 保持开启..."
+                                operationMessage = "正在直接应用 UID ${card.uid}..."
                                 simulateCard(card) { newStatus, message -> runOnUiThread { status = newStatus; operationMessage = message } }
                                 status = status.copy(simulationEnabled = true, selectedUid = card.uid, rfStatus = "WAITING")
                             },
                             {
-                                operationMessage = "正在停止模拟并恢复原始 NFC 配置..."
+                                operationMessage = "正在停止模拟并恢复默认 RF..."
                                 stopSimulation { newStatus, message -> runOnUiThread { status = newStatus; operationMessage = message } }
                                 status = status.copy(simulationEnabled = false, rfStatus = "IDLE")
                             },
@@ -254,7 +259,7 @@ class MainActivity : ComponentActivity() {
                                         line.contains("SUCCESS") || line.contains("APPLIED") || line.contains("ACCEPTED") || line.contains("READY") -> Color.Cyan
                                         line.contains("FAILED") || line.contains("ERROR") || line.contains("STALE") || line.contains("FATAL") -> Color.Red
                                         line.contains("WAITING") || line.contains("IDLE") -> Color.Yellow
-                                        line.contains("RF") || line.contains("NFCID1") || line.contains("NfcUIDSim") -> Color.Green
+                                        line.contains("RF") || line.contains("NFCID1") || line.contains("NfcUIDSim") || line.contains("VENDOR_BINDER") -> Color.Green
                                         else -> Color(0xFFD4D4D4)
                                     },
                                     fontSize = 9.sp, lineHeight = 11.sp, fontFamily = FontFamily.Monospace
@@ -278,6 +283,7 @@ class MainActivity : ComponentActivity() {
                 StatusRow("NFC / Hook", status.currentPid > 0 && status.hookInstalled, "pid=${status.currentPid} · hookBuild=${status.hookBuild} · hookPid=${status.hookPid}")
                 StatusRow("模拟配置", status.simulationEnabled, if (status.simulationEnabled) "UID=${status.selectedUid ?: "-"}" else "IDLE")
                 StatusRow("RF UID", status.rfStatus == "RF_UID_APPLIED", "${status.rfStatus} · uid=${status.rfUid ?: "-"} · result=${status.rfResult ?: "-"}")
+                Text("触发方式: Vendor Binder transaction 6 → 15", fontSize = 11.sp)
                 Text("读卡模式: ${if (readModeEnabled) "开启" else "关闭"}", fontSize = 11.sp)
                 operationMessage?.let { Text(it, fontSize = 11.sp, color = Color.Gray) }
                 status.rfError?.takeIf { it.isNotBlank() }?.let { Text("RF error: $it", fontSize = 10.sp, color = Color.Red) }
@@ -361,55 +367,95 @@ class MainActivity : ComponentActivity() {
     private fun simulateCard(card: CardModel, onDone: (RuntimeStatus, String) -> Unit) {
         stopReadMode("simulation_start")
         writeSimulationConfig(card)
-        AppLogger.i("SIMULATION: requested uid=${card.uid} sak=${card.sak} atqa=${card.atqa}")
+        AppLogger.i("SIMULATION: DIRECT_BINDER requested uid=${card.uid} sak=${card.sak} atqa=${card.atqa}")
         executor.execute {
-            val restart = restartNfcProcessKeepingEnabled("simulation")
-            AppLogger.i("SIMULATION: process restart\n$restart")
-            val state = waitForHookAndRf(card.uid, 14_000)
-            val message = when {
-                state.rfStatus == "RF_UID_APPLIED" && state.rfUid.equals(card.uid, true) -> "模拟已应用 · UID=${card.uid}"
-                !state.hookInstalled -> "NFC 已保持开启，但 Hook 尚未就绪"
-                else -> "Hook 已加载，等待 RF UID 应用"
+            var state = readRuntimeStatus()
+            var restarted = false
+
+            if (!state.hookInstalled || state.hookBuild != EXPECTED_HOOK_BUILD) {
+                val restart = restartNfcProcessKeepingEnabled("ensure_hook_before_direct_binder")
+                restarted = true
+                AppLogger.i("SIMULATION: fallback restart for stale hook\n$restart")
+                state = waitForHookOnly(10_000)
             }
-            AppLogger.i("SIMULATION: result $message\n${buildStatusSummary(state)}")
+
+            var binderResult = if (state.hookInstalled) {
+                vendorNfcController.setShareMode(true)
+            } else {
+                VendorNfcController.Result(false, true, "HOOK", "Hook not ready")
+            }
+            AppLogger.i("SIMULATION: VENDOR_BINDER enable success=${binderResult.success} stage=${binderResult.stage} detail=${binderResult.detail} descriptor=${binderResult.vendorDescriptor}")
+
+            if (!binderResult.success && !restarted) {
+                val restart = restartNfcProcessKeepingEnabled("binder_retry")
+                AppLogger.i("SIMULATION: binder retry restart\n$restart")
+                state = waitForHookOnly(10_000)
+                if (state.hookInstalled) {
+                    binderResult = vendorNfcController.setShareMode(true)
+                    AppLogger.i("SIMULATION: VENDOR_BINDER retry success=${binderResult.success} stage=${binderResult.stage} detail=${binderResult.detail}")
+                }
+            }
+
+            state = if (binderResult.success) waitForHookAndRf(card.uid, 5_000) else readRuntimeStatus()
+            val applied = binderResult.success && state.rfStatus == "RF_UID_APPLIED" && state.rfUid.equals(card.uid, true) && state.rfResult == "0"
+            val message = when {
+                applied -> "模拟已应用 · UID=${card.uid} · Binder直连"
+                !binderResult.success -> "Vendor Binder 调用失败 · ${binderResult.stage}: ${binderResult.detail}"
+                !state.hookInstalled -> "Binder 已返回，但 Hook 未就绪"
+                else -> "Binder 已触发，等待 RF UID 确认"
+            }
+            AppLogger.i("SIMULATION: DIRECT_BINDER result=$message\n${buildStatusSummary(state)}")
             onDone(state, message)
         }
     }
 
     private fun stopSimulation(onDone: (RuntimeStatus, String) -> Unit) {
         stopReadMode("simulation_stop")
+        // Important: turn injection off before asking the OEM service to restore default RF config.
         contentResolver.insert(ConfigProvider.URI, ContentValues().apply {
             put(ConfigProvider.KEY_SIMULATION_ENABLED, false)
-            put(ConfigProvider.KEY_RF_STATUS, "IDLE")
+            put(ConfigProvider.KEY_RF_STATUS, "STOPPING")
             put(ConfigProvider.KEY_RF_UID, "")
             put(ConfigProvider.KEY_RF_RESULT, "")
             put(ConfigProvider.KEY_RF_ERROR, "")
             put(ConfigProvider.KEY_FULL_DIAG_STAGE, "STOPPING")
-            put(ConfigProvider.KEY_FULL_DIAG_SUMMARY, "Restoring stock NFC config without disabling NFC")
+            put(ConfigProvider.KEY_FULL_DIAG_SUMMARY, "Disabling share mode through verified Vendor Binder")
         })
-        AppLogger.i("SIMULATION: stop requested")
+        AppLogger.i("SIMULATION: DIRECT_BINDER stop requested")
         executor.execute {
-            val restart = restartNfcProcessKeepingEnabled("stop_simulation")
-            AppLogger.i("SIMULATION: stop restart\n$restart")
-            val state = waitForHookOnly(10_000)
-            onDone(state, "模拟已停止，NFC 保持开启")
+            var result = vendorNfcController.setShareMode(false)
+            AppLogger.i("SIMULATION: VENDOR_BINDER disable success=${result.success} stage=${result.stage} detail=${result.detail}")
+
+            if (!result.success) {
+                val restart = restartNfcProcessKeepingEnabled("stop_fallback")
+                AppLogger.i("SIMULATION: stop fallback restart\n$restart")
+                waitForHookOnly(10_000)
+                result = vendorNfcController.setShareMode(false)
+                AppLogger.i("SIMULATION: VENDOR_BINDER disable retry success=${result.success} stage=${result.stage} detail=${result.detail}")
+            }
+
+            contentResolver.insert(ConfigProvider.URI, ContentValues().apply {
+                put(ConfigProvider.KEY_RF_STATUS, "IDLE")
+                put(ConfigProvider.KEY_RF_UID, "")
+                put(ConfigProvider.KEY_RF_RESULT, "")
+                put(ConfigProvider.KEY_RF_ERROR, "")
+                put(ConfigProvider.KEY_RF_PID, 0)
+                put(ConfigProvider.KEY_FULL_DIAG_STAGE, if (result.success) "IDLE" else "STOP_FAILED")
+                put(ConfigProvider.KEY_FULL_DIAG_SUMMARY, if (result.success) "Stock RF restored by Vendor Binder" else result.detail)
+            })
+            val state = readRuntimeStatus()
+            onDone(state, if (result.success) "模拟已停止 · 默认 RF 已恢复" else "停止模拟失败 · ${result.stage}")
         }
     }
 
     private fun writeSimulationConfig(card: CardModel) {
+        // Preserve current hook/scope state. The direct Binder path no longer requires an NFC restart.
         contentResolver.insert(ConfigProvider.URI, ContentValues().apply {
             put(ConfigProvider.KEY_APP_BUILD, ConfigProvider.APP_BUILD)
             put(ConfigProvider.KEY_SIMULATION_ENABLED, true)
             put(ConfigProvider.KEY_UID, card.uid)
             put(ConfigProvider.KEY_SAK, card.sak)
             put(ConfigProvider.KEY_ATQA, card.atqa)
-            put(ConfigProvider.KEY_SCOPE_OK, false)
-            put(ConfigProvider.KEY_SCOPE_PROCESS, "")
-            put(ConfigProvider.KEY_SCOPE_PID, 0)
-            put(ConfigProvider.KEY_HOOK_INSTALLED, false)
-            put(ConfigProvider.KEY_HOOK_CLASS, "")
-            put(ConfigProvider.KEY_HOOK_COUNT, 0)
-            put(ConfigProvider.KEY_HOOK_PID, 0)
             put(ConfigProvider.KEY_RF_STATUS, "WAITING")
             put(ConfigProvider.KEY_RF_UID, "")
             put(ConfigProvider.KEY_RF_SOURCE, "")
@@ -417,7 +463,7 @@ class MainActivity : ComponentActivity() {
             put(ConfigProvider.KEY_RF_ERROR, "")
             put(ConfigProvider.KEY_RF_PID, 0)
             put(ConfigProvider.KEY_FULL_DIAG_STAGE, "APP_CONFIG_READY")
-            put(ConfigProvider.KEY_FULL_DIAG_SUMMARY, "UID saved; restarting NFC process without disabling NFC")
+            put(ConfigProvider.KEY_FULL_DIAG_SUMMARY, "UID saved; ready for verified Vendor Binder transaction 6 -> 15")
         })
     }
 
@@ -464,7 +510,7 @@ class MainActivity : ComponentActivity() {
         while (System.currentTimeMillis() < end) {
             state = readRuntimeStatus()
             if (state.hookInstalled && state.hookBuild == EXPECTED_HOOK_BUILD && state.rfStatus == "RF_UID_APPLIED" && state.rfUid.equals(uid, true)) return state
-            Thread.sleep(250)
+            Thread.sleep(100)
         }
         return state
     }
@@ -475,7 +521,7 @@ class MainActivity : ComponentActivity() {
         while (System.currentTimeMillis() < end) {
             state = readRuntimeStatus()
             if (state.hookInstalled && state.hookBuild == EXPECTED_HOOK_BUILD) return state
-            Thread.sleep(250)
+            Thread.sleep(200)
         }
         return state
     }
@@ -507,7 +553,7 @@ class MainActivity : ComponentActivity() {
             hookInstalled = hookFresh,
             simulationEnabled = map[ConfigProvider.KEY_SIMULATION_ENABLED].toBoolean(),
             selectedUid = map[ConfigProvider.KEY_UID]?.takeIf { it.isNotBlank() },
-            rfStatus = if (rfPid == currentPid && currentPid > 0) map[ConfigProvider.KEY_RF_STATUS] ?: "WAITING" else if (map[ConfigProvider.KEY_RF_STATUS] == "IDLE") "IDLE" else "STALE",
+            rfStatus = if (rfPid == currentPid && currentPid > 0) map[ConfigProvider.KEY_RF_STATUS] ?: "WAITING" else if (map[ConfigProvider.KEY_RF_STATUS] == "IDLE") "IDLE" else map[ConfigProvider.KEY_RF_STATUS] ?: "STALE",
             rfUid = if (rfPid == currentPid) map[ConfigProvider.KEY_RF_UID]?.takeIf { it.isNotBlank() } else null,
             rfSource = if (rfPid == currentPid) map[ConfigProvider.KEY_RF_SOURCE]?.takeIf { it.isNotBlank() } else null,
             rfResult = if (rfPid == currentPid) map[ConfigProvider.KEY_RF_RESULT]?.takeIf { it.isNotBlank() } else null,
@@ -543,7 +589,7 @@ class MainActivity : ComponentActivity() {
             LogSource.KERNEL_SU -> runRootCmd("for f in ${'$'}(ls -t /data/adb/ksu/log/sulog* 2>/dev/null | head -n 3); do echo === ${'$'}f ===; tail -n 300 ${'$'}f; done")
             LogSource.SYSTEM -> runRootCmd("logcat -b all -d -v threadtime 2>/dev/null | tail -n 1800")
             LogSource.NFC -> {
-                val filter = "NfcUIDSim|NfcService|NxpNfcService|NfcChipDeviceImpl|NFCID1|changeRfParamsByConfig|setRfConfig|commitRouting|applyPreRfConfig|VendorNfcService"
+                val filter = "NfcUIDSim|NfcService|NxpNfcService|NfcChipDeviceImpl|NFCID1|changeRfParamsByConfig|setRfConfig|VendorNfcService|enableNfcShareMode"
                 val pidFilter = if (pid.isNotBlank()) "${'$'}0 ~ / $pid / || ${'$'}0 ~ /$filter/" else "${'$'}0 ~ /$filter/"
                 runRootCmd("logcat -b all -d -v threadtime 2>/dev/null | awk '$pidFilter' | tail -n 1800")
             }
@@ -578,23 +624,24 @@ class MainActivity : ComponentActivity() {
         return if (json.isNullOrBlank()) emptyList() else runCatching { gson.fromJson<List<CardModel>>(json, object : TypeToken<List<CardModel>>() {}.type) ?: emptyList() }.getOrDefault(emptyList())
     }
 
-    private fun saveCards(cards: List<CardModel>) { getSharedPreferences("cards", 0).edit().putString("list", gson.toJson(cards)).apply() }
+    private fun saveCards(cards: List<CardModel>) {
+        getSharedPreferences("cards", 0).edit().putString("list", gson.toJson(cards)).apply()
+    }
 
-    private fun runOneTapDiagnosticAndShare(onDone: () -> Unit) {
-        stopReadMode("diagnostic_share")
+    private fun saveDiagnosticWithoutSharing(onDone: () -> Unit) {
+        stopReadMode("diagnostic_save")
         executor.execute {
             try {
-                val file = File(cacheDir, "nfc_fullcheck_1.0.15.txt")
+                val dir = getExternalFilesDir("diagnostics") ?: filesDir
+                if (!dir.exists()) dir.mkdirs()
+                val file = File(dir, "nfc_fullcheck_1.0.15.txt")
                 file.writeText(buildFullDiagnosticReport())
-                AppLogger.i("Diagnostics exported: ${file.absolutePath}")
+                AppLogger.i("Diagnostics saved without share chooser: ${file.absolutePath}")
+                val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                clipboard.setPrimaryClip(ClipData.newPlainText("NFC diagnostic path", file.absolutePath))
                 runOnUiThread {
                     onDone()
-                    val uri = FileProvider.getUriForFile(this@MainActivity, "$packageName.fileprovider", file)
-                    startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {
-                        type = "text/plain"
-                        putExtra(Intent.EXTRA_STREAM, uri)
-                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                    }, "Share NFC Full Check"))
+                    Toast.makeText(this@MainActivity, "诊断已保存，路径已复制；未打开分享界面", Toast.LENGTH_LONG).show()
                 }
             } catch (e: Exception) {
                 AppLogger.i("Diagnostics failed ${e.javaClass.simpleName}: ${e.message}")
@@ -607,6 +654,7 @@ class MainActivity : ComponentActivity() {
         val s = readRuntimeStatus()
         appendLine("=== NFC FULL CHECK 1.0.15 ===")
         appendLine("Generated: ${System.currentTimeMillis()}")
+        appendLine("Trigger: production Vendor Binder transaction 6 -> 15")
         appendLine("--- FINAL SUMMARY ---")
         appendLine(buildStatusSummary(s))
         appendLine()
