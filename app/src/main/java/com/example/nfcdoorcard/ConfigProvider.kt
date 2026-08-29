@@ -38,11 +38,6 @@ class ConfigProvider : ContentProvider() {
         const val KEY_RF_RESULT = "rf_result"
         const val KEY_RF_ERROR = "rf_error"
         const val KEY_RF_PID = "rf_pid"
-        const val KEY_RF_REQUEST_GENERATION = "rf_request_generation"
-        const val KEY_RF_REFRESH_APPLIED_GENERATION = "rf_refresh_applied_generation"
-        const val KEY_RF_REFRESH_STATUS = "rf_refresh_status"
-        const val KEY_RF_REFRESH_DETAIL = "rf_refresh_detail"
-        const val KEY_RF_REFRESH_PID = "rf_refresh_pid"
         const val KEY_TRACE_STAGE = "trace_stage"
         const val KEY_TRACE_SOURCE = "trace_source"
         const val KEY_TRACE_PID = "trace_pid"
@@ -61,6 +56,9 @@ class ConfigProvider : ContentProvider() {
 
         val URI: Uri = Uri.parse("content://$AUTHORITY/$PATH_SETTINGS")
     }
+
+    @Volatile
+    private var refreshGeneration = 0
 
     override fun onCreate(): Boolean {
         context!!.getSharedPreferences("nfc_config", 0)
@@ -89,7 +87,6 @@ class ConfigProvider : ContentProvider() {
         if (values == null) return uri
         val prefs = context!!.getSharedPreferences("nfc_config", 0)
         val editor = prefs.edit()
-
         values.keySet().forEach { key ->
             when (val value = values.get(key)) {
                 is Boolean -> editor.putBoolean(key, value)
@@ -100,20 +97,71 @@ class ConfigProvider : ContentProvider() {
                 else -> editor.putString(key, value.toString())
             }
         }
-
-        // Every simulate/stop request receives a monotonically increasing generation.
-        // com.android.nfc consumes this generation in-process and performs the vendor RF refresh.
-        if (values.containsKey(KEY_SIMULATION_ENABLED) && !values.containsKey(KEY_RF_REQUEST_GENERATION)) {
-            val next = prefs.getLong(KEY_RF_REQUEST_GENERATION, 0L) + 1L
-            editor.putLong(KEY_RF_REQUEST_GENERATION, next)
-            editor.putString(KEY_RF_REFRESH_STATUS, "REQUESTED")
-            editor.putString(KEY_RF_REFRESH_DETAIL, "waiting for com.android.nfc adapter")
-            editor.putInt(KEY_RF_REFRESH_PID, 0)
-        }
-
         editor.apply()
         context?.contentResolver?.notifyChange(uri, null)
+
+        if (values.containsKey(KEY_SIMULATION_ENABLED)) {
+            val enabled = when (val raw = values.get(KEY_SIMULATION_ENABLED)) {
+                is Boolean -> raw
+                else -> raw?.toString()?.toBoolean() == true
+            }
+            refreshGeneration += 1
+            if (enabled) scheduleRfRefresh(refreshGeneration)
+        }
         return uri
+    }
+
+    /**
+     * The OPlus/NXP stack re-applies its RF config while serving `dumpsys nfc` on this device.
+     * That gives us a much safer refresh trigger than directly invoking private vendor APIs.
+     * Wait for the restarted com.android.nfc process + LSPosed hook, then issue bounded pulses.
+     * Stop immediately once the hook reports RF_UID_APPLIED.
+     */
+    private fun scheduleRfRefresh(generation: Int) {
+        val appContext = context?.applicationContext ?: return
+        Thread({
+            try {
+                Thread.sleep(2_500L)
+                repeat(8) { attempt ->
+                    if (generation != refreshGeneration) return@Thread
+                    val prefs = appContext.getSharedPreferences("nfc_config", 0)
+                    if (!prefs.getBoolean(KEY_SIMULATION_ENABLED, false)) return@Thread
+                    if (prefs.getString(KEY_RF_STATUS, "") == "RF_UID_APPLIED") return@Thread
+
+                    runRootQuiet("dumpsys nfc >/dev/null 2>&1")
+                    AppLogger.i("SIMULATION: RF refresh pulse ${attempt + 1}/8")
+
+                    repeat(3) {
+                        Thread.sleep(250L)
+                        if (generation != refreshGeneration) return@Thread
+                        val now = appContext.getSharedPreferences("nfc_config", 0)
+                        if (now.getString(KEY_RF_STATUS, "") == "RF_UID_APPLIED") {
+                            AppLogger.i("SIMULATION: RF refresh confirmed")
+                            return@Thread
+                        }
+                    }
+                }
+                AppLogger.i("SIMULATION: RF refresh pulses finished without confirmation")
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+            } catch (t: Throwable) {
+                AppLogger.i("SIMULATION: RF refresh failed ${t.javaClass.simpleName}: ${t.message}")
+            }
+        }, "NfcUIDSim-RfRefresh").apply {
+            isDaemon = true
+            start()
+        }
+    }
+
+    private fun runRootQuiet(command: String) {
+        runCatching {
+            Runtime.getRuntime().exec(arrayOf("su", "-c", command)).apply {
+                inputStream.close()
+                errorStream.close()
+                outputStream.close()
+                waitFor()
+            }
+        }
     }
 
     override fun update(
@@ -128,12 +176,12 @@ class ConfigProvider : ContentProvider() {
     }
 
     override fun delete(uri: Uri, selection: String?, selectionArgs: Array<out String>?): Int {
+        refreshGeneration += 1
         context!!.getSharedPreferences("nfc_config", 0)
             .edit()
             .clear()
             .putInt(KEY_APP_BUILD, APP_BUILD)
             .apply()
-        context?.contentResolver?.notifyChange(uri, null)
         return 1
     }
 
