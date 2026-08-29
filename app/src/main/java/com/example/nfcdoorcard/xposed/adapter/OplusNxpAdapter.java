@@ -1,12 +1,6 @@
 package com.example.nfcdoorcard.xposed.adapter;
 
-import java.io.ByteArrayOutputStream;
-import java.io.File;
-import java.io.FileInputStream;
-import java.lang.reflect.Field;
-import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
-import java.lang.reflect.Modifier;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -18,40 +12,23 @@ import java.util.regex.Pattern;
 public final class OplusNxpAdapter implements NfcStackAdapter {
     private static final String MANAGER_CLASS = "com.android.nfc.dhimpl.NxpNativeNfcManager";
     private static final String INJECTION_METHOD = "changeRfParamsByConfig";
-    private static final String CHIP_CLASS = "com.oplus.nfc.common.NfcChipDeviceImpl";
-    private static final String REFRESH_METHOD = "setRfConfig";
     private static final Pattern OPLUS_BLOCK = Pattern.compile("(?ms)(OPLUS_CONF_EXTN\\s*=\\s*\\{)(.*?)(\\})");
     private static final Pattern HEX_TOKEN = Pattern.compile("(?i)(?<![0-9A-F])([0-9A-F]{2})(?![0-9A-F])");
-    private static final String[] CONFIG_PATHS = new String[]{
-            "/data/vendor/nfc/libnfc_default_config.conf",
-            "/data/vendor/nfc/libnfc-nxpTransit.conf"
-    };
-
-    private volatile Object refreshTarget;
-    private volatile Method refreshMethod;
-    private volatile String capturedStockConfig;
-    private volatile String capturedSource = "none";
 
     @Override
     public String id() {
-        return "oplus-nxp-v2";
+        return "oplus-nxp-v1";
     }
 
     @Override
     public Detection detect(ClassLoader classLoader) {
         try {
             Class<?> manager = Class.forName(MANAGER_CLASS, false, classLoader);
-            Method injection = manager.getDeclaredMethod(INJECTION_METHOD, byte[].class);
-            if (injection.getReturnType() == Void.TYPE) {
+            Method method = manager.getDeclaredMethod(INJECTION_METHOD, byte[].class);
+            if (method.getReturnType() == Void.TYPE) {
                 return Detection.unsupported("changeRfParamsByConfig has unexpected void return type");
             }
-            Class<?> chip = Class.forName(CHIP_CLASS, false, classLoader);
-            Method refresh = chip.getDeclaredMethod(REFRESH_METHOD, String.class);
-            refresh.setAccessible(true);
-            refreshMethod = refresh;
-            return Detection.supported(
-                    MANAGER_CLASS + "#" + INJECTION_METHOD + "(byte[]) + " +
-                            CHIP_CLASS + "#" + REFRESH_METHOD + "(String)");
+            return Detection.supported(MANAGER_CLASS + "#" + INJECTION_METHOD + "(byte[])");
         } catch (Throwable t) {
             return Detection.unsupported(t.getClass().getSimpleName() + ": " + t.getMessage());
         }
@@ -61,161 +38,6 @@ public final class OplusNxpAdapter implements NfcStackAdapter {
     public Method resolveInjectionMethod(ClassLoader classLoader) throws Exception {
         Class<?> manager = Class.forName(MANAGER_CLASS, false, classLoader);
         return manager.getDeclaredMethod(INJECTION_METHOD, byte[].class);
-    }
-
-    @Override
-    public void observeInvocation(Object receiver, Method method, Object[] args) {
-        if (method == null) return;
-        if (!CHIP_CLASS.equals(method.getDeclaringClass().getName())) return;
-        if (!REFRESH_METHOD.equals(method.getName())) return;
-        Class<?>[] types = method.getParameterTypes();
-        if (types.length != 1 || types[0] != String.class) return;
-
-        if (receiver != null) {
-            refreshTarget = receiver;
-            refreshMethod = method;
-            try { refreshMethod.setAccessible(true); } catch (Throwable ignored) {}
-            capturedSource = "observed-instance";
-        }
-        if (args != null && args.length == 1 && args[0] instanceof String) {
-            String config = (String) args[0];
-            if (isUsableConfig(config)) {
-                capturedStockConfig = config;
-                capturedSource = receiver == null ? "observed-config" : "observed-instance+config";
-            }
-        }
-    }
-
-    @Override
-    public void observeConstructedObject(Object object) {
-        if (object != null && CHIP_CLASS.equals(object.getClass().getName())) {
-            refreshTarget = object;
-            capturedSource = "constructor-capture";
-        }
-    }
-
-    @Override
-    public RefreshResult requestRfRefresh(ClassLoader classLoader) {
-        try {
-            Class<?> chip = Class.forName(CHIP_CLASS, false, classLoader);
-            Method method = refreshMethod;
-            if (method == null || !method.getDeclaringClass().equals(chip)) {
-                method = chip.getDeclaredMethod(REFRESH_METHOD, String.class);
-                method.setAccessible(true);
-                refreshMethod = method;
-            }
-
-            Object target = refreshTarget;
-            String targetSource = capturedSource;
-            if (target == null || !chip.isInstance(target)) {
-                TargetResolution resolution = resolveExistingTarget(chip);
-                target = resolution.target;
-                targetSource = resolution.detail;
-                if (target != null) {
-                    refreshTarget = target;
-                    capturedSource = targetSource;
-                }
-            }
-            if (target == null) {
-                return RefreshResult.unavailable("TARGET_NOT_READY " + targetSource);
-            }
-
-            ConfigResolution configResolution = resolveStockConfig();
-            if (configResolution.config == null) {
-                return RefreshResult.unavailable("STOCK_CONFIG_NOT_READY " + configResolution.detail);
-            }
-
-            Object result;
-            try {
-                result = method.invoke(target, configResolution.config);
-            } catch (InvocationTargetException ite) {
-                Throwable cause = ite.getCause() == null ? ite : ite.getCause();
-                return RefreshResult.rejected("invoke threw " + cause.getClass().getSimpleName() + ": " + cause.getMessage());
-            }
-
-            String detail = "target=" + targetSource + " config=" + configResolution.detail + " result=" + String.valueOf(result);
-            if (result instanceof Boolean) {
-                return ((Boolean) result) ? RefreshResult.accepted(detail) : RefreshResult.rejected(detail);
-            }
-            if (result instanceof Number) {
-                return ((Number) result).intValue() == 0 ? RefreshResult.accepted(detail) : RefreshResult.rejected(detail);
-            }
-            return RefreshResult.accepted(detail);
-        } catch (Throwable t) {
-            return RefreshResult.unavailable(t.getClass().getSimpleName() + ": " + t.getMessage());
-        }
-    }
-
-    private TargetResolution resolveExistingTarget(Class<?> chip) {
-        StringBuilder detail = new StringBuilder();
-
-        for (Method method : chip.getDeclaredMethods()) {
-            String name = method.getName().toLowerCase(Locale.ROOT);
-            if (!Modifier.isStatic(method.getModifiers()) || method.getParameterCount() != 0) continue;
-            if (!chip.isAssignableFrom(method.getReturnType())) continue;
-            if (!(name.equals("getinstance") || name.equals("instance") || name.equals("getdefault") ||
-                    name.equals("getdevice") || name.equals("getnfcchipdevice"))) continue;
-            try {
-                method.setAccessible(true);
-                Object value = method.invoke(null);
-                if (chip.isInstance(value)) return new TargetResolution(value, "static-method:" + method.getName());
-            } catch (Throwable t) {
-                detail.append(" method:").append(method.getName()).append('=').append(t.getClass().getSimpleName());
-            }
-        }
-
-        for (Field field : chip.getDeclaredFields()) {
-            if (!Modifier.isStatic(field.getModifiers())) continue;
-            if (!chip.isAssignableFrom(field.getType())) continue;
-            try {
-                field.setAccessible(true);
-                Object value = field.get(null);
-                if (chip.isInstance(value)) return new TargetResolution(value, "static-field:" + field.getName());
-            } catch (Throwable t) {
-                detail.append(" field:").append(field.getName()).append('=').append(t.getClass().getSimpleName());
-            }
-        }
-
-        return new TargetResolution(null, detail.length() == 0 ? "no singleton getter/static instance field" : detail.toString());
-    }
-
-    private ConfigResolution resolveStockConfig() {
-        String cached = capturedStockConfig;
-        if (isUsableConfig(cached)) return new ConfigResolution(cached, "captured:" + cached.length());
-
-        StringBuilder failures = new StringBuilder();
-        for (String path : CONFIG_PATHS) {
-            try {
-                File file = new File(path);
-                if (!file.isFile()) {
-                    failures.append(path).append("=missing;");
-                    continue;
-                }
-                String text = readText(file);
-                if (!isUsableConfig(text)) {
-                    failures.append(path).append("=no-oplus-block;");
-                    continue;
-                }
-                capturedStockConfig = text;
-                return new ConfigResolution(text, path + ":" + text.length());
-            } catch (Throwable t) {
-                failures.append(path).append('=').append(t.getClass().getSimpleName()).append(';');
-            }
-        }
-        return new ConfigResolution(null, failures.toString());
-    }
-
-    private static String readText(File file) throws Exception {
-        try (FileInputStream in = new FileInputStream(file); ByteArrayOutputStream out = new ByteArrayOutputStream()) {
-            byte[] buffer = new byte[4096];
-            int n;
-            while ((n = in.read(buffer)) > 0) out.write(buffer, 0, n);
-            return out.toString(StandardCharsets.UTF_8.name());
-        }
-    }
-
-    private static boolean isUsableConfig(String text) {
-        return text != null && text.length() > 100 && text.contains("OPLUS_CONF_EXTN") && text.contains("NXP_CORE_CONF_EXTN");
     }
 
     @Override
@@ -314,23 +136,5 @@ public final class OplusNxpAdapter implements NfcStackAdapter {
             else sb.append("  ");
         }
         return sb.toString().stripTrailing();
-    }
-
-    private static final class TargetResolution {
-        final Object target;
-        final String detail;
-        TargetResolution(Object target, String detail) {
-            this.target = target;
-            this.detail = detail;
-        }
-    }
-
-    private static final class ConfigResolution {
-        final String config;
-        final String detail;
-        ConfigResolution(String config, String detail) {
-            this.config = config;
-            this.detail = detail;
-        }
     }
 }
