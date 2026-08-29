@@ -12,7 +12,7 @@ object AppLogger {
     fun i(message: String) {
         val line = "[${format.format(Date())}] APP: $message"
         lines += line
-        if (lines.size > 1000) lines.removeAt(0)
+        while (lines.size > 1000) lines.removeAt(0)
         android.util.Log.i("NfcDoorCard", message)
     }
 
@@ -20,5 +20,7 @@ object AppLogger {
     fun readAll(): String = lines.joinToString("\n")
 
     @Synchronized
-    fun clear() = lines.clear()
+    fun clear() {
+        lines.clear()
+    }
 }
