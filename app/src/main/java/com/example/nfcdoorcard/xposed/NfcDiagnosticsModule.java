@@ -151,8 +151,6 @@ public class NfcDiagnosticsModule extends XposedModule {
     }
 
     private void writeBaseStatus(int pid, boolean ready, int count) {
-        Application app = currentApplication();
-        if (app == null) return;
         ContentValues v = new ContentValues();
         v.put("hook_build", HOOK_BUILD);
         v.put("scope_ok", true);
@@ -166,12 +164,10 @@ public class NfcDiagnosticsModule extends XposedModule {
             v.put("full_diag_stage", "READY");
             v.put("full_diag_summary", "Production NFCID1 injector ready");
         }
-        app.getContentResolver().insert(CONFIG_URI, v);
+        writeStatusWithRetry(v, "BASE_STATUS");
     }
 
     private void writeHookFailure(int pid, Throwable t) {
-        Application app = currentApplication();
-        if (app == null) return;
         ContentValues v = new ContentValues();
         v.put("hook_build", HOOK_BUILD);
         v.put("scope_ok", true);
@@ -182,13 +178,19 @@ public class NfcDiagnosticsModule extends XposedModule {
         v.put("rf_status", "HOOK_FAILED");
         v.put("rf_error", t.getClass().getSimpleName() + ": " + t.getMessage());
         v.put("rf_pid", pid);
-        app.getContentResolver().insert(CONFIG_URI, v);
+        writeStatusWithRetry(v, "HOOK_FAILURE");
     }
 
     private void writeRfStatus(String state, String uid, String detail, String result) {
-        Application app = currentApplication();
-        if (app == null) return;
         ContentValues v = new ContentValues();
+        v.put("hook_build", HOOK_BUILD);
+        v.put("scope_ok", true);
+        v.put("scope_process", "com.android.nfc");
+        v.put("scope_pid", Process.myPid());
+        v.put("hook_installed", true);
+        v.put("hook_class", "NfcDiagnosticsModule");
+        v.put("hook_count", 1);
+        v.put("hook_pid", Process.myPid());
         v.put("rf_status", state);
         v.put("rf_uid", uid == null ? "" : uid);
         v.put("rf_source", "OPLUS_CONF_EXTN");
@@ -197,7 +199,41 @@ public class NfcDiagnosticsModule extends XposedModule {
         v.put("rf_pid", Process.myPid());
         v.put("full_diag_stage", state);
         v.put("full_diag_summary", detail);
-        app.getContentResolver().insert(CONFIG_URI, v);
+        writeStatusWithRetry(v, "RF_STATUS_" + state);
+    }
+
+    private void writeStatusWithRetry(ContentValues values, String label) {
+        if (tryWriteStatus(values)) return;
+        ContentValues copy = new ContentValues(values);
+        Thread worker = new Thread(() -> {
+            for (int i = 1; i <= 30; i++) {
+                try {
+                    Thread.sleep(200L);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+                if (tryWriteStatus(copy)) {
+                    Log.i(TAG, "STATUS SYNC OK label=" + label + " attempt=" + i + " pid=" + Process.myPid());
+                    return;
+                }
+            }
+            Log.w(TAG, "STATUS SYNC FAILED label=" + label + " pid=" + Process.myPid());
+        }, "NfcUidStatusSync");
+        worker.setDaemon(true);
+        worker.start();
+    }
+
+    private boolean tryWriteStatus(ContentValues values) {
+        Application app = currentApplication();
+        if (app == null) return false;
+        try {
+            app.getContentResolver().insert(CONFIG_URI, values);
+            return true;
+        } catch (Throwable t) {
+            Log.w(TAG, "status write failed: " + t.getClass().getSimpleName() + ": " + t.getMessage());
+            return false;
+        }
     }
 
     private SimConfig readConfig() {
