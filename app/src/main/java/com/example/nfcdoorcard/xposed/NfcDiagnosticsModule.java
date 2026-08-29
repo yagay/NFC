@@ -1,402 +1,261 @@
 package com.example.nfcdoorcard.xposed;
 
 import android.app.Application;
+import android.content.ContentValues;
 import android.database.Cursor;
 import android.net.Uri;
-import android.os.Binder;
+import android.provider.Settings;
 import android.util.Log;
 
-import java.lang.reflect.Constructor;
-import java.lang.reflect.Field;
 import java.lang.reflect.Method;
-import java.lang.reflect.Modifier;
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
 import java.util.Arrays;
-import java.util.HashSet;
 import java.util.Locale;
-import java.util.Set;
 
 import io.github.libxposed.api.XposedModule;
 import io.github.libxposed.api.XposedModuleInterface;
 
-/** LSPosed/libxposed API 102 diagnostics module. Observation only. */
+/**
+ * OxygenOS 16 NFC Type-A UID hook.
+ *
+ * V8 diagnostics confirmed the real call path on this device:
+ * VendorNfcService.doSetHceTypeAConfig ->
+ * NxpNativeNfcManager.setHceTypeAConfig(boolean, byte[], byte[], byte[]).
+ *
+ * Keep the hook deliberately narrow: when simulation is disabled the original
+ * call is passed through unchanged. No vendor command is proactively invoked.
+ */
 public class NfcDiagnosticsModule extends XposedModule {
     private static final String TAG = "NfcUIDSim";
     private static final Uri CONFIG_URI = Uri.parse("content://com.example.nfcdoorcard.config/settings");
-    private static final int MAX_STACK_FRAMES = 6;
-    private static final int MAX_AUTO_TRACE_PARAMS = 4;
 
-    private static final String[] CANDIDATE_KEYWORDS = {
-            "config", "core", "vendor", "raw", "write", "rf", "listen", "discovery", "nfcid", "uid"
-    };
+    private static final String KEY_SIMULATION_ENABLED = "simulation_enabled";
+    private static final String KEY_UID = "uid";
+    private static final String KEY_SAK = "sak";
+    private static final String KEY_ATQA = "atqa";
+    private static final String KEY_MODULE_ACTIVE = "module_active";
+    private static final String KEY_MODULE_PROCESS = "module_process";
+    private static final String KEY_MODULE_BOOT_COUNT = "module_boot_count";
 
-    private static final String[] DIRECT_RUNTIME_CLASS_CANDIDATES = {
-            "com.android.nfc.dhimpl.NxpNativeNfcManager",
-            "com.android.nfc.NxpNativeNfcManager",
-            "com.android.nfc.dhimpl.NativeNfcManager",
-            "com.android.nfc.dhimpl.StNativeNfcManager",
-            "com.android.nfc.StNativeNfcManager"
-    };
-
-    private static final String[] CONFIG_SELECTOR_CLASS_CANDIDATES = {
-            "com.android.nfc.nxp.NxpNfcService$NxpNfcAdapterService",
-            "com.android.nfc.nxp.NxpNfcService"
-    };
-
-    private final Set<String> installedTraceHooks = new HashSet<>();
-    private final Set<String> inspectedRuntimeClasses = new HashSet<>();
+    private volatile boolean heartbeatWritten;
 
     @Override
     public void onModuleLoaded(XposedModuleInterface.ModuleLoadedParam param) {
         super.onModuleLoaded(param);
-        info("onModuleLoaded process=" + param.getProcessName() + ", api=" + getApiVersion());
+        info("MODULE: onModuleLoaded process=" + param.getProcessName() + ", api=" + getApiVersion());
     }
 
     @Override
     public void onPackageLoaded(XposedModuleInterface.PackageLoadedParam lp) {
         super.onPackageLoaded(lp);
         if (!"com.android.nfc".equals(lp.getPackageName())) return;
-        info("onPackageLoaded package=com.android.nfc");
-        installSlimTrace(lp.getDefaultClassLoader());
-    }
 
-    private void installSlimTrace(ClassLoader cl) {
-        info("NFC-TRACE slim mode begin; observation only, no NFC/vendor command will be invoked");
-        Class<?> deviceHost = loadOptional(cl, "com.android.nfc.DeviceHost");
-        Class<?> nfcService = loadOptional(cl, "com.android.nfc.NfcService");
-        probeKnownRuntimeClasses(cl);
-        probeConfigSelectorClasses(cl);
-        if (nfcService != null) {
-            installNfcServiceConstructorProbe(nfcService, deviceHost);
-            installTraceHook(nfcService, "getNfcListenTech");
-            installTraceHook(nfcService, "saveNfcListenTech", int.class);
-            installTraceHook(nfcService, "clearListenTech", boolean.class);
-            installTraceHook(nfcService, "getNfcPollTech");
-            installTraceHook(nfcService, "saveNfcPollTech", int.class);
-            installNamedTraceHooks(nfcService, "restoreSavedTech");
-        } else {
-            warn("NFC-TRACE NfcService class unavailable");
-        }
-        info("NFC-TRACE slim mode hooks requested");
-    }
+        info("MODULE: onPackageLoaded package=com.android.nfc");
+        reportModuleActive("com.android.nfc");
 
-    private void probeKnownRuntimeClasses(ClassLoader cl) {
-        info("NFC-RUNTIME DIRECT PROBE BEGIN");
-        int found = 0;
-        for (String className : DIRECT_RUNTIME_CLASS_CANDIDATES) {
-            try {
-                Class<?> runtime = Class.forName(className, false, cl);
-                found++;
-                info("NFC-RUNTIME DIRECT CLASS FOUND " + runtime.getName());
-                inspectAndTraceRuntimeClass(runtime);
-                installHostTraceHooks(runtime);
-            } catch (ClassNotFoundException e) {
-                info("NFC-RUNTIME DIRECT CLASS ABSENT " + className);
-            } catch (Throwable t) {
-                warn("NFC-RUNTIME DIRECT CLASS ERROR " + className + " / " + t.getClass().getSimpleName(), t);
-            }
-        }
-        info("NFC-RUNTIME DIRECT PROBE END found=" + found);
-    }
-
-    private void probeConfigSelectorClasses(ClassLoader cl) {
-        info("NFC-SELECTOR PROBE BEGIN");
-        int found = 0;
-        for (String className : CONFIG_SELECTOR_CLASS_CANDIDATES) {
-            try {
-                Class<?> selector = Class.forName(className, false, cl);
-                found++;
-                info("NFC-SELECTOR CLASS FOUND " + selector.getName());
-                enumerateSelectorMethods(selector);
-                installNamedTraceHooks(selector, "setConfig");
-                installNamedTraceHooks(selector, "changeRfParamsByConfig");
-            } catch (ClassNotFoundException e) {
-                info("NFC-SELECTOR CLASS ABSENT " + className);
-            } catch (Throwable t) {
-                warn("NFC-SELECTOR CLASS ERROR " + className + " / " + t.getClass().getSimpleName(), t);
-            }
-        }
-        info("NFC-SELECTOR PROBE END found=" + found);
-    }
-
-    private void enumerateSelectorMethods(Class<?> selector) {
-        int candidates = 0;
-        for (Method method : selector.getDeclaredMethods()) {
-            String name = method.getName().toLowerCase(Locale.ROOT);
-            if (!name.contains("config") && !name.contains("tap") && !name.contains("access") && !name.contains("card") && !name.contains("hce") && !name.contains("transit")) continue;
-            candidates++;
-            info("NFC-SELECTOR METHOD " + formatMethod(method));
-        }
-        info("NFC-SELECTOR METHOD ENUM END class=" + selector.getName() + " candidates=" + candidates);
-    }
-
-    private Class<?> loadOptional(ClassLoader cl, String name) {
-        try {
-            return Class.forName(name, false, cl);
-        } catch (ClassNotFoundException e) {
-            info("NFC-TRACE class absent: " + name);
-            return null;
-        } catch (Throwable t) {
-            warn("NFC-TRACE unable to load " + name + ": " + t.getClass().getSimpleName());
-            return null;
-        }
-    }
-
-    private void installNfcServiceConstructorProbe(Class<?> nfcService, Class<?> deviceHost) {
+        ClassLoader cl = lp.getDefaultClassLoader();
         int installed = 0;
-        for (Constructor<?> constructor : nfcService.getDeclaredConstructors()) {
-            try {
-                hook(constructor).intercept(chain -> {
-                    Object thisObject = chain.getThisObject();
-                    Object result = chain.proceed();
-                    try { inspectNfcServiceInstance(thisObject, deviceHost); }
-                    catch (Throwable t) { warn("NFC-RUNTIME DeviceHost inspection failed: " + t.getClass().getSimpleName(), t); }
-                    return result;
-                });
-                installed++;
-            } catch (Throwable t) {
-                warn("NFC-RUNTIME constructor hook failed: " + t.getClass().getSimpleName(), t);
-            }
-        }
-        info("NFC-RUNTIME constructor probes installed=" + installed);
+        installed += installVerifiedHceHook(cl, "com.android.nfc.dhimpl.NxpNativeNfcManager");
+        installed += installVerifiedHceHook(cl, "com.android.nfc.dhimpl.StNativeNfcManager");
+        info("MODULE: verified HCE hooks installed=" + installed);
     }
 
-    private void inspectNfcServiceInstance(Object service, Class<?> deviceHost) {
-        if (service == null) { warn("NFC-RUNTIME NfcService thisObject=null"); return; }
-        Object host = null;
-        String hostField = null;
-        Class<?> cursor = service.getClass();
-        while (cursor != null && cursor != Object.class) {
-            for (Field field : cursor.getDeclaredFields()) {
-                try {
-                    boolean declaredAsDeviceHost = deviceHost != null && deviceHost.isAssignableFrom(field.getType());
-                    if (!declaredAsDeviceHost && !field.getName().toLowerCase(Locale.ROOT).contains("devicehost")) continue;
-                    field.setAccessible(true);
-                    Object value = field.get(service);
-                    if (value != null && deviceHost != null && deviceHost.isInstance(value)) { host = value; hostField = field.getName(); break; }
-                } catch (Throwable ignored) {}
-            }
-            if (host != null) break;
-            cursor = cursor.getSuperclass();
-        }
-        if (host == null) { warn("NFC-RUNTIME DeviceHost instance not found"); return; }
-        Class<?> runtime = host.getClass();
-        info("NFC-RUNTIME DeviceHost field=" + hostField);
-        info("NFC-RUNTIME DeviceHost class=" + runtime.getName());
-        info("NFC-RUNTIME DeviceHost interfaces=" + joinTypes(runtime.getInterfaces()));
-        inspectAndTraceRuntimeClass(runtime);
-        installHostTraceHooks(runtime);
-        logConfiguredTestRequest();
-    }
-
-    private void inspectAndTraceRuntimeClass(Class<?> runtime) {
-        synchronized (inspectedRuntimeClasses) { if (!inspectedRuntimeClasses.add(runtime.getName())) return; }
-        info("NFC-RUNTIME METHOD ENUM BEGIN class=" + runtime.getName());
-        int total = 0, candidates = 0;
-        for (Method method : runtime.getDeclaredMethods()) {
-            total++;
-            if (!isCandidateMethod(method)) continue;
-            candidates++;
-            info("NFC-RUNTIME CANDIDATE " + formatMethod(method));
-            if (method.getParameterCount() <= MAX_AUTO_TRACE_PARAMS) installTraceHook(runtime, method.getName(), method.getParameterTypes());
-            else info("NFC-RUNTIME candidate not auto-hooked (params=" + method.getParameterCount() + "): " + method.getName());
-        }
-        info("NFC-RUNTIME METHOD ENUM END class=" + runtime.getName() + " total=" + total + " candidates=" + candidates);
-    }
-
-    private boolean isCandidateMethod(Method method) {
-        if (method.isSynthetic() || method.isBridge()) return false;
-        String name = method.getName().toLowerCase(Locale.ROOT);
-        for (String keyword : CANDIDATE_KEYWORDS) if (name.contains(keyword)) return true;
-        return false;
-    }
-
-    private void installHostTraceHooks(Class<?> runtime) {
-        installTraceHook(runtime, "changeRfParams", byte[].class, boolean.class);
-        installTraceHook(runtime, "changeRfParamsByConfig", byte[].class);
-        installTraceHook(runtime, "doWriteData", byte[].class, byte[].class);
-        installTraceHook(runtime, "nativeSendRawVendorCmd", int.class, int.class, int.class, byte[].class);
-        installTraceHook(runtime, "setDiscoveryTech", int.class, int.class);
-        installTraceHook(runtime, "resetDiscoveryTech");
-        installTraceHook(runtime, "restartRfDiscovery");
-        installTraceHook(runtime, "doRestartRFDiscovery");
-    }
-
-    private void installNamedTraceHooks(Class<?> runtime, String methodName) {
-        int found = 0;
-        for (Method method : runtime.getDeclaredMethods()) {
-            if (!methodName.equals(method.getName())) continue;
-            found++;
-            installTraceHook(runtime, methodName, method.getParameterTypes());
-        }
-        if (found == 0) info("NFC-TRACE named method absent: " + runtime.getName() + "." + methodName);
-    }
-
-    private void installTraceHook(Class<?> runtime, String methodName, Class<?>... parameterTypes) {
-        String key = runtime.getName() + "#" + methodName + Arrays.toString(parameterTypes);
-        synchronized (installedTraceHooks) { if (installedTraceHooks.contains(key)) return; }
+    private int installVerifiedHceHook(ClassLoader cl, String className) {
         try {
-            Method method = runtime.getDeclaredMethod(methodName, parameterTypes);
+            Class<?> runtime = Class.forName(className, false, cl);
+            Method method = runtime.getDeclaredMethod(
+                    "setHceTypeAConfig",
+                    boolean.class,
+                    byte[].class,
+                    byte[].class,
+                    byte[].class
+            );
+
             hook(method).intercept(chain -> {
-                Object thisObject = chain.getThisObject();
-                Object[] argsArray = chain.getArgs().toArray();
-                info("NFC-TRACE ENTER " + runtime.getSimpleName() + "." + methodName + " args=" + summarizeArgs(argsArray));
-                logPayloadDigests(methodName, argsArray);
-                if ("setConfig".equals(methodName)) logBinderCaller();
-                if ("restoreSavedTech".equals(methodName)) logActualSavedTech(thisObject, "BEFORE");
-                logDiscoveryMasks(methodName, argsArray);
-                logShortStack(methodName);
-                try {
+                reportModuleActive("com.android.nfc");
+
+                Object[] incoming = chain.getArgs().toArray();
+                info("HCE: ENTER " + runtime.getSimpleName() + ".setHceTypeAConfig args=" + summarizeArgs(incoming));
+
+                SimConfig config = readConfig();
+                if (!config.active || config.uid == null || config.uid.isBlank()) {
+                    info("HCE: PASS simulation disabled or UID missing");
                     Object result = chain.proceed();
-                    if ("restoreSavedTech".equals(methodName)) logActualSavedTech(thisObject, "AFTER");
-                    if (result instanceof Integer) logIntBreakdown(methodName + ".result", (Integer) result);
-                    info("NFC-TRACE RETURN " + runtime.getSimpleName() + "." + methodName + " result=" + summarizeValue(result));
+                    info("HCE: RETURN pass-through result=" + String.valueOf(result));
+                    return result;
+                }
+
+                try {
+                    byte[] uid = hexToBytes(config.uid);
+                    byte[] sak = hexToBytes(defaultIfBlank(config.sak, "08"));
+                    byte[] atqa = hexToBytes(defaultIfBlank(config.atqa, "0400"));
+
+                    Object[] replacement = new Object[] { true, uid, sak, atqa };
+                    info("HCE: APPLY uid=" + normalizeHex(config.uid)
+                            + " sak=" + normalizeHex(defaultIfBlank(config.sak, "08"))
+                            + " atqa=" + normalizeHex(defaultIfBlank(config.atqa, "0400"))
+                            + " via=" + runtime.getSimpleName());
+
+                    Object result = chain.proceed(replacement);
+                    info("HCE: APPLIED result=" + String.valueOf(result));
                     return result;
                 } catch (Throwable t) {
-                    warn("NFC-TRACE THROW " + runtime.getSimpleName() + "." + methodName + " exception=" + t.getClass().getName());
-                    throw t;
+                    error("HCE: APPLY FAILED; falling back to original call", t);
+                    return chain.proceed();
                 }
             });
-            synchronized (installedTraceHooks) { installedTraceHooks.add(key); }
-            info("NFC-TRACE hook installed: " + formatMethod(method));
+
+            info("HCE: hook installed " + method.toGenericString());
+            return 1;
+        } catch (ClassNotFoundException e) {
+            info("HCE: class absent " + className);
+            return 0;
         } catch (NoSuchMethodException e) {
-            info("NFC-TRACE method absent: " + runtime.getName() + "." + methodName);
+            warn("HCE: verified signature absent in " + className);
+            return 0;
         } catch (Throwable t) {
-            warn("NFC-TRACE hook failed: " + runtime.getName() + "." + methodName + " / " + t.getClass().getSimpleName(), t);
+            error("HCE: hook install failed for " + className, t);
+            return 0;
         }
     }
 
-    private void logBinderCaller() {
-        try {
-            int uid = Binder.getCallingUid(), pid = Binder.getCallingPid();
-            String packages = "[]";
-            Application app = currentApplication();
-            if (app != null) {
-                String[] names = app.getPackageManager().getPackagesForUid(uid);
-                packages = names == null ? "[]" : Arrays.toString(names);
-            }
-            info("NFC-SELECTOR CALLER uid=" + uid + " pid=" + pid + " packages=" + packages);
-        } catch (Throwable t) { info("NFC-SELECTOR CALLER unavailable=" + t.getClass().getSimpleName()); }
-    }
-
-    private void logPayloadDigests(String methodName, Object[] args) {
-        if (!"setConfig".equals(methodName) && !"setTransitConfig".equals(methodName) && !"changeRfParamsByConfig".equals(methodName) && !"changeRfParams".equals(methodName)) return;
-        for (int i = 0; i < args.length; i++) {
-            byte[] payload = null; String sourceType = null;
-            if (args[i] instanceof byte[]) { payload = (byte[]) args[i]; sourceType = "byte[]"; }
-            else if (args[i] instanceof String) { payload = ((String) args[i]).getBytes(StandardCharsets.UTF_8); sourceType = "String/UTF-8"; }
-            if (payload == null) continue;
-            info("NFC-TRACE DIGEST " + methodName + ".arg" + i + " type=" + sourceType + " bytes=" + payload.length + " sha256=" + sha256(payload));
-        }
-    }
-
-    private String sha256(byte[] data) {
-        try {
-            MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            byte[] hash = digest.digest(data);
-            StringBuilder sb = new StringBuilder(hash.length * 2);
-            for (byte b : hash) sb.append(String.format(Locale.ROOT, "%02x", b & 0xff));
-            return sb.toString();
-        } catch (Throwable t) { return "unavailable:" + t.getClass().getSimpleName(); }
-    }
-
-    private void logActualSavedTech(Object service, String phase) {
-        Integer poll = invokeIntGetter(service, "getNfcPollTech"), listen = invokeIntGetter(service, "getNfcListenTech");
-        info("NFC-TRACE SAVED " + phase + " poll=" + summarizeValue(poll) + " listen=" + summarizeValue(listen));
-        if (poll != null) logIntBreakdown("SAVED." + phase + ".poll", poll);
-        if (listen != null) logIntBreakdown("SAVED." + phase + ".listen", listen);
-    }
-
-    private Integer invokeIntGetter(Object target, String methodName) {
-        if (target == null) return null;
-        try {
-            Method method = target.getClass().getDeclaredMethod(methodName);
-            method.setAccessible(true);
-            Object value = method.invoke(target);
-            return value instanceof Integer ? (Integer) value : null;
-        } catch (Throwable t) { info("NFC-TRACE SAVED unable to read " + methodName + ": " + t.getClass().getSimpleName()); return null; }
-    }
-
-    private void logDiscoveryMasks(String methodName, Object[] args) {
-        String lower = methodName.toLowerCase(Locale.ROOT);
-        if (!lower.contains("discoverytech") && !lower.contains("listentech") && !lower.contains("polltech")) return;
-        for (int i = 0; i < args.length; i++) if (args[i] instanceof Integer) logIntBreakdown(methodName + ".arg" + i, (Integer) args[i]);
-    }
-
-    private void logIntBreakdown(String label, int value) {
-        int high2 = value & 0xC0000000, middle = value & 0x3FFFFF00, low8 = value & 0x000000FF;
-        info("NFC-TRACE MASK " + label + " raw=0x" + hex8(value) + " high2=0x" + hex8(high2) + " middle=0x" + hex8(middle) + " low8=0x" + hex8(low8));
-    }
-
-    private String summarizeArgs(Object[] args) {
-        if (args == null || args.length == 0) return "[]";
-        StringBuilder sb = new StringBuilder("[");
-        for (int i = 0; i < args.length; i++) { if (i > 0) sb.append(", "); sb.append(i).append('=').append(summarizeValue(args[i])); }
-        return sb.append(']').toString();
-    }
-
-    private String summarizeValue(Object value) {
-        if (value == null) return "null";
-        if (value instanceof byte[]) return "byte[len=" + ((byte[]) value).length + "]";
-        if (value instanceof int[]) return "int[len=" + ((int[]) value).length + "]";
-        if (value instanceof boolean[]) return "boolean[len=" + ((boolean[]) value).length + "]";
-        if (value instanceof Integer) { int v = (Integer) value; return v + "(0x" + Integer.toHexString(v).toUpperCase(Locale.ROOT) + ")"; }
-        if (value instanceof Number || value instanceof Boolean || value instanceof Character) return String.valueOf(value);
-        if (value instanceof String) return "String[len=" + ((String) value).length() + "]";
-        return value.getClass().getName();
-    }
-
-    private String hex8(int value) { return String.format(Locale.ROOT, "%08X", value); }
-
-    private void logShortStack(String methodName) {
-        StackTraceElement[] stack = Thread.currentThread().getStackTrace();
-        int emitted = 0;
-        for (StackTraceElement frame : stack) {
-            String className = frame.getClassName();
-            if (className.equals(Thread.class.getName()) || className.equals(getClass().getName())) continue;
-            if (className.startsWith("io.github.libxposed.")) continue;
-            info("NFC-TRACE STACK " + methodName + " #" + emitted + " " + className + "." + frame.getMethodName() + ":" + frame.getLineNumber());
-            if (++emitted >= MAX_STACK_FRAMES) break;
-        }
-    }
-
-    private void logConfiguredTestRequest() {
+    private SimConfig readConfig() {
         Cursor cursor = null;
         try {
             Application app = currentApplication();
-            if (app == null) { warn("UID config bridge unavailable: currentApplication is null"); return; }
+            if (app == null) {
+                warn("CONFIG: currentApplication unavailable");
+                return SimConfig.DISABLED;
+            }
+
             cursor = app.getContentResolver().query(CONFIG_URI, null, null, null, null);
-            if (cursor == null) { warn("UID config bridge returned no rows"); return; }
-            boolean active = false; String uid = null;
+            if (cursor == null) {
+                warn("CONFIG: provider returned null cursor");
+                return SimConfig.DISABLED;
+            }
+
+            boolean active = false;
+            String uid = null;
+            String sak = null;
+            String atqa = null;
             while (cursor.moveToNext()) {
                 String key = cursor.getString(0);
                 String value = cursor.getString(1);
-                if ("simulation_enabled".equals(key)) active = "true".equalsIgnoreCase(value);
-                if ("uid".equals(key)) uid = value;
+                if (KEY_SIMULATION_ENABLED.equals(key)) active = "true".equalsIgnoreCase(value);
+                else if (KEY_UID.equals(key)) uid = value;
+                else if (KEY_SAK.equals(key)) sak = value;
+                else if (KEY_ATQA.equals(key)) atqa = value;
             }
-            info("UID test config observed: active=" + active + ", uidPresent=" + (uid != null && !uid.isBlank()));
+
+            info("CONFIG: active=" + active + " uidPresent=" + (uid != null && !uid.isBlank()));
+            return new SimConfig(active, uid, sak, atqa);
         } catch (Throwable t) {
-            warn("Unable to read UID test configuration: " + t.getClass().getSimpleName(), t);
-        } finally { if (cursor != null) cursor.close(); }
+            error("CONFIG: read failed", t);
+            return SimConfig.DISABLED;
+        } finally {
+            if (cursor != null) cursor.close();
+        }
+    }
+
+    private void reportModuleActive(String processName) {
+        if (heartbeatWritten) return;
+        try {
+            Application app = currentApplication();
+            if (app == null) {
+                info("MODULE: heartbeat deferred; currentApplication unavailable");
+                return;
+            }
+
+            int bootCount = Settings.Global.getInt(app.getContentResolver(), Settings.Global.BOOT_COUNT, -1);
+            ContentValues values = new ContentValues();
+            values.put(KEY_MODULE_ACTIVE, true);
+            values.put(KEY_MODULE_PROCESS, processName);
+            values.put(KEY_MODULE_BOOT_COUNT, bootCount);
+            app.getContentResolver().insert(CONFIG_URI, values);
+            heartbeatWritten = true;
+            info("MODULE: heartbeat persisted process=" + processName + " boot=" + bootCount);
+        } catch (Throwable t) {
+            error("MODULE: heartbeat write failed", t);
+        }
     }
 
     private Application currentApplication() {
         try {
             Class<?> activityThread = Class.forName("android.app.ActivityThread");
-            Method currentApplication = activityThread.getDeclaredMethod("currentApplication");
-            currentApplication.setAccessible(true);
-            Object value = currentApplication.invoke(null);
+            Method method = activityThread.getDeclaredMethod("currentApplication");
+            method.setAccessible(true);
+            Object value = method.invoke(null);
             return value instanceof Application ? (Application) value : null;
-        } catch (Throwable t) { return null; }
+        } catch (Throwable t) {
+            return null;
+        }
     }
 
-    private String formatMethod(Method method) {
-        return Modifier.toString(method.getModifiers()) + " " + method.getReturnType().getTypeName() + " " + method.getDeclaringClass().getName() + "." + method.getName() + "(" + joinTypes(method.getParameterTypes()) + ")";
+    private byte[] hexToBytes(String value) {
+        String hex = normalizeHex(value);
+        if (hex.length() == 0 || (hex.length() & 1) != 0) {
+            throw new IllegalArgumentException("invalid hex length=" + hex.length());
+        }
+        byte[] result = new byte[hex.length() / 2];
+        for (int i = 0; i < result.length; i++) {
+            int offset = i * 2;
+            result[i] = (byte) Integer.parseInt(hex.substring(offset, offset + 2), 16);
+        }
+        return result;
     }
 
-    private String joinTypes(Class<?>[] types) { return Arrays.stream(types).map(Class::getTypeName).reduce((a, b) -> a + ", " + b).orElse(""); }
-    private void info(String message) { log(Log.INFO, TAG, message); Log.i(TAG, message); }
-    private void warn(String message) { log(Log.WARN, TAG, message); Log.w(TAG, message); }
-    private void warn(String message, Throwable t) { log(Log.WARN, TAG, message, t); Log.w(TAG, message, t); }
+    private String normalizeHex(String value) {
+        if (value == null) return "";
+        return value.replace(":", "")
+                .replace(" ", "")
+                .replace("0x", "")
+                .replace("0X", "")
+                .toUpperCase(Locale.ROOT);
+    }
+
+    private String defaultIfBlank(String value, String fallback) {
+        return value == null || value.isBlank() ? fallback : value;
+    }
+
+    private String summarizeArgs(Object[] args) {
+        if (args == null) return "null";
+        StringBuilder sb = new StringBuilder("[");
+        for (int i = 0; i < args.length; i++) {
+            if (i > 0) sb.append(", ");
+            Object arg = args[i];
+            sb.append(i).append('=');
+            if (arg instanceof byte[]) sb.append("byte[len=").append(((byte[]) arg).length).append(']');
+            else sb.append(String.valueOf(arg));
+        }
+        return sb.append(']').toString();
+    }
+
+    private static final class SimConfig {
+        static final SimConfig DISABLED = new SimConfig(false, null, null, null);
+        final boolean active;
+        final String uid;
+        final String sak;
+        final String atqa;
+
+        SimConfig(boolean active, String uid, String sak, String atqa) {
+            this.active = active;
+            this.uid = uid;
+            this.sak = sak;
+            this.atqa = atqa;
+        }
+    }
+
+    private void info(String message) {
+        log(Log.INFO, TAG, message);
+        Log.i(TAG, message);
+    }
+
+    private void warn(String message) {
+        log(Log.WARN, TAG, message);
+        Log.w(TAG, message);
+    }
+
+    private void error(String message, Throwable t) {
+        log(Log.ERROR, TAG, message, t);
+        Log.e(TAG, message, t);
+    }
 }
