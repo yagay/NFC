@@ -33,6 +33,7 @@ import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
 import java.io.File
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 enum class LogSource(val label: String) {
     STATUS("状态"),
@@ -71,8 +72,12 @@ class MainActivity : ComponentActivity() {
     private var nfcAdapter: NfcAdapter? = null
     private var pendingIntent: PendingIntent? = null
     private val gson = Gson()
-    private val executor = Executors.newSingleThreadExecutor()
+    // NFC operations must never queue behind logcat/diagnostic collection.
+    private val operationExecutor = Executors.newSingleThreadExecutor()
+    private val diagnosticExecutor = Executors.newSingleThreadExecutor()
     private val vendorNfcController = VendorNfcController()
+    @Volatile private var rootAvailableCache: Boolean? = null
+    @Volatile private var lastRootToastAt: Long = 0L
     private var scannedCardState by mutableStateOf<CardModel?>(null)
     private var savedCardsState by mutableStateOf<List<CardModel>>(emptyList())
     private var readModeEnabled by mutableStateOf(false)
@@ -98,7 +103,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() { super.onResume(); if (readModeEnabled) enableReadDispatch() }
     override fun onPause() { disableReadDispatch(); super.onPause() }
-    override fun onDestroy() { disableReadDispatch(); executor.shutdownNow(); super.onDestroy() }
+    override fun onDestroy() { disableReadDispatch(); operationExecutor.shutdownNow(); diagnosticExecutor.shutdownNow(); super.onDestroy() }
 
     private fun enableReadDispatch() {
         if (!readModeEnabled) return
@@ -169,8 +174,9 @@ class MainActivity : ComponentActivity() {
 
         LaunchedEffect(selectedSource, logsEnabled) {
             while (true) {
-                executor.execute {
-                    val newStatus = readRuntimeStatus()
+                diagnosticExecutor.execute {
+                    // Normal UI refresh is Provider-only. Root/pidof is used only while logs are enabled.
+                    val newStatus = readRuntimeStatus(includeRootPid = logsEnabled)
                     val logs = if (logsEnabled) fetchLogsSync(selectedSource) else ""
                     runOnUiThread {
                         status = newStatus
@@ -181,7 +187,7 @@ class MainActivity : ComponentActivity() {
                         }
                     }
                 }
-                kotlinx.coroutines.delay(if (logsEnabled) 2000 else 3000)
+                kotlinx.coroutines.delay(if (logsEnabled) 2000 else 4000)
             }
         }
 
@@ -407,8 +413,8 @@ class MainActivity : ComponentActivity() {
         stopReadMode("simulation_start")
         writeSimulationConfig(card)
         AppLogger.i("SIMULATION: DIRECT_BINDER requested uid=${card.uid} sak=${card.sak} atqa=${card.atqa}")
-        executor.execute {
-            var state = readRuntimeStatus()
+        operationExecutor.execute {
+            var state = readRuntimeStatus(includeRootPid = true)
             var restarted = false
 
             if (!state.hookInstalled || state.hookBuild != EXPECTED_HOOK_BUILD) {
@@ -435,7 +441,7 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
-            state = if (binderResult.success) waitForHookAndRf(card.uid, 5_000) else readRuntimeStatus()
+            state = if (binderResult.success) waitForHookAndRf(card.uid, 5_000) else readRuntimeStatus(includeRootPid = true)
             val applied = binderResult.success && state.rfStatus == "RF_UID_APPLIED" && state.rfUid.equals(card.uid, true) && state.rfResult == "0"
             val message = when {
                 applied -> "模拟已应用 · UID=${card.uid} · Binder直连"
@@ -461,7 +467,7 @@ class MainActivity : ComponentActivity() {
             put(ConfigProvider.KEY_FULL_DIAG_SUMMARY, "Disabling share mode, then restarting NFC to restore stock RF")
         })
         AppLogger.i("SIMULATION: DIRECT_BINDER stop requested; stock RF restart required")
-        executor.execute {
+        operationExecutor.execute {
             val binderResult = vendorNfcController.setShareMode(false)
             AppLogger.i("SIMULATION: VENDOR_BINDER disable success=${binderResult.success} stage=${binderResult.stage} detail=${binderResult.detail}")
 
@@ -484,7 +490,7 @@ class MainActivity : ComponentActivity() {
                     if (state.hookInstalled) "Stock RF restored after mandatory NFC restart"
                     else "NFC restarted for stock RF; hook status not yet confirmed")
             })
-            val finalState = readRuntimeStatus()
+            val finalState = readRuntimeStatus(includeRootPid = true)
             val message = if (state.hookInstalled) {
                 "模拟已停止 · NFC 已重启并恢复原厂 RF"
             } else {
@@ -554,7 +560,7 @@ class MainActivity : ComponentActivity() {
         val end = System.currentTimeMillis() + timeoutMs
         var state = RuntimeStatus()
         while (System.currentTimeMillis() < end) {
-            state = readRuntimeStatus()
+            state = readRuntimeStatus(includeRootPid = true)
             if (state.hookInstalled && state.hookBuild == EXPECTED_HOOK_BUILD && state.rfStatus == "RF_UID_APPLIED" && state.rfUid.equals(uid, true)) return state
             Thread.sleep(100)
         }
@@ -565,7 +571,7 @@ class MainActivity : ComponentActivity() {
         val end = System.currentTimeMillis() + timeoutMs
         var state = RuntimeStatus()
         while (System.currentTimeMillis() < end) {
-            state = readRuntimeStatus()
+            state = readRuntimeStatus(includeRootPid = true)
             if (state.hookInstalled && state.hookBuild == EXPECTED_HOOK_BUILD) return state
             Thread.sleep(200)
         }
@@ -580,15 +586,21 @@ class MainActivity : ComponentActivity() {
         return map
     }
 
-    private fun readRuntimeStatus(): RuntimeStatus {
+    private fun readRuntimeStatus(includeRootPid: Boolean = false): RuntimeStatus {
         val map = readProviderMap()
-        val currentPid = currentNfcPid().toIntOrNull() ?: 0
         val scopePid = map[ConfigProvider.KEY_SCOPE_PID]?.toIntOrNull() ?: 0
         val hookPid = map[ConfigProvider.KEY_HOOK_PID]?.toIntOrNull() ?: 0
+        val rfPidFromProvider = map[ConfigProvider.KEY_RF_PID]?.toIntOrNull() ?: 0
+        // Avoid su/pidof during ordinary UI refresh. The Hook already publishes its current PID.
+        val currentPid = if (includeRootPid) {
+            currentNfcPid().toIntOrNull() ?: 0
+        } else {
+            hookPid.takeIf { it > 0 } ?: scopePid.takeIf { it > 0 } ?: rfPidFromProvider
+        }
         val hookBuild = map[ConfigProvider.KEY_HOOK_BUILD]?.toIntOrNull() ?: 0
         val hookFresh = currentPid > 0 && hookPid == currentPid && hookBuild == EXPECTED_HOOK_BUILD && map[ConfigProvider.KEY_HOOK_INSTALLED].toBoolean()
         val scopeFresh = currentPid > 0 && scopePid == currentPid && hookBuild == EXPECTED_HOOK_BUILD && map[ConfigProvider.KEY_SCOPE_OK].toBoolean()
-        val rfPid = map[ConfigProvider.KEY_RF_PID]?.toIntOrNull() ?: 0
+        val rfPid = rfPidFromProvider
         return RuntimeStatus(
             appBuild = map[ConfigProvider.KEY_APP_BUILD]?.toIntOrNull() ?: 0,
             hookBuild = hookBuild,
@@ -676,7 +688,7 @@ class MainActivity : ComponentActivity() {
 
     private fun saveDiagnosticWithoutSharing(onDone: () -> Unit) {
         stopReadMode("diagnostic_save")
-        executor.execute {
+        diagnosticExecutor.execute {
             try {
                 val dir = getExternalFilesDir("diagnostics") ?: filesDir
                 if (!dir.exists()) dir.mkdirs()
@@ -697,7 +709,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun buildFullDiagnosticReport(): String = buildString {
-        val s = readRuntimeStatus()
+        val s = readRuntimeStatus(includeRootPid = true)
         appendLine("=== NFC FULL CHECK 1.0.15 ===")
         appendLine("Generated: ${System.currentTimeMillis()}")
         appendLine("Trigger: production Vendor Binder transaction 6 -> 15")
@@ -723,13 +735,45 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun runRootCmd(command: String): String = try {
-        val process = Runtime.getRuntime().exec(arrayOf("su", "-c", command))
-        val out = process.inputStream.bufferedReader().readText()
-        val err = process.errorStream.bufferedReader().readText()
-        process.waitFor()
-        buildString { append(out); if (err.isNotBlank()) appendLine(err); appendLine("[exit=${process.exitValue()}]") }
-    } catch (t: Throwable) { "ERROR ${t.javaClass.simpleName}: ${t.message}" }
+    private fun ensureRootAccess(showToast: Boolean = true): Boolean {
+        rootAvailableCache?.let { if (it) return true }
+        val ok = try {
+            val process = Runtime.getRuntime().exec(arrayOf("su", "-c", "id -u"))
+            val finished = process.waitFor(4, TimeUnit.SECONDS)
+            val output = if (finished) process.inputStream.bufferedReader().readText().trim() else ""
+            if (!finished) process.destroyForcibly()
+            finished && process.exitValue() == 0 && output.lineSequence().any { it.trim() == "0" }
+        } catch (_: Throwable) {
+            false
+        }
+        rootAvailableCache = if (ok) true else null // allow a later retry after the user grants Root.
+        if (!ok && showToast) notifyRootUnavailable()
+        return ok
+    }
+
+    private fun notifyRootUnavailable() {
+        val now = System.currentTimeMillis()
+        if (now - lastRootToastAt < 3000L) return
+        lastRootToastAt = now
+        runOnUiThread {
+            Toast.makeText(this@MainActivity, "Root 获取失败，请在 Root 管理器中授予本应用权限", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun runRootCmd(command: String): String {
+        if (!ensureRootAccess(showToast = true)) return "ROOT_UNAVAILABLE"
+        return try {
+            val process = Runtime.getRuntime().exec(arrayOf("su", "-c", command))
+            val out = process.inputStream.bufferedReader().readText()
+            val err = process.errorStream.bufferedReader().readText()
+            process.waitFor()
+            buildString { append(out); if (err.isNotBlank()) appendLine(err); appendLine("[exit=${process.exitValue()}]") }
+        } catch (t: Throwable) {
+            rootAvailableCache = null
+            notifyRootUnavailable()
+            "ERROR ${t.javaClass.simpleName}: ${t.message}"
+        }
+    }
 
     private fun bytesToHex(bytes: ByteArray): String = bytes.joinToString("") { "%02X".format(it) }
 }
