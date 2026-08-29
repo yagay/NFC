@@ -64,17 +64,17 @@ class VendorNfcBinderTestActivity : ComponentActivity() {
                 appendLine("app_uid=${Process.myUid()} app_pid=${Process.myPid()} package=$packageName")
                 appendLine("simulation_enabled=${state[ConfigProvider.KEY_SIMULATION_ENABLED]}")
                 appendLine("target_uid=${state[ConfigProvider.KEY_UID]}")
-                appendLine("hook_build=${state[\"hook_build\"]}")
-                appendLine("hook_pid=${state[\"hook_pid\"]}")
-                appendLine("scope_pid=${state[\"scope_pid\"]}")
+                appendLine("hook_build=${state["hook_build"]}")
+                appendLine("hook_pid=${state["hook_pid"]}")
+                appendLine("scope_pid=${state["scope_pid"]}")
                 appendLine()
-                appendLine("vendor_meta_ready=${state[\"vendor_meta_ready\"] ?: \"<missing>\"}")
-                appendLine("vendor_share_mode_transaction=${state[\"vendor_share_mode_transaction\"] ?: \"<missing>\"}")
-                appendLine("vendor_share_mode_transaction_source=${state[\"vendor_share_mode_transaction_source\"] ?: \"<missing>\"}")
-                appendLine("vendor_binder_descriptor=${state[\"vendor_binder_descriptor\"] ?: \"<missing>\"}")
-                appendLine("vendor_share_mode_method=${state[\"vendor_share_mode_method\"] ?: \"<missing>\"}")
-                appendLine("vendor_meta_report=${state[\"vendor_meta_report\"] ?: \"<missing>\"}")
-                appendLine("vendor_meta_error=${state[\"vendor_meta_error\"] ?: \"<none>\"}")
+                appendLine("vendor_meta_ready=${state["vendor_meta_ready"] ?: "<missing>"}")
+                appendLine("vendor_share_mode_transaction=${state["vendor_share_mode_transaction"] ?: "<missing>"}")
+                appendLine("vendor_share_mode_transaction_source=${state["vendor_share_mode_transaction_source"] ?: "<missing>"}")
+                appendLine("vendor_binder_descriptor=${state["vendor_binder_descriptor"] ?: "<missing>"}")
+                appendLine("vendor_share_mode_method=${state["vendor_share_mode_method"] ?: "<missing>"}")
+                appendLine("vendor_meta_report=${state["vendor_meta_report"] ?: "<missing>"}")
+                appendLine("vendor_meta_error=${state["vendor_meta_error"] ?: "<none>"}")
                 appendLine()
 
                 val tx = state["vendor_share_mode_transaction"]?.toIntOrNull()
@@ -106,7 +106,9 @@ class VendorNfcBinderTestActivity : ComponentActivity() {
         val out = mutableMapOf<String, String>()
         runCatching {
             contentResolver.query(ConfigProvider.URI, null, null, null, null)?.use { c ->
-                while (c.moveToNext()) out[c.getString(0)] = c.getString(1)
+                while (c.moveToNext()) {
+                    out[c.getString(0)] = c.getString(1)
+                }
             }
         }
         return out
