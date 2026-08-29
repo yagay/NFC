@@ -21,7 +21,10 @@ public class NfcDiagnosticsModule extends XposedModule {
     private static final String TAG = "NfcUIDSim";
     private static final Uri CONFIG_URI = Uri.parse("content://com.example.nfcdoorcard.config/settings");
     private static final int PARAM_LA_NFCID1 = 0x33;
+    private static final int HOOK_BUILD = 8;
 
+    private static final String KEY_APP_BUILD = "app_build";
+    private static final String KEY_HOOK_BUILD = "hook_build";
     private static final String KEY_SIMULATION_ENABLED = "simulation_enabled";
     private static final String KEY_UID = "uid";
     private static final String KEY_SAK = "sak";
@@ -51,7 +54,7 @@ public class NfcDiagnosticsModule extends XposedModule {
     @Override
     public void onModuleLoaded(XposedModuleInterface.ModuleLoadedParam param) {
         super.onModuleLoaded(param);
-        info("MODULE: loaded process=" + param.getProcessName() + ", api=" + getApiVersion());
+        info("MODULE: loaded build=" + HOOK_BUILD + " process=" + param.getProcessName() + ", api=" + getApiVersion());
     }
 
     @Override
@@ -60,8 +63,9 @@ public class NfcDiagnosticsModule extends XposedModule {
         if (!"com.android.nfc".equals(lp.getPackageName())) return;
 
         int pid = Process.myPid();
-        info("SCOPE: SUCCESS package=com.android.nfc pid=" + pid);
+        info("SCOPE: SUCCESS build=" + HOOK_BUILD + " package=com.android.nfc pid=" + pid);
         writeStatus(values(
+                KEY_HOOK_BUILD, HOOK_BUILD,
                 KEY_SCOPE_OK, true,
                 KEY_SCOPE_PROCESS, "com.android.nfc",
                 KEY_SCOPE_PID, pid,
@@ -94,13 +98,14 @@ public class NfcDiagnosticsModule extends XposedModule {
         installed += installTraceHooks(cl, "com.android.nfc.NfcService");
 
         writeStatus(values(
+                KEY_HOOK_BUILD, HOOK_BUILD,
                 KEY_HOOK_INSTALLED, installed > 0,
                 KEY_HOOK_COUNT, installed,
                 KEY_HOOK_PID, pid,
                 KEY_TRACE_STAGE, installed > 0 ? "READY" : "HOOK_FAILED"
         ));
-        if (installed > 0) info("HOOK: SUCCESS installed=" + installed + " pid=" + pid);
-        else warn("HOOK: FAILED no NFC hooks installed pid=" + pid);
+        if (installed > 0) info("HOOK: SUCCESS build=" + HOOK_BUILD + " installed=" + installed + " pid=" + pid);
+        else warn("HOOK: FAILED build=" + HOOK_BUILD + " no NFC hooks installed pid=" + pid);
     }
 
     private int installVerifiedHceHook(ClassLoader cl, String className) {
@@ -112,7 +117,7 @@ public class NfcDiagnosticsModule extends XposedModule {
                 Object[] incoming = chain.getArgs().toArray();
                 SimConfig config = readConfig();
                 String source = runtime.getSimpleName() + ".setHceTypeAConfig";
-                info("HCE: ENTER pid=" + pid + " source=" + source + " args=" + summarizeArgs(incoming) + " active=" + config.active);
+                info("HCE: ENTER build=" + HOOK_BUILD + " pid=" + pid + " source=" + source + " args=" + summarizeArgs(incoming) + " active=" + config.active);
                 writeStatus(values(KEY_TRACE_STAGE, "HCE_ENTER", KEY_TRACE_SOURCE, source, KEY_TRACE_PID, pid, KEY_HIJACK_PID, pid));
 
                 if (!config.active || config.uid == null || config.uid.isBlank()) {
@@ -128,12 +133,12 @@ public class NfcDiagnosticsModule extends XposedModule {
                     writeStatus(values(KEY_HIJACK_STATUS, "APPLYING", KEY_HIJACK_UID, normalizedUid, KEY_HIJACK_ERROR, "", KEY_HIJACK_PID, pid));
                     info("HCE: APPLY pid=" + pid + " uid=" + normalizedUid + " sak=" + bytesToHex(sak) + " atqa=" + bytesToHex(atqa) + " via=" + source);
                     Object result = chain.proceed(new Object[]{true, uid, sak, atqa});
-                    boolean success = !(result instanceof Boolean) || Boolean.TRUE.equals(result);
+                    boolean success = Boolean.TRUE.equals(result);
                     writeStatus(values(
                             KEY_HIJACK_STATUS, success ? "NATIVE_ACCEPTED" : "FAILED",
                             KEY_HIJACK_RESULT, String.valueOf(result),
                             KEY_HIJACK_UID, normalizedUid,
-                            KEY_HIJACK_ERROR, success ? "" : "native returned false",
+                            KEY_HIJACK_ERROR, success ? "" : "setHceTypeAConfig returned " + String.valueOf(result),
                             KEY_HIJACK_PID, pid,
                             KEY_TRACE_STAGE, success ? "HCE_NATIVE_ACCEPTED" : "HCE_NATIVE_FAILED",
                             KEY_TRACE_SOURCE, source,
@@ -148,7 +153,7 @@ public class NfcDiagnosticsModule extends XposedModule {
                     return chain.proceed();
                 }
             });
-            writeStatus(values(KEY_HOOK_INSTALLED, true, KEY_HOOK_CLASS, className, KEY_HOOK_PID, Process.myPid()));
+            writeStatus(values(KEY_HOOK_INSTALLED, true, KEY_HOOK_CLASS, className, KEY_HOOK_PID, Process.myPid(), KEY_HOOK_BUILD, HOOK_BUILD));
             info("HOOK: INSTALLED " + method.toGenericString());
             return 1;
         } catch (ClassNotFoundException e) {
@@ -175,23 +180,42 @@ public class NfcDiagnosticsModule extends XposedModule {
                     Object[] args = chain.getArgs().toArray();
                     SimConfig config = readConfig();
                     String source = runtime.getSimpleName() + "." + method.getName();
-                    info("TRACE: ENTER pid=" + pid + " source=" + source + " args=" + summarizeArgs(args));
+                    info("TRACE: ENTER build=" + HOOK_BUILD + " pid=" + pid + " source=" + source + " args=" + summarizeArgs(args));
                     writeStatus(values(KEY_TRACE_STAGE, "CALL_ENTER", KEY_TRACE_SOURCE, source, KEY_TRACE_PID, pid));
 
                     boolean changed = false;
                     for (int i = 0; i < args.length; i++) {
                         if (!(args[i] instanceof byte[])) continue;
                         byte[] original = (byte[]) args[i];
-                        if (looksLikeCoreSetConfig(original)) {
-                            info("NCI: CORE_SET_CONFIG pid=" + pid + " source=" + source + " arg=" + i + " hex=" + bytesToHex(original));
-                            writeStatus(values(KEY_TRACE_STAGE, "CORE_SET_CONFIG", KEY_TRACE_SOURCE, source, KEY_TRACE_PID, pid));
+                        boolean confirmedCoreSetConfig = looksLikeCoreSetConfig(original);
+                        if (confirmedCoreSetConfig) {
+                            info("NCI: CORE_SET_CONFIG CONFIRMED pid=" + pid + " source=" + source + " arg=" + i + " hex=" + bytesToHex(original));
+                            writeStatus(values(KEY_TRACE_STAGE, "CORE_SET_CONFIG_CONFIRMED", KEY_TRACE_SOURCE, source, KEY_TRACE_PID, pid));
                         }
+
                         Nfcid1Tlv tlv = findNfcid1Tlv(original);
                         if (tlv == null) continue;
 
-                        info("RF: NFCID1 FOUND pid=" + pid + " source=" + source + " arg=" + i + " len=" + tlv.length + " uid=" + bytesToHex(tlv.value));
-                        writeStatus(values(KEY_RF_STATUS, "OBSERVED", KEY_RF_UID, bytesToHex(tlv.value), KEY_RF_SOURCE, source, KEY_RF_ERROR, "", KEY_RF_PID, pid,
-                                KEY_TRACE_STAGE, "NFCID1_FOUND", KEY_TRACE_SOURCE, source, KEY_TRACE_PID, pid));
+                        if (!confirmedCoreSetConfig) {
+                            info("RF: CANDIDATE_33_TLV_UNCONFIRMED pid=" + pid + " source=" + source + " arg=" + i
+                                    + " len=" + tlv.length + " value=" + bytesToHex(tlv.value) + " packet=" + bytesToHex(original));
+                            writeStatus(values(
+                                    KEY_RF_STATUS, "UNCONFIRMED_33_TLV",
+                                    KEY_RF_UID, bytesToHex(tlv.value),
+                                    KEY_RF_SOURCE, source,
+                                    KEY_RF_RESULT, "not rewritten",
+                                    KEY_RF_ERROR, "0x33 TLV found outside confirmed CORE_SET_CONFIG",
+                                    KEY_RF_PID, pid,
+                                    KEY_TRACE_STAGE, "UNCONFIRMED_33_TLV",
+                                    KEY_TRACE_SOURCE, source,
+                                    KEY_TRACE_PID, pid
+                            ));
+                            continue;
+                        }
+
+                        info("RF: NFCID1 CONFIRMED pid=" + pid + " source=" + source + " arg=" + i + " len=" + tlv.length + " uid=" + bytesToHex(tlv.value));
+                        writeStatus(values(KEY_RF_STATUS, "NFCID1_CONFIRMED", KEY_RF_UID, bytesToHex(tlv.value), KEY_RF_SOURCE, source, KEY_RF_ERROR, "", KEY_RF_PID, pid,
+                                KEY_TRACE_STAGE, "NFCID1_CONFIRMED", KEY_TRACE_SOURCE, source, KEY_TRACE_PID, pid));
 
                         if (config.active && config.uid != null && !config.uid.isBlank()) {
                             byte[] desired = hexToBytes(config.uid);
@@ -203,22 +227,40 @@ public class NfcDiagnosticsModule extends XposedModule {
                             if (rewritten != null) {
                                 args[i] = rewritten;
                                 changed = true;
-                                writeStatus(values(KEY_RF_STATUS, "APPLYING", KEY_RF_UID, bytesToHex(desired), KEY_RF_SOURCE, source, KEY_RF_ERROR, "", KEY_RF_PID, pid,
+                                writeStatus(values(KEY_RF_STATUS, "REWRITTEN_PENDING_RESULT", KEY_RF_UID, bytesToHex(desired), KEY_RF_SOURCE, source, KEY_RF_ERROR, "", KEY_RF_PID, pid,
                                         KEY_TRACE_STAGE, "NFCID1_REWRITTEN", KEY_TRACE_SOURCE, source, KEY_TRACE_PID, pid));
-                                info("RF: NFCID1 REWRITE pid=" + pid + " source=" + source + " oldLen=" + tlv.length + " oldUid=" + bytesToHex(tlv.value)
+                                info("RF: NFCID1 REWRITE CONFIRMED pid=" + pid + " source=" + source + " oldLen=" + tlv.length + " oldUid=" + bytesToHex(tlv.value)
                                         + " newLen=" + desired.length + " newUid=" + bytesToHex(desired) + " packet=" + bytesToHex(rewritten));
                             }
                         }
                     }
 
                     Object result = changed ? chain.proceed(args) : chain.proceed();
-                    info("TRACE: RETURN pid=" + pid + " source=" + source + " result=" + String.valueOf(result));
+                    info("TRACE: RETURN build=" + HOOK_BUILD + " pid=" + pid + " source=" + source + " result=" + String.valueOf(result));
                     if (changed) {
-                        boolean success = !(result instanceof Boolean) || Boolean.TRUE.equals(result);
-                        writeStatus(values(KEY_RF_STATUS, success ? "RF_CONFIG_ACCEPTED" : "FAILED", KEY_RF_RESULT, String.valueOf(result),
-                                KEY_RF_ERROR, success ? "" : "RF config returned false", KEY_RF_PID, pid,
-                                KEY_TRACE_STAGE, success ? "RF_CONFIG_ACCEPTED" : "RF_CONFIG_FAILED", KEY_TRACE_SOURCE, source, KEY_TRACE_PID, pid));
-                        info("RF: CONFIG " + (success ? "ACCEPTED" : "FAILED") + " pid=" + pid + " source=" + source + " result=" + String.valueOf(result));
+                        Boolean success = classifyResult(result);
+                        String status;
+                        String error;
+                        if (Boolean.TRUE.equals(success)) {
+                            status = "RF_CONFIG_ACCEPTED";
+                            error = "";
+                        } else if (Boolean.FALSE.equals(success)) {
+                            status = "RF_CONFIG_FAILED";
+                            error = "RF config returned failure value " + String.valueOf(result);
+                        } else {
+                            status = "RF_CONFIG_RESULT_UNKNOWN";
+                            error = "unknown return semantics for " + (result == null ? "null" : result.getClass().getName());
+                        }
+                        writeStatus(values(
+                                KEY_RF_STATUS, status,
+                                KEY_RF_RESULT, String.valueOf(result),
+                                KEY_RF_ERROR, error,
+                                KEY_RF_PID, pid,
+                                KEY_TRACE_STAGE, status,
+                                KEY_TRACE_SOURCE, source,
+                                KEY_TRACE_PID, pid
+                        ));
+                        info("RF: CONFIG " + status + " pid=" + pid + " source=" + source + " result=" + String.valueOf(result));
                     }
                     return result;
                 });
@@ -235,6 +277,13 @@ public class NfcDiagnosticsModule extends XposedModule {
         }
     }
 
+    private Boolean classifyResult(Object result) {
+        if (result instanceof Boolean) return (Boolean) result;
+        if (result instanceof Number) return ((Number) result).longValue() >= 0L;
+        if (result == null) return null;
+        return null;
+    }
+
     private boolean isTraceCandidate(String name, Class<?>[] types) {
         String lower = name.toLowerCase(Locale.ROOT);
         boolean named = lower.contains("config") || lower.contains("vendor") || lower.contains("raw") || lower.contains("rf")
@@ -245,9 +294,13 @@ public class NfcDiagnosticsModule extends XposedModule {
     }
 
     private boolean looksLikeCoreSetConfig(byte[] data) {
-        if (data == null || data.length < 2) return false;
-        for (int i = 0; i + 1 < data.length; i++) {
-            if ((data[i] & 0xFF) == 0x20 && (data[i + 1] & 0xFF) == 0x02) return true;
+        if (data == null || data.length < 3) return false;
+        for (int i = 0; i + 2 < data.length; i++) {
+            if ((data[i] & 0xFF) == 0x20 && (data[i + 1] & 0xFF) == 0x02) {
+                int payloadLen = data[i + 2] & 0xFF;
+                int remaining = data.length - (i + 3);
+                if (payloadLen <= remaining) return true;
+            }
         }
         return false;
     }
