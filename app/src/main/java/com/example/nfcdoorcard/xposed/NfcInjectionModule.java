@@ -9,6 +9,7 @@ import android.os.Process;
 import android.util.Log;
 
 import com.example.nfcdoorcard.xposed.adapter.NfcStackAdapter;
+import com.example.nfcdoorcard.xposed.adapter.GenericNxpAdapter;
 import com.example.nfcdoorcard.xposed.adapter.OplusNxpAdapter;
 
 import java.lang.reflect.Array;
@@ -42,7 +43,10 @@ public class NfcInjectionModule extends XposedModule {
     };
 
     private final NfcStackAdapter[] adapters = new NfcStackAdapter[]{
-            new OplusNxpAdapter()
+            // Prefer the proven vendor-specific implementation, then fall back to
+            // a strictly validated raw CORE_SET_CONFIG NXP implementation.
+            new OplusNxpAdapter(),
+            new GenericNxpAdapter()
     };
 
     private volatile boolean disabledAfterFailure;

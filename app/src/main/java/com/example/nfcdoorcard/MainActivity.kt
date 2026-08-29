@@ -407,7 +407,7 @@ class MainActivity : ComponentActivity() {
 
     private fun stopSimulation(onDone: (RuntimeStatus, String) -> Unit) {
         stopReadMode("simulation_stop")
-        // Important: turn injection off before asking the OEM service to restore default RF config.
+        // Disable injection first so every RF config loaded during recovery remains stock.
         contentResolver.insert(ConfigProvider.URI, ContentValues().apply {
             put(ConfigProvider.KEY_SIMULATION_ENABLED, false)
             put(ConfigProvider.KEY_RF_STATUS, "STOPPING")
@@ -415,32 +415,39 @@ class MainActivity : ComponentActivity() {
             put(ConfigProvider.KEY_RF_RESULT, "")
             put(ConfigProvider.KEY_RF_ERROR, "")
             put(ConfigProvider.KEY_FULL_DIAG_STAGE, "STOPPING")
-            put(ConfigProvider.KEY_FULL_DIAG_SUMMARY, "Disabling share mode through verified Vendor Binder")
+            put(ConfigProvider.KEY_FULL_DIAG_SUMMARY, "Disabling share mode, then restarting NFC to restore stock RF")
         })
-        AppLogger.i("SIMULATION: DIRECT_BINDER stop requested")
+        AppLogger.i("SIMULATION: DIRECT_BINDER stop requested; stock RF restart required")
         executor.execute {
-            var result = vendorNfcController.setShareMode(false)
-            AppLogger.i("SIMULATION: VENDOR_BINDER disable success=${result.success} stage=${result.stage} detail=${result.detail}")
+            val binderResult = vendorNfcController.setShareMode(false)
+            AppLogger.i("SIMULATION: VENDOR_BINDER disable success=${binderResult.success} stage=${binderResult.stage} detail=${binderResult.detail}")
 
-            if (!result.success) {
-                val restart = restartNfcProcessKeepingEnabled("stop_fallback")
-                AppLogger.i("SIMULATION: stop fallback restart\n$restart")
-                waitForHookOnly(10_000)
-                result = vendorNfcController.setShareMode(false)
-                AppLogger.i("SIMULATION: VENDOR_BINDER disable retry success=${result.success} stage=${result.stage} detail=${result.detail}")
-            }
+            // A successful tx15(false) does not guarantee that LA_NFCID1 is rewritten.
+            // Restart NFC unconditionally while simulation_enabled=false so the OEM stack
+            // reloads its original RF configuration without UID injection.
+            val restart = restartNfcProcessKeepingEnabled("stop_restore_stock_rf")
+            AppLogger.i("SIMULATION: mandatory stock RF restart\n$restart")
+            val state = waitForHookOnly(12_000)
 
             contentResolver.insert(ConfigProvider.URI, ContentValues().apply {
                 put(ConfigProvider.KEY_RF_STATUS, "IDLE")
                 put(ConfigProvider.KEY_RF_UID, "")
+                put(ConfigProvider.KEY_RF_SOURCE, "")
                 put(ConfigProvider.KEY_RF_RESULT, "")
                 put(ConfigProvider.KEY_RF_ERROR, "")
                 put(ConfigProvider.KEY_RF_PID, 0)
-                put(ConfigProvider.KEY_FULL_DIAG_STAGE, if (result.success) "IDLE" else "STOP_FAILED")
-                put(ConfigProvider.KEY_FULL_DIAG_SUMMARY, if (result.success) "Stock RF restored by Vendor Binder" else result.detail)
+                put(ConfigProvider.KEY_FULL_DIAG_STAGE, if (state.hookInstalled) "IDLE" else "RESTORE_RESTARTED_HOOK_WAIT")
+                put(ConfigProvider.KEY_FULL_DIAG_SUMMARY,
+                    if (state.hookInstalled) "Stock RF restored after mandatory NFC restart"
+                    else "NFC restarted for stock RF; hook status not yet confirmed")
             })
-            val state = readRuntimeStatus()
-            onDone(state, if (result.success) "模拟已停止 · 默认 RF 已恢复" else "停止模拟失败 · ${result.stage}")
+            val finalState = readRuntimeStatus()
+            val message = if (state.hookInstalled) {
+                "模拟已停止 · NFC 已重启并恢复原厂 RF"
+            } else {
+                "模拟已停止 · NFC 已重启，Hook 正在重新就绪"
+            }
+            onDone(finalState, message)
         }
     }
 
