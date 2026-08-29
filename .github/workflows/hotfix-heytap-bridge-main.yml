@@ -1,0 +1,113 @@
+name: One-shot HeyTap Bridge Main Flow
+
+on:
+  push:
+    paths:
+      - '.github/workflows/hotfix-heytap-bridge-main.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Switch MainActivity from direct Binder to HeyTap bridge
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          p = Path('app/src/main/java/com/example/nfcdoorcard/MainActivity.kt')
+          s = p.read_text()
+
+          s = s.replace('    private val vendorNfcController = VendorNfcController()\n', '')
+          s = s.replace('Text("触发方式: Vendor Binder transaction 6 → 15", fontSize = 11.sp)',
+                        'Text("触发方式: HeyTap Hook → Vendor Binder 6 → 15", fontSize = 11.sp)')
+          s = s.replace('operationMessage = "正在直接应用 UID ${card.uid}..."',
+                        'operationMessage = "正在请求 HeyTap 应用 UID ${card.uid}..."')
+
+          new_sim = r'''    private fun simulateCard(card: CardModel, onDone: (RuntimeStatus, String) -> Unit) {
+        stopReadMode("simulation_start")
+        writeSimulationConfig(card)
+        AppLogger.i("SIMULATION: HEYTAP_BRIDGE requested uid=${card.uid} sak=${card.sak} atqa=${card.atqa}")
+        executor.execute {
+            val state = waitForHookAndRf(card.uid, 7_000)
+            val bridge = readProviderMap()
+            val bridgeReady = bridge["heytap_bridge_ready"].toBoolean()
+            val bridgeStage = bridge["heytap_bridge_stage"].orEmpty()
+            val bridgeDetail = bridge["heytap_bridge_detail"].orEmpty()
+            val applied = state.rfStatus == "RF_UID_APPLIED" && state.rfUid.equals(card.uid, true) && state.rfResult == "0"
+            val message = when {
+                applied -> "模拟已应用 · UID=${card.uid} · HeyTap桥接"
+                !bridgeReady -> "等待 HeyTap Hook · ${bridgeStage.ifBlank { "NOT_READY" }} ${bridgeDetail}".trim()
+                else -> "HeyTap 已触发，等待 RF UID 确认 · $bridgeStage"
+            }
+            AppLogger.i("SIMULATION: HEYTAP_BRIDGE result=$message\n${buildStatusSummary(state)}")
+            onDone(state, message)
+        }
+    }
+
+'''
+          s, n = re.subn(r'    private fun simulateCard\(card: CardModel, onDone: \(RuntimeStatus, String\) -> Unit\) \{.*?\n    \}\n\n(?=    private fun stopSimulation)', new_sim, s, count=1, flags=re.S)
+          if n != 1:
+              raise SystemExit('simulateCard block not replaced')
+
+          new_stop = r'''    private fun stopSimulation(onDone: (RuntimeStatus, String) -> Unit) {
+        stopReadMode("simulation_stop")
+        contentResolver.insert(ConfigProvider.URI, ContentValues().apply {
+            put(ConfigProvider.KEY_SIMULATION_ENABLED, false)
+            put(ConfigProvider.KEY_RF_STATUS, "STOPPING")
+            put(ConfigProvider.KEY_RF_UID, "")
+            put(ConfigProvider.KEY_RF_RESULT, "")
+            put(ConfigProvider.KEY_RF_ERROR, "")
+            put(ConfigProvider.KEY_FULL_DIAG_STAGE, "STOPPING")
+            put(ConfigProvider.KEY_FULL_DIAG_SUMMARY, "Waiting for HeyTap bridge to disable share mode")
+        })
+        AppLogger.i("SIMULATION: HEYTAP_BRIDGE stop requested")
+        executor.execute {
+            val deadline = System.currentTimeMillis() + 5_000L
+            var bridge = readProviderMap()
+            while (System.currentTimeMillis() < deadline) {
+                bridge = readProviderMap()
+                if (bridge["heytap_bridge_stage"] == "DONE" && bridge["heytap_bridge_enabled"] == "false") break
+                Thread.sleep(100L)
+            }
+            val stopped = bridge["heytap_bridge_stage"] == "DONE" && bridge["heytap_bridge_enabled"] == "false"
+            contentResolver.insert(ConfigProvider.URI, ContentValues().apply {
+                put(ConfigProvider.KEY_RF_STATUS, "IDLE")
+                put(ConfigProvider.KEY_RF_UID, "")
+                put(ConfigProvider.KEY_RF_RESULT, "")
+                put(ConfigProvider.KEY_RF_ERROR, "")
+                put(ConfigProvider.KEY_RF_PID, 0)
+                put(ConfigProvider.KEY_FULL_DIAG_STAGE, if (stopped) "IDLE" else "STOP_WAITING_HEYTAP")
+                put(ConfigProvider.KEY_FULL_DIAG_SUMMARY, if (stopped) "Stock RF restored by HeyTap bridge" else bridge["heytap_bridge_detail"].orEmpty())
+            })
+            val state = readRuntimeStatus()
+            onDone(state, if (stopped) "模拟已停止 · HeyTap 已恢复默认 RF" else "已关闭模拟配置，等待 HeyTap 恢复 RF")
+        }
+    }
+
+'''
+          s, n = re.subn(r'    private fun stopSimulation\(onDone: \(RuntimeStatus, String\) -> Unit\) \{.*?\n    \}\n\n(?=    private fun writeSimulationConfig)', new_stop, s, count=1, flags=re.S)
+          if n != 1:
+              raise SystemExit('stopSimulation block not replaced')
+
+          s = s.replace('        // Preserve current hook/scope state. The direct Binder path no longer requires an NFC restart.\n',
+                        '        // Main app only publishes desired state. HeyTap LSPosed bridge owns share-mode Binder calls.\n')
+          s = s.replace('put(ConfigProvider.KEY_FULL_DIAG_SUMMARY, "UID saved; ready for verified Vendor Binder transaction 6 -> 15")',
+                        'put(ConfigProvider.KEY_FULL_DIAG_SUMMARY, "UID saved; waiting for HeyTap LSPosed bridge")')
+
+          # Remove now-unused NFC restart helper. All share-mode transitions are owned by HeyTap bridge.
+          s, _ = re.subn(r'\n    private fun restartNfcProcessKeepingEnabled\(reason: String\): String \{.*?\n    \}\n\n(?=    private fun waitForHookAndRf)', '\n', s, count=1, flags=re.S)
+
+          p.write_text(s)
+          PY
+      - name: Commit HeyTap bridge main flow
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add app/src/main/java/com/example/nfcdoorcard/MainActivity.kt
+          git commit -m 'refactor: route simulation through HeyTap bridge'
+          git push
