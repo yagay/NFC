@@ -71,7 +71,7 @@ class MainActivity : ComponentActivity() {
             this, 0, Intent(this, javaClass).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
             PendingIntent.FLAG_MUTABLE
         )
-        AppLogger.i("Diagnostics V10 started")
+        AppLogger.i("Diagnostics V11 started")
         setContent {
             MaterialTheme {
                 Surface(modifier = Modifier.fillMaxSize()) { NfcAppContent() }
@@ -87,6 +87,8 @@ class MainActivity : ComponentActivity() {
         var logText by remember { mutableStateOf("") }
         var selectedSource by remember { mutableStateOf(LogSource.HIJACK) }
         var diagnosticRunning by remember { mutableStateOf(false) }
+        var reloadRunning by remember { mutableStateOf(false) }
+        var reloadMessage by remember { mutableStateOf<String?>(null) }
         val scannedCard = scannedCardState
         val logListState = rememberLazyListState()
 
@@ -129,12 +131,29 @@ class MainActivity : ComponentActivity() {
                 contentPadding = PaddingValues(bottom = 8.dp)
             ) {
                 item {
-                    RuntimeStatusPanel(status, diagnosticRunning) {
-                        if (!diagnosticRunning) {
-                            diagnosticRunning = true
-                            runOneTapDiagnosticAndShare { diagnosticRunning = false }
+                    RuntimeStatusPanel(
+                        status = status,
+                        diagnosticRunning = diagnosticRunning,
+                        reloadRunning = reloadRunning,
+                        reloadMessage = reloadMessage,
+                        onReload = {
+                            if (!reloadRunning) {
+                                reloadRunning = true
+                                reloadMessage = "正在重新加载 com.android.nfc..."
+                                reloadNfcProcessAndHook { newStatus, message ->
+                                    status = newStatus
+                                    reloadMessage = message
+                                    reloadRunning = false
+                                }
+                            }
+                        },
+                        onDiagnostic = {
+                            if (!diagnosticRunning) {
+                                diagnosticRunning = true
+                                runOneTapDiagnosticAndShare { diagnosticRunning = false }
+                            }
                         }
-                    }
+                    )
                 }
 
                 item {
@@ -259,7 +278,14 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun RuntimeStatusPanel(status: RuntimeStatus, diagnosticRunning: Boolean, onDiagnostic: () -> Unit) {
+    private fun RuntimeStatusPanel(
+        status: RuntimeStatus,
+        diagnosticRunning: Boolean,
+        reloadRunning: Boolean,
+        reloadMessage: String?,
+        onReload: () -> Unit,
+        onDiagnostic: () -> Unit
+    ) {
         val hijackOk = status.hijackStatus == "SUCCESS"
         Card(modifier = Modifier.fillMaxWidth().padding(8.dp)) {
             Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -289,7 +315,25 @@ class MainActivity : ComponentActivity() {
                         else -> "IDLE"
                     }
                 )
-                Button(onClick = onDiagnostic, enabled = !diagnosticRunning, modifier = Modifier.fillMaxWidth()) {
+
+                HorizontalDivider()
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("重新加载 Hook / 更新状态", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                        Text(
+                            reloadMessage ?: "无需重启手机；会重启 NFC 系统进程并等待 LSPosed 重新注入",
+                            fontSize = 10.sp,
+                            color = Color.Gray
+                        )
+                    }
+                    Switch(
+                        checked = reloadRunning,
+                        enabled = !reloadRunning,
+                        onCheckedChange = { enabled -> if (enabled) onReload() }
+                    )
+                }
+
+                Button(onClick = onDiagnostic, enabled = !diagnosticRunning && !reloadRunning, modifier = Modifier.fillMaxWidth()) {
                     Text(if (diagnosticRunning) "检测中..." else "一键检测 + 导出")
                 }
             }
@@ -421,6 +465,99 @@ class MainActivity : ComponentActivity() {
         restartNfcSafely()
     }
 
+    private fun clearRuntimeHookStatus() {
+        try {
+            contentResolver.insert(ConfigProvider.CONTENT_URI, ContentValues().apply {
+                put(ConfigProvider.KEY_SCOPE_OK, false)
+                put(ConfigProvider.KEY_SCOPE_PROCESS, "")
+                put(ConfigProvider.KEY_HOOK_INSTALLED, false)
+                put(ConfigProvider.KEY_HOOK_CLASS, "")
+                put(ConfigProvider.KEY_HOOK_COUNT, 0)
+                put(ConfigProvider.KEY_HIJACK_STATUS, if (getSimulationEnabled()) "WAITING" else "IDLE")
+                put(ConfigProvider.KEY_HIJACK_RESULT, "")
+                put(ConfigProvider.KEY_HIJACK_UID, "")
+                put(ConfigProvider.KEY_HIJACK_ERROR, "")
+            })
+        } catch (e: Exception) {
+            AppLogger.i("RELOAD: status clear failed ${e.javaClass.simpleName}: ${e.message}")
+        }
+    }
+
+    private fun getSimulationEnabled(): Boolean {
+        return try {
+            contentResolver.query(ConfigProvider.CONTENT_URI, null, null, null, null)?.use { c ->
+                while (c.moveToNext()) {
+                    if (c.getString(0) == ConfigProvider.KEY_SIMULATION_ENABLED) {
+                        return@use c.getString(1).equals("true", true)
+                    }
+                }
+                false
+            } ?: false
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private fun reloadNfcProcessAndHook(onDone: (RuntimeStatus, String) -> Unit) {
+        executor.execute {
+            clearRuntimeHookStatus()
+            val script = """
+                old=$(pidof com.android.nfc 2>/dev/null | awk '{print $1}')
+                echo "OLD_PID=$old"
+                svc nfc disable 2>/dev/null || true
+                sleep 1
+                if [ -n "$old" ]; then
+                  kill -TERM "$old" 2>/dev/null || true
+                  sleep 1
+                  kill -0 "$old" 2>/dev/null && kill -KILL "$old" 2>/dev/null || true
+                fi
+                i=0
+                new=""
+                while [ $i -lt 40 ]; do
+                  new=$(pidof com.android.nfc 2>/dev/null | awk '{print $1}')
+                  if [ -n "$new" ] && [ "$new" != "$old" ]; then break; fi
+                  sleep 0.25
+                  i=$((i+1))
+                done
+                svc nfc enable 2>/dev/null || true
+                i=0
+                while [ $i -lt 40 ]; do
+                  state=$(dumpsys nfc 2>/dev/null | grep -m1 -E 'mState=|state=' | tr 'A-Z' 'a-z')
+                  echo "$state" | grep -Eq 'mstate=3|state_on|state=on|mstate=on| on' && break
+                  sleep 0.25
+                  i=$((i+1))
+                done
+                final=$(pidof com.android.nfc 2>/dev/null | awk '{print $1}')
+                echo "NEW_PID=$final"
+                echo "NFC_STATE=$(dumpsys nfc 2>/dev/null | grep -m1 -E 'mState=|state=' || true)"
+            """.trimIndent()
+
+            val result = runRootCmd(script)
+            AppLogger.i("RELOAD: process restart result\n$result")
+
+            var status = RuntimeStatus()
+            var attempts = 0
+            while (attempts < 20) {
+                Thread.sleep(250)
+                status = readRuntimeStatus()
+                if (status.scopeOk && status.hookInstalled) break
+                attempts++
+            }
+
+            val oldPid = Regex("OLD_PID=(\\d+)").find(result)?.groupValues?.getOrNull(1)
+            val newPid = Regex("NEW_PID=(\\d+)").find(result)?.groupValues?.getOrNull(1)
+            val pidChanged = !oldPid.isNullOrBlank() && !newPid.isNullOrBlank() && oldPid != newPid
+            val message = when {
+                !pidChanged -> "更新失败：NFC 进程没有换 PID（old=${oldPid ?: "?"}, new=${newPid ?: "?"}）"
+                status.scopeOk && status.hookInstalled -> "更新成功：PID $oldPid → $newPid，Scope + Hook 已重新加载"
+                status.scopeOk -> "进程已重载：PID $oldPid → $newPid，但 Hook 尚未确认"
+                else -> "进程已重载：PID $oldPid → $newPid，等待 LSPosed 注入"
+            }
+            AppLogger.i("RELOAD: $message")
+            runOnUiThread { onDone(status, message) }
+        }
+    }
+
     private fun readRuntimeStatus(): RuntimeStatus {
         val map = mutableMapOf<String, String>()
         try {
@@ -429,15 +566,15 @@ class MainActivity : ComponentActivity() {
             }
         } catch (_: Exception) {}
 
-        val lsp = runRootCmd("grep -h -E 'com.example.nfcdoorcard|SCOPE: SUCCESS|HOOK: (SUCCESS|INSTALLED)|HIJACK: (SUCCESS|FAILED)' /data/adb/lspd/log/modules* 2>/dev/null | tail -n 200")
-        val scopeByLog = lsp.contains("(com.android.nfc)[com.example.nfcdoorcard") || lsp.contains("SCOPE: SUCCESS package=com.android.nfc")
+        val lsp = runRootCmd("pid=$(pidof com.android.nfc 2>/dev/null | awk '{print $1}'); if [ -n \"$pid\" ]; then grep -h -E 'com.example.nfcdoorcard|SCOPE: SUCCESS|HOOK: (SUCCESS|INSTALLED)|HIJACK: (SUCCESS|FAILED)' /data/adb/lspd/log/modules* 2>/dev/null | grep \": $pid:\" | tail -n 200; fi")
+        val scopeByLog = lsp.contains("SCOPE: SUCCESS package=com.android.nfc")
         val hookByLog = lsp.contains("HOOK: SUCCESS") || lsp.contains("HOOK: INSTALLED")
 
         return RuntimeStatus(
             scopeOk = map[ConfigProvider.KEY_SCOPE_OK] == "true" || scopeByLog,
-            scopeProcess = map[ConfigProvider.KEY_SCOPE_PROCESS] ?: if (scopeByLog) "com.android.nfc" else null,
+            scopeProcess = map[ConfigProvider.KEY_SCOPE_PROCESS]?.takeIf { it.isNotBlank() } ?: if (scopeByLog) "com.android.nfc" else null,
             hookInstalled = map[ConfigProvider.KEY_HOOK_INSTALLED] == "true" || hookByLog,
-            hookClass = map[ConfigProvider.KEY_HOOK_CLASS],
+            hookClass = map[ConfigProvider.KEY_HOOK_CLASS]?.takeIf { it.isNotBlank() },
             hookCount = map[ConfigProvider.KEY_HOOK_COUNT]?.toIntOrNull() ?: if (hookByLog) 1 else 0,
             simulationEnabled = map[ConfigProvider.KEY_SIMULATION_ENABLED] == "true",
             selectedUid = map[ConfigProvider.KEY_UID],
@@ -460,7 +597,7 @@ class MainActivity : ComponentActivity() {
     private fun fetchLogsSync(source: LogSource): String {
         val cmd = when (source) {
             LogSource.HIJACK -> "logcat -d -t 700 -s NfcUIDSim"
-            LogSource.LSPosed -> "grep -h -E 'com.example.nfcdoorcard|NfcUIDSim|SCOPE:|HOOK:|HIJACK:|com.android.nfc' /data/adb/lspd/log/modules* 2>/dev/null | tail -n 500"
+            LogSource.LSPosed -> "grep -h -E 'com.example.nfcdoorcard|NfcUIDSim|SCOPE:|HOOK:|HIJACK:|RELOAD:|com.android.nfc' /data/adb/lspd/log/modules* 2>/dev/null | tail -n 500"
             LogSource.KernelSU -> "ls -t /data/adb/ksu/log/sulog* 2>/dev/null | head -n 1 | xargs -r cat | tail -n 300"
         }
         return runRootCmd(cmd).ifBlank { "No matching logs found for $source" }
@@ -477,7 +614,7 @@ class MainActivity : ComponentActivity() {
         executor.execute {
             try {
                 val status = readRuntimeStatus()
-                val file = File(cacheDir, "nfc_fullcheck_v10.txt")
+                val file = File(cacheDir, "nfc_fullcheck_v11.txt")
                 file.writeText(buildFullDiagnosticReport(status))
                 runOnUiThread {
                     onDone()
@@ -497,7 +634,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun buildFullDiagnosticReport(status: RuntimeStatus): String = buildString {
-        append("=== NFC FULL CHECK V10 ===\nGenerated: ").append(System.currentTimeMillis()).append("\n\n")
+        append("=== NFC FULL CHECK V11 ===\nGenerated: ").append(System.currentTimeMillis()).append("\n\n")
         append("--- RUNTIME STATUS ---\n").append(buildStatusSummary(status)).append("\n\n")
         append("--- SAVED CARDS ---\ncount=").append(loadCards().size).append("\n")
         loadCards().forEach { append("card uid=${it.uid} sak=${it.sak} atqa=${it.atqa}\n") }
@@ -505,7 +642,7 @@ class MainActivity : ComponentActivity() {
         append("--- ROOT ---\n").append(runRootCmd("id; su -v 2>/dev/null || true")).append("\n")
         append("--- NFC PROCESS ---\n").append(runRootCmd("pm path com.android.nfc; pidof com.android.nfc; ps -A | grep -i '[n]fc' || true")).append("\n")
         append("--- NFC SERVICE ---\n").append(runRootCmd("dumpsys nfc 2>/dev/null | head -n 220")).append("\n")
-        append("--- LSPOSED MODULE ---\n").append(runRootCmd("grep -h -n -E 'com.example.nfcdoorcard|NfcUIDSim|SCOPE:|HOOK:|HIJACK:|com.android.nfc' /data/adb/lspd/log/modules* 2>/dev/null | tail -n 1200")).append("\n")
+        append("--- LSPOSED MODULE ---\n").append(runRootCmd("grep -h -n -E 'com.example.nfcdoorcard|NfcUIDSim|SCOPE:|HOOK:|HIJACK:|RELOAD:|com.android.nfc' /data/adb/lspd/log/modules* 2>/dev/null | tail -n 1200")).append("\n")
         append("--- HIJACK LOGCAT ---\n").append(runRootCmd("logcat -d -t 1800 -s NfcUIDSim")).append("\n")
         append("--- APP LOG ---\n").append(AppLogger.getAllLogs()).append("\n")
     }
