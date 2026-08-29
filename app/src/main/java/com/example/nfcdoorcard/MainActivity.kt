@@ -146,9 +146,8 @@ class MainActivity : ComponentActivity() {
                         Card(Modifier.fillMaxWidth()) {
                             Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                 Text("读取卡片", style = MaterialTheme.typography.titleMedium)
-                                if (scanned == null) {
-                                    Text("把实体卡贴到手机背面读取 UID / SAK / ATQA")
-                                } else {
+                                if (scanned == null) Text("把实体卡贴到手机背面读取 UID / SAK / ATQA")
+                                else {
                                     Text("UID: ${scanned.uid}")
                                     Text("SAK: ${scanned.sak}   ATQA: ${scanned.atqa}")
                                     Button(onClick = {
@@ -204,7 +203,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun simulateCard(card: CardModel) {
-        val values = ContentValues().apply {
+        contentResolver.insert(ConfigProvider.URI, ContentValues().apply {
             put(ConfigProvider.KEY_SIMULATION_ENABLED, true)
             put(ConfigProvider.KEY_UID, card.uid)
             put(ConfigProvider.KEY_SAK, card.sak)
@@ -218,14 +217,13 @@ class MainActivity : ComponentActivity() {
             put(ConfigProvider.KEY_RF_SOURCE, "")
             put(ConfigProvider.KEY_RF_RESULT, "")
             put(ConfigProvider.KEY_RF_ERROR, "")
-        }
-        contentResolver.insert(ConfigProvider.URI, values)
+        })
         AppLogger.i("CARD: SIM requested uid=${card.uid} sak=${card.sak} atqa=${card.atqa}")
         restartNfcSafely()
     }
 
     private fun disableSimulation() {
-        val values = ContentValues().apply {
+        contentResolver.insert(ConfigProvider.URI, ContentValues().apply {
             put(ConfigProvider.KEY_SIMULATION_ENABLED, false)
             put(ConfigProvider.KEY_HIJACK_STATUS, "IDLE")
             put(ConfigProvider.KEY_RF_STATUS, "IDLE")
@@ -233,8 +231,7 @@ class MainActivity : ComponentActivity() {
             put(ConfigProvider.KEY_RF_SOURCE, "")
             put(ConfigProvider.KEY_RF_RESULT, "")
             put(ConfigProvider.KEY_RF_ERROR, "")
-        }
-        contentResolver.insert(ConfigProvider.URI, values)
+        })
         AppLogger.i("CARD: simulation stopped")
         restartNfcSafely()
     }
@@ -268,21 +265,13 @@ class MainActivity : ComponentActivity() {
                   sleep 0.25
                   i=${'$'}((i+1))
                 done
-                j=0
-                state=""
-                while [ ${'$'}j -lt 20 ]; do
-                  state=${'$'}(dumpsys nfc 2>/dev/null | grep -m1 'mState=' || true)
-                  echo "${'$'}state" | grep -q 'mState=on' && break
-                  sleep 0.25
-                  j=${'$'}((j+1))
-                done
+                state=${'$'}(dumpsys nfc 2>/dev/null | grep -m1 'mState=' || true)
                 final=${'$'}(pidof com.android.nfc 2>/dev/null | awk '{print ${'$'}1}')
                 echo "NEW_PID=${'$'}final"
                 echo "NFC_STATE=${'$'}state"
             """.trimIndent()
             val result = runRootCmd(script)
             AppLogger.i("RELOAD: process restart result\n$result")
-
             var state = RuntimeStatus()
             repeat(20) {
                 Thread.sleep(250)
@@ -291,10 +280,8 @@ class MainActivity : ComponentActivity() {
             val oldPid = Regex("OLD_PID=(\\d+)").find(result)?.groupValues?.getOrNull(1)
             val newPid = Regex("NEW_PID=(\\d+)").find(result)?.groupValues?.getOrNull(1)
             val msg = when {
-                oldPid != null && newPid != null && oldPid != newPid && state.scopeOk && state.hookInstalled ->
-                    "更新成功：PID $oldPid → $newPid，Scope + Hook 已重新加载"
-                oldPid != null && newPid != null && oldPid != newPid ->
-                    "进程已重启：PID $oldPid → $newPid，等待 LSPosed 注入"
+                oldPid != null && newPid != null && oldPid != newPid && state.scopeOk && state.hookInstalled -> "更新成功：PID $oldPid → $newPid，Scope + Hook 已重新加载"
+                oldPid != null && newPid != null && oldPid != newPid -> "进程已重启：PID $oldPid → $newPid，等待 LSPosed 注入"
                 else -> "重新加载失败：com.android.nfc PID 未变化"
             }
             AppLogger.i("RELOAD: $msg")
@@ -303,7 +290,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun clearRuntimeHookStatus() {
-        val values = ContentValues().apply {
+        contentResolver.insert(ConfigProvider.URI, ContentValues().apply {
             put(ConfigProvider.KEY_SCOPE_OK, false)
             put(ConfigProvider.KEY_SCOPE_PROCESS, "")
             put(ConfigProvider.KEY_HOOK_INSTALLED, false)
@@ -318,8 +305,7 @@ class MainActivity : ComponentActivity() {
             put(ConfigProvider.KEY_RF_SOURCE, "")
             put(ConfigProvider.KEY_RF_RESULT, "")
             put(ConfigProvider.KEY_RF_ERROR, "")
-        }
-        contentResolver.insert(ConfigProvider.URI, values)
+        })
     }
 
     private fun readRuntimeStatus(): RuntimeStatus {
@@ -329,18 +315,14 @@ class MainActivity : ComponentActivity() {
                 while (cursor.moveToNext()) map[cursor.getString(0)] = cursor.getString(1)
             }
         }
-
         var scopeOk = map[ConfigProvider.KEY_SCOPE_OK].toBoolean()
         var hookInstalled = map[ConfigProvider.KEY_HOOK_INSTALLED].toBoolean()
         val currentPid = runRootCmd("pidof com.android.nfc 2>/dev/null | awk '{print ${'$'}1}'").trim()
         if (currentPid.isNotBlank()) {
-            val lsp = runRootCmd(
-                "grep -h -E 'SCOPE: SUCCESS|HOOK: (SUCCESS|INSTALLED)|RF: NFCID1|RF: CONFIG|HIJACK:' /data/adb/lspd/log/modules* 2>/dev/null | grep ': $currentPid:' | tail -n 300"
-            )
+            val lsp = runRootCmd("grep -h -E 'SCOPE: SUCCESS|HOOK: (SUCCESS|INSTALLED)|RF: NFCID1|RF: CONFIG|HIJACK:' /data/adb/lspd/log/modules* 2>/dev/null | grep ': $currentPid:' | tail -n 300")
             scopeOk = scopeOk || lsp.contains("SCOPE: SUCCESS package=com.android.nfc")
             hookInstalled = hookInstalled || lsp.contains("HOOK: SUCCESS") || lsp.contains("HOOK: INSTALLED")
         }
-
         return RuntimeStatus(
             scopeOk = scopeOk,
             scopeProcess = map[ConfigProvider.KEY_SCOPE_PROCESS]?.takeIf { it.isNotBlank() },
@@ -363,9 +345,7 @@ class MainActivity : ComponentActivity() {
 
     private fun loadCards(): List<CardModel> {
         val json = getSharedPreferences("cards", 0).getString("list", null) ?: return emptyList()
-        return runCatching {
-            gson.fromJson<List<CardModel>>(json, object : TypeToken<List<CardModel>>() {}.type) ?: emptyList()
-        }.getOrDefault(emptyList())
+        return runCatching { gson.fromJson<List<CardModel>>(json, object : TypeToken<List<CardModel>>() {}.type) ?: emptyList() }.getOrDefault(emptyList())
     }
 
     private fun saveCards(cards: List<CardModel>) {
@@ -393,28 +373,21 @@ class MainActivity : ComponentActivity() {
                 appendLine()
                 appendLine("--- APP / APK ---")
                 appendLine(runRootCmd("dumpsys package $packageName 2>/dev/null | grep -E 'versionName=|versionCode=|path:' | head -n 20"))
-                appendLine()
                 appendLine("--- ROOT ---")
                 appendLine(runRootCmd("id; su -v 2>/dev/null || true"))
-                appendLine()
                 appendLine("--- NFC PROCESS ---")
                 appendLine(runRootCmd("pm path com.android.nfc; pidof com.android.nfc; ps -A | grep -E 'nfc|$packageName'"))
-                appendLine()
                 appendLine("--- NFC SERVICE ---")
                 appendLine(runRootCmd("dumpsys nfc 2>/dev/null | grep -E 'mState=|mScreenState=|listenTech=|pollTech=|mEnableHostRouting=|mTechMask' | head -n 100"))
-                appendLine()
                 appendLine("--- LSPOSED / RF ---")
                 appendLine(runRootCmd("grep -h -E 'NfcUIDSim|SCOPE:|HOOK:|HIJACK:|HCE:|RF:' /data/adb/lspd/log/modules* 2>/dev/null | tail -n 700"))
-                appendLine()
                 appendLine("--- LOGCAT RF/NFC ---")
                 appendLine(runRootCmd("logcat -d -v threadtime 2>/dev/null | grep -E 'NfcUIDSim|NFCID1|LA_NFCID1|CORE_SET_CONFIG|setHceTypeAConfig' | tail -n 700"))
-                appendLine()
                 appendLine("--- APP LOG ---")
                 appendLine(AppLogger.readAll())
             }
-            val file = File(getExternalFilesDir(null), "nfc_fullcheck_v12.txt")
-            file.writeText(report)
-            AppLogger.i("Diagnostics exported: ${file.absolutePath}")
+            File(getExternalFilesDir(null), "nfc_fullcheck_v12.txt").writeText(report)
+            AppLogger.i("Diagnostics V12 exported")
         }
     }
 
@@ -428,9 +401,7 @@ class MainActivity : ComponentActivity() {
             if (err.isNotBlank()) appendLine(err)
             appendLine("[exit=${process.exitValue()}]")
         }
-    } catch (t: Throwable) {
-        "ERROR ${t.javaClass.simpleName}: ${t.message}"
-    }
+    } catch (t: Throwable) { "ERROR ${t.javaClass.simpleName}: ${t.message}" }
 
     private fun bytesToHex(bytes: ByteArray): String = bytes.joinToString("") { "%02X".format(it) }
 }
