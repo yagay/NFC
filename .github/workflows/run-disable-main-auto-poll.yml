@@ -1,0 +1,21 @@
+name: One-shot startup safe-mode patch
+on:
+  push:
+    paths:
+      - '.github/workflows/run-disable-main-auto-poll.yml'
+permissions:
+  contents: write
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Patch MainActivity
+        run: python3 scripts/disable_main_auto_poll.py
+      - name: Commit patch
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add app/src/main/java/com/example/nfcdoorcard/MainActivity.kt
+          git commit -m 'fix: disable automatic root log polling on startup'
+          git push
