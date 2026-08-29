@@ -162,7 +162,7 @@ class MainActivity : ComponentActivity() {
     @Composable
     private fun NfcAppContent() {
         val cards = savedCardsState
-        var status by remember { mutableStateOf(readRuntimeStatus()) }
+        var status by remember { mutableStateOf(RuntimeStatus()) }
         var logText by remember { mutableStateOf("") }
         var selectedSource by remember { mutableStateOf(LogSource.STATUS) }
         var diagnosticRunning by remember { mutableStateOf(false) }
