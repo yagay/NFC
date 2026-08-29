@@ -16,9 +16,11 @@ import java.lang.reflect.InvocationTargetException
 import java.util.concurrent.Executors
 
 /**
- * V11: direct app-UID Vendor NFC Binder test using values observed from the real HeyTap caller.
+ * V12: direct app-UID Vendor NFC Binder test using values observed from the real HeyTap caller.
  * INfcAdapter transaction 6 and IVendorNfcAdapter transaction 15 were reflected from this device.
- * The real caller was observed using vendorName="vendor".
+ * The real HeyTap caller was observed using vendorName="vendor".
+ *
+ * Do not gate on the observer's latest value: our own previous Binder tests can overwrite it.
  */
 class VendorNfcBinderTestActivity : ComponentActivity() {
     companion object {
@@ -35,15 +37,15 @@ class VendorNfcBinderTestActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        title = "Vendor NFC Binder 测试 V11"
+        title = "Vendor NFC Binder 测试 V12"
         output = TextView(this).apply {
             textSize = 12f
             setTextIsSelectable(true)
-            text = "V11 使用真实 HeyTap 调用观测到的 vendorName=vendor。\n\n流程：App UID → INfcAdapter transaction 6 → 校验 com.vendor.nfc.IVendorNfcAdapter → transaction 15 → RF_UID_APPLIED → false 清理。"
+            text = "V12 使用真实 HeyTap 调用曾确认的 vendorName=vendor。\n\n不会再用 observer 的最后一次值阻断测试，因为 V10/V11 自己的调用会覆盖该值。流程：App UID → INfcAdapter transaction 6 → descriptor 校验 → transaction 15 → RF_UID_APPLIED → false 清理。"
         }
         runButton = Button(this).apply {
-            text = "开始 Vendor NFC Binder 测试 V11"
-            setOnClickListener { runV11() }
+            text = "开始 Vendor NFC Binder 测试 V12"
+            setOnClickListener { runV12() }
         }
         setContentView(ScrollView(this).apply {
             addView(LinearLayout(this@VendorNfcBinderTestActivity).apply {
@@ -60,12 +62,12 @@ class VendorNfcBinderTestActivity : ComponentActivity() {
         super.onDestroy()
     }
 
-    private fun runV11() {
+    private fun runV12() {
         runButton.isEnabled = false
         output.text = "测试中..."
         executor.execute {
             val report = buildString {
-                appendLine("=== VENDOR NFC BINDER TEST V11 ===")
+                appendLine("=== VENDOR NFC BINDER TEST V12 ===")
                 appendLine("time=${System.currentTimeMillis()}")
                 appendLine("app_uid=${Process.myUid()} app_pid=${Process.myPid()} package=$packageName")
 
@@ -81,7 +83,7 @@ class VendorNfcBinderTestActivity : ComponentActivity() {
                 appendLine("main_descriptor=$INFC_DESCRIPTOR get_vendor_tx=$TX_GET_VENDOR_INTERFACE vendor_name=$VENDOR_NAME")
                 appendLine("vendor_descriptor=$VENDOR_DESCRIPTOR enable_share_tx=$TX_ENABLE_SHARE_MODE")
                 appendLine("metadata_stub_transactions=$reflectedGetTx")
-                appendLine("observed_vendor_name=$observedName observed_vendor_descriptor=$observedDescriptor")
+                appendLine("observer_last_name=$observedName observer_last_descriptor=$observedDescriptor informational_only=true")
 
                 if (!simulationEnabled || targetUid.isBlank()) {
                     appendLine("RESULT=TEST_NOT_RUN reason=simulation_not_enabled")
@@ -89,14 +91,6 @@ class VendorNfcBinderTestActivity : ComponentActivity() {
                 }
                 if (!reflectedGetTx.contains("TRANSACTION_getNfcAdapterVendorInterface=6")) {
                     appendLine("RESULT=TEST_NOT_RUN reason=device_metadata_does_not_confirm_transaction_6")
-                    return@buildString
-                }
-                if (observedName.isNotBlank() && observedName != VENDOR_NAME) {
-                    appendLine("RESULT=TEST_NOT_RUN reason=observed_vendor_name_mismatch actual=$observedName")
-                    return@buildString
-                }
-                if (observedDescriptor.isNotBlank() && observedDescriptor != VENDOR_DESCRIPTOR) {
-                    appendLine("RESULT=TEST_NOT_RUN reason=observed_vendor_descriptor_mismatch actual=$observedDescriptor")
                     return@buildString
                 }
 
@@ -148,7 +142,7 @@ class VendorNfcBinderTestActivity : ComponentActivity() {
 
                 runCatching {
                     contentResolver.insert(ConfigProvider.URI, ContentValues().apply {
-                        put(ConfigProvider.KEY_RF_STATUS, "WAITING_BINDER_TEST_V11")
+                        put(ConfigProvider.KEY_RF_STATUS, "WAITING_BINDER_TEST_V12")
                         put(ConfigProvider.KEY_RF_UID, "")
                         put(ConfigProvider.KEY_RF_RESULT, "")
                         put(ConfigProvider.KEY_RF_ERROR, "")
@@ -190,8 +184,8 @@ class VendorNfcBinderTestActivity : ComponentActivity() {
                 appendLine("RESULT=${if (enterAccepted == true && rfApplied) "TEST_PASS" else "TEST_FAIL_CALL_OR_RF"}")
             }
 
-            AppLogger.i("VENDOR_BINDER_TEST_V11:\n$report")
-            runCatching { File(cacheDir, "vendor_nfc_binder_test_v11.txt").writeText(report) }
+            AppLogger.i("VENDOR_BINDER_TEST_V12:\n$report")
+            runCatching { File(cacheDir, "vendor_nfc_binder_test_v12.txt").writeText(report) }
             runOnUiThread {
                 output.text = report
                 runButton.isEnabled = true
