@@ -26,4 +26,4 @@ V12 会：
 - `RF_CONFIG_ACCEPTED`：携带改写后 NFCID1 的原始 native 调用已返回成功/非布尔结果。
 - `FAILED`：参数长度或 native 调用失败。
 
-> `RF_CONFIG_ACCEPTED` 仍然不等同于门禁读卡器最终一定读到目标 UID。最终 RF 行为仍需由外部读卡器验证；V12 的目的就是把问题定位到真正的 `LA_NFCID1` 配置层，而不是继续依赖误导性的 HCE success。
+`RF_CONFIG_ACCEPTED` 仍然不等同于门禁读卡器最终一定读到目标 UID。最终 RF 行为必须由外部读卡器验证。V12 的目标是一次性定位真正的 `LA_NFCID1` 配置路径，而不是继续依赖 HCE success。
