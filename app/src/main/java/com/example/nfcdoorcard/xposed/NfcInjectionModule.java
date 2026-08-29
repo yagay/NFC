@@ -14,6 +14,7 @@ import com.example.nfcdoorcard.xposed.adapter.OplusNxpAdapter;
 import java.lang.reflect.Array;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
 
@@ -139,8 +140,8 @@ public class NfcInjectionModule extends XposedModule {
                             Object[] args = chain.getArgs().toArray();
                             String argText = summarizeArgs(args);
                             String stack = compactCallStack(24);
-                            String binderCaller = isShareModeProbe(candidate)
-                                    ? " callingUid=" + Binder.getCallingUid() + " callingPid=" + Binder.getCallingPid()
+                            String binderCaller = isVendorSecurityProbe(candidate)
+                                    ? binderCallerDetails()
                                     : "";
                             String enter = "ENTER " + signature + " event=" + event +
                                     " thread=" + Thread.currentThread().getName() + binderCaller +
@@ -175,20 +176,40 @@ public class NfcInjectionModule extends XposedModule {
         Log.i(TAG, "RFPROBE: READY candidates=" + installed.size() + " " + candidates);
     }
 
-    private boolean isShareModeProbe(Method method) {
+    private String binderCallerDetails() {
+        int uid = Binder.getCallingUid();
+        int pid = Binder.getCallingPid();
+        String packages = "unknown";
+        Application app = currentApplication();
+        if (app != null) {
+            try {
+                String[] names = app.getPackageManager().getPackagesForUid(uid);
+                packages = names == null ? "[]" : Arrays.toString(names);
+            } catch (Throwable t) {
+                packages = "error:" + t.getClass().getSimpleName();
+            }
+        }
+        return " callingUid=" + uid + " callingPid=" + pid + " callingPackages=" + packages;
+    }
+
+    private boolean isVendorSecurityProbe(Method method) {
         String owner = method.getDeclaringClass().getName();
+        if (!owner.equals("com.android.nfc.VendorNfcService") &&
+                !owner.equals("com.android.nfc.VendorNfcService$VendorNfcAdapterService") &&
+                !owner.equals("com.oplus.nfc.taptoshare.TapToShareEvent")) return false;
         String name = method.getName().toLowerCase(Locale.ROOT);
-        return (owner.equals("com.android.nfc.VendorNfcService$VendorNfcAdapterService") ||
-                owner.equals("com.oplus.nfc.taptoshare.TapToShareEvent")) &&
-                (name.equals("enablenfcsharemode") || name.equals("enternfcsharemode") || name.equals("exitnfcsharemode"));
+        return name.equals("enablenfcsharemode") || name.equals("enternfcsharemode") || name.equals("exitnfcsharemode") ||
+                name.contains("permission") || name.contains("check") || name.contains("enforce") ||
+                name.contains("access") || name.contains("allow");
     }
 
     private boolean isRefreshProbeCandidate(Method method) {
         String name = method.getName().toLowerCase(Locale.ROOT);
         String owner = method.getDeclaringClass().getName();
 
-        if (owner.equals("com.android.nfc.VendorNfcService$VendorNfcAdapterService")) {
-            return name.equals("enablenfcsharemode");
+        if (owner.equals("com.android.nfc.VendorNfcService") || owner.equals("com.android.nfc.VendorNfcService$VendorNfcAdapterService")) {
+            return name.equals("enablenfcsharemode") || name.contains("permission") || name.contains("check") ||
+                    name.contains("enforce") || name.contains("access") || name.contains("allow");
         }
         if (owner.equals("com.oplus.nfc.taptoshare.TapToShareEvent")) {
             return name.equals("enablenfcsharemode") || name.equals("enternfcsharemode") || name.equals("exitnfcsharemode");
