@@ -29,8 +29,14 @@ public class VendorBinderMetadataModule extends XposedModule {
         values.put("vendor_meta_pid", pid);
 
         StringBuilder report = new StringBuilder();
+        boolean ifaceOk = false;
+        boolean stubOk = false;
+        boolean txOk = false;
+
         try {
             Class<?> iface = Class.forName("com.vendor.nfc.IVendorNfcAdapter", false, cl);
+            ifaceOk = true;
+            values.put("vendor_binder_descriptor", iface.getName());
             report.append("IFACE=").append(iface.getName());
             Class<?>[] parents = iface.getInterfaces();
             for (Class<?> p : parents) report.append(" parent=").append(p.getName());
@@ -48,6 +54,7 @@ public class VendorBinderMetadataModule extends XposedModule {
 
         try {
             Class<?> stub = Class.forName("com.vendor.nfc.IVendorNfcAdapter$Stub", false, cl);
+            stubOk = true;
             values.put("vendor_binder_stub_class", stub.getName());
             report.append(" | STUB=").append(stub.getName());
 
@@ -60,6 +67,7 @@ public class VendorBinderMetadataModule extends XposedModule {
                     Object v = f.get(null);
                     report.append(" | ").append(name).append('=').append(String.valueOf(v));
                     if ("TRANSACTION_enableNfcShareMode".equals(name) && v instanceof Number) {
+                        txOk = true;
                         values.put("vendor_share_mode_transaction", ((Number) v).intValue());
                         values.put("vendor_share_mode_transaction_source", "REFLECT_STUB_CONSTANT");
                     }
@@ -78,20 +86,46 @@ public class VendorBinderMetadataModule extends XposedModule {
             report.append(" | STUB_ERROR=").append(t.getClass().getSimpleName()).append(':').append(t.getMessage());
         }
 
-        try {
-            Class<?> service = Class.forName("com.android.nfc.VendorNfcService$VendorNfcAdapterService", false, cl);
-            report.append(" | SERVICE=").append(service.getName());
-            Class<?> parent = service.getSuperclass();
-            if (parent != null) report.append(" super=").append(parent.getName());
-            for (Class<?> i : service.getInterfaces()) report.append(" iface=").append(i.getName());
-        } catch (Throwable t) {
-            report.append(" | SERVICE_ERROR=").append(t.getClass().getSimpleName()).append(':').append(t.getMessage());
-        }
+        inspectClass("com.android.nfc.VendorNfcService$VendorNfcAdapterService", cl, report);
+        inspectClass("com.android.nfc.VendorNfcService", cl, report);
+        inspectClass("com.android.nfc.NfcService", cl, report);
 
+        values.put("vendor_meta_ready", ifaceOk && stubOk && txOk);
+        values.put("vendor_meta_error", "");
         String text = report.length() > 3500 ? report.substring(0, 3500) : report.toString();
         values.put("vendor_meta_report", text);
         writeValues(values);
         Log.i(TAG, text);
+    }
+
+    private void inspectClass(String className, ClassLoader cl, StringBuilder report) {
+        try {
+            Class<?> c = Class.forName(className, false, cl);
+            report.append(" | CLASS=").append(c.getName());
+            Class<?> parent = c.getSuperclass();
+            if (parent != null) report.append(" super=").append(parent.getName());
+            for (Class<?> i : c.getInterfaces()) report.append(" iface=").append(i.getName());
+
+            for (Field f : c.getDeclaredFields()) {
+                String type = f.getType().getName();
+                String name = f.getName();
+                String lower = (name + " " + type).toLowerCase();
+                if (lower.contains("vendor") || lower.contains("binder") || lower.contains("nfcadapter") || lower.contains("service")) {
+                    report.append(" | FIELD=").append(c.getSimpleName()).append('#').append(name).append(':').append(type);
+                }
+            }
+
+            for (Method m : c.getDeclaredMethods()) {
+                String ret = m.getReturnType().getName();
+                String lower = (m.getName() + " " + ret).toLowerCase();
+                if (lower.contains("vendor") || lower.contains("binder") || lower.contains("nfcadapter") || ret.contains("IVendorNfcAdapter")) {
+                    report.append(" | GETTER=").append(c.getSimpleName()).append('#').append(m.getName())
+                            .append("->").append(ret).append(" args=").append(m.getParameterCount());
+                }
+            }
+        } catch (Throwable t) {
+            report.append(" | CLASS_ERROR=").append(className).append(':').append(t.getClass().getSimpleName()).append(':').append(t.getMessage());
+        }
     }
 
     private void writeValues(ContentValues values) {
