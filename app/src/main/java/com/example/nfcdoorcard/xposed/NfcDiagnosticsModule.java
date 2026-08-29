@@ -4,6 +4,7 @@ import android.app.Application;
 import android.content.ContentValues;
 import android.database.Cursor;
 import android.net.Uri;
+import android.os.Process;
 import android.util.Log;
 
 import java.lang.reflect.Method;
@@ -15,17 +16,7 @@ import java.util.Locale;
 import io.github.libxposed.api.XposedModule;
 import io.github.libxposed.api.XposedModuleInterface;
 
-/**
- * OxygenOS 16 NFC diagnostics / UID simulation hook.
- *
- * V12 deliberately separates Java HCE config success from RF NFCID1 success.
- * It observes candidate vendor config buffers, detects NCI TLVs, and can safely
- * rewrite an existing LA_NFCID1 (0x33) TLV when simulation is enabled.
- *
- * It never blindly injects raw vendor commands and never invents a new config
- * packet when no NFCID1 TLV is present. This keeps the change narrow and lets
- * diagnostics prove whether the RF path was actually reached.
- */
+/** Full-chain OxygenOS NFC diagnostics. */
 public class NfcDiagnosticsModule extends XposedModule {
     private static final String TAG = "NfcUIDSim";
     private static final Uri CONFIG_URI = Uri.parse("content://com.example.nfcdoorcard.config/settings");
@@ -37,18 +28,25 @@ public class NfcDiagnosticsModule extends XposedModule {
     private static final String KEY_ATQA = "atqa";
     private static final String KEY_SCOPE_OK = "scope_ok";
     private static final String KEY_SCOPE_PROCESS = "scope_process";
+    private static final String KEY_SCOPE_PID = "scope_pid";
     private static final String KEY_HOOK_INSTALLED = "hook_installed";
     private static final String KEY_HOOK_CLASS = "hook_class";
     private static final String KEY_HOOK_COUNT = "hook_count";
+    private static final String KEY_HOOK_PID = "hook_pid";
     private static final String KEY_HIJACK_STATUS = "hijack_status";
     private static final String KEY_HIJACK_RESULT = "hijack_result";
     private static final String KEY_HIJACK_UID = "hijack_uid";
     private static final String KEY_HIJACK_ERROR = "hijack_error";
+    private static final String KEY_HIJACK_PID = "hijack_pid";
     private static final String KEY_RF_STATUS = "rf_status";
     private static final String KEY_RF_UID = "rf_uid";
     private static final String KEY_RF_SOURCE = "rf_source";
     private static final String KEY_RF_RESULT = "rf_result";
     private static final String KEY_RF_ERROR = "rf_error";
+    private static final String KEY_RF_PID = "rf_pid";
+    private static final String KEY_TRACE_STAGE = "trace_stage";
+    private static final String KEY_TRACE_SOURCE = "trace_source";
+    private static final String KEY_TRACE_PID = "trace_pid";
 
     @Override
     public void onModuleLoaded(XposedModuleInterface.ModuleLoadedParam param) {
@@ -61,44 +59,64 @@ public class NfcDiagnosticsModule extends XposedModule {
         super.onPackageLoaded(lp);
         if (!"com.android.nfc".equals(lp.getPackageName())) return;
 
-        info("SCOPE: SUCCESS package=com.android.nfc");
+        int pid = Process.myPid();
+        info("SCOPE: SUCCESS package=com.android.nfc pid=" + pid);
         writeStatus(values(
                 KEY_SCOPE_OK, true,
                 KEY_SCOPE_PROCESS, "com.android.nfc",
+                KEY_SCOPE_PID, pid,
+                KEY_HOOK_INSTALLED, false,
+                KEY_HOOK_COUNT, 0,
+                KEY_HOOK_PID, pid,
                 KEY_HIJACK_STATUS, "IDLE",
+                KEY_HIJACK_RESULT, "",
+                KEY_HIJACK_UID, "",
                 KEY_HIJACK_ERROR, "",
+                KEY_HIJACK_PID, pid,
                 KEY_RF_STATUS, "WAITING",
-                KEY_RF_ERROR, ""
+                KEY_RF_UID, "",
+                KEY_RF_SOURCE, "",
+                KEY_RF_RESULT, "",
+                KEY_RF_ERROR, "",
+                KEY_RF_PID, pid,
+                KEY_TRACE_STAGE, "HOOKING",
+                KEY_TRACE_SOURCE, "",
+                KEY_TRACE_PID, pid
         ));
 
         ClassLoader cl = lp.getDefaultClassLoader();
         int installed = 0;
         installed += installVerifiedHceHook(cl, "com.android.nfc.dhimpl.NxpNativeNfcManager");
         installed += installVerifiedHceHook(cl, "com.android.nfc.dhimpl.StNativeNfcManager");
-        installed += installRfConfigHooks(cl, "com.android.nfc.dhimpl.NxpNativeNfcManager");
-        installed += installRfConfigHooks(cl, "com.android.nfc.dhimpl.StNativeNfcManager");
+        installed += installTraceHooks(cl, "com.android.nfc.dhimpl.NxpNativeNfcManager");
+        installed += installTraceHooks(cl, "com.android.nfc.dhimpl.StNativeNfcManager");
+        installed += installTraceHooks(cl, "com.android.nfc.VendorNfcService");
+        installed += installTraceHooks(cl, "com.android.nfc.NfcService");
 
-        writeStatus(values(KEY_HOOK_INSTALLED, installed > 0, KEY_HOOK_COUNT, installed));
-        if (installed > 0) info("HOOK: SUCCESS installed=" + installed);
-        else warn("HOOK: FAILED no verified NFC hooks installed");
+        writeStatus(values(
+                KEY_HOOK_INSTALLED, installed > 0,
+                KEY_HOOK_COUNT, installed,
+                KEY_HOOK_PID, pid,
+                KEY_TRACE_STAGE, installed > 0 ? "READY" : "HOOK_FAILED"
+        ));
+        if (installed > 0) info("HOOK: SUCCESS installed=" + installed + " pid=" + pid);
+        else warn("HOOK: FAILED no NFC hooks installed pid=" + pid);
     }
 
     private int installVerifiedHceHook(ClassLoader cl, String className) {
         try {
             Class<?> runtime = Class.forName(className, false, cl);
-            Method method = runtime.getDeclaredMethod(
-                    "setHceTypeAConfig",
-                    boolean.class, byte[].class, byte[].class, byte[].class
-            );
-
+            Method method = runtime.getDeclaredMethod("setHceTypeAConfig", boolean.class, byte[].class, byte[].class, byte[].class);
             hook(method).intercept(chain -> {
-                SimConfig config = readConfig();
+                int pid = Process.myPid();
                 Object[] incoming = chain.getArgs().toArray();
-                info("HCE: ENTER " + runtime.getSimpleName() + ".setHceTypeAConfig args=" + summarizeArgs(incoming)
-                        + " active=" + config.active);
+                SimConfig config = readConfig();
+                String source = runtime.getSimpleName() + ".setHceTypeAConfig";
+                info("HCE: ENTER pid=" + pid + " source=" + source + " args=" + summarizeArgs(incoming) + " active=" + config.active);
+                writeStatus(values(KEY_TRACE_STAGE, "HCE_ENTER", KEY_TRACE_SOURCE, source, KEY_TRACE_PID, pid, KEY_HIJACK_PID, pid));
 
                 if (!config.active || config.uid == null || config.uid.isBlank()) {
-                    writeStatus(values(KEY_HIJACK_STATUS, "IDLE", KEY_HIJACK_RESULT, "", KEY_HIJACK_ERROR, ""));
+                    writeStatus(values(KEY_HIJACK_STATUS, "IDLE", KEY_HIJACK_RESULT, "", KEY_HIJACK_UID, "", KEY_HIJACK_ERROR, "", KEY_HIJACK_PID, pid));
                     return chain.proceed();
                 }
 
@@ -107,41 +125,30 @@ public class NfcDiagnosticsModule extends XposedModule {
                     byte[] uid = hexToBytes(normalizedUid);
                     byte[] sak = hexToBytes(defaultIfBlank(config.sak, "08"));
                     byte[] atqa = hexToBytes(defaultIfBlank(config.atqa, "0400"));
-
-                    writeStatus(values(
-                            KEY_HIJACK_STATUS, "APPLYING",
-                            KEY_HIJACK_UID, normalizedUid,
-                            KEY_HIJACK_ERROR, ""
-                    ));
-                    info("HIJACK: APPLY uid=" + normalizedUid
-                            + " sak=" + normalizeHex(defaultIfBlank(config.sak, "08"))
-                            + " atqa=" + normalizeHex(defaultIfBlank(config.atqa, "0400"))
-                            + " via=" + runtime.getSimpleName());
-
-                    Object result = chain.proceed(new Object[] { true, uid, sak, atqa });
+                    writeStatus(values(KEY_HIJACK_STATUS, "APPLYING", KEY_HIJACK_UID, normalizedUid, KEY_HIJACK_ERROR, "", KEY_HIJACK_PID, pid));
+                    info("HCE: APPLY pid=" + pid + " uid=" + normalizedUid + " sak=" + bytesToHex(sak) + " atqa=" + bytesToHex(atqa) + " via=" + source);
+                    Object result = chain.proceed(new Object[]{true, uid, sak, atqa});
                     boolean success = !(result instanceof Boolean) || Boolean.TRUE.equals(result);
                     writeStatus(values(
                             KEY_HIJACK_STATUS, success ? "NATIVE_ACCEPTED" : "FAILED",
                             KEY_HIJACK_RESULT, String.valueOf(result),
                             KEY_HIJACK_UID, normalizedUid,
-                            KEY_HIJACK_ERROR, success ? "" : "native returned false"
+                            KEY_HIJACK_ERROR, success ? "" : "native returned false",
+                            KEY_HIJACK_PID, pid,
+                            KEY_TRACE_STAGE, success ? "HCE_NATIVE_ACCEPTED" : "HCE_NATIVE_FAILED",
+                            KEY_TRACE_SOURCE, source,
+                            KEY_TRACE_PID, pid
                     ));
-                    info("HIJACK: " + (success ? "NATIVE_ACCEPTED" : "FAILED")
-                            + " result=" + result + " uid=" + normalizedUid);
+                    info("HCE: " + (success ? "NATIVE_ACCEPTED" : "FAILED") + " pid=" + pid + " result=" + result + " uid=" + normalizedUid);
                     return result;
                 } catch (Throwable t) {
-                    writeStatus(values(
-                            KEY_HIJACK_STATUS, "FAILED",
-                            KEY_HIJACK_RESULT, "exception",
-                            KEY_HIJACK_UID, normalizedUid,
-                            KEY_HIJACK_ERROR, t.getClass().getSimpleName() + ": " + String.valueOf(t.getMessage())
-                    ));
-                    error("HIJACK: FAILED", t);
+                    writeStatus(values(KEY_HIJACK_STATUS, "FAILED", KEY_HIJACK_RESULT, "exception", KEY_HIJACK_UID, normalizedUid,
+                            KEY_HIJACK_ERROR, t.getClass().getSimpleName() + ": " + String.valueOf(t.getMessage()), KEY_HIJACK_PID, pid));
+                    error("HCE: FAILED", t);
                     return chain.proceed();
                 }
             });
-
-            writeStatus(values(KEY_HOOK_INSTALLED, true, KEY_HOOK_CLASS, className));
+            writeStatus(values(KEY_HOOK_INSTALLED, true, KEY_HOOK_CLASS, className, KEY_HOOK_PID, Process.myPid()));
             info("HOOK: INSTALLED " + method.toGenericString());
             return 1;
         } catch (ClassNotFoundException e) {
@@ -156,104 +163,99 @@ public class NfcDiagnosticsModule extends XposedModule {
         }
     }
 
-    private int installRfConfigHooks(ClassLoader cl, String className) {
+    private int installTraceHooks(ClassLoader cl, String className) {
         try {
             Class<?> runtime = Class.forName(className, false, cl);
             int installed = 0;
             for (Method method : runtime.getDeclaredMethods()) {
-                String name = method.getName();
-                Class<?>[] types = method.getParameterTypes();
-                if (!isRfConfigCandidate(name, types)) continue;
-
+                if ("setHceTypeAConfig".equals(method.getName())) continue;
+                if (!isTraceCandidate(method.getName(), method.getParameterTypes())) continue;
                 hook(method).intercept(chain -> {
+                    int pid = Process.myPid();
                     Object[] args = chain.getArgs().toArray();
                     SimConfig config = readConfig();
-                    boolean changed = false;
                     String source = runtime.getSimpleName() + "." + method.getName();
+                    info("TRACE: ENTER pid=" + pid + " source=" + source + " args=" + summarizeArgs(args));
+                    writeStatus(values(KEY_TRACE_STAGE, "CALL_ENTER", KEY_TRACE_SOURCE, source, KEY_TRACE_PID, pid));
 
+                    boolean changed = false;
                     for (int i = 0; i < args.length; i++) {
                         if (!(args[i] instanceof byte[])) continue;
                         byte[] original = (byte[]) args[i];
+                        if (looksLikeCoreSetConfig(original)) {
+                            info("NCI: CORE_SET_CONFIG pid=" + pid + " source=" + source + " arg=" + i + " hex=" + bytesToHex(original));
+                            writeStatus(values(KEY_TRACE_STAGE, "CORE_SET_CONFIG", KEY_TRACE_SOURCE, source, KEY_TRACE_PID, pid));
+                        }
                         Nfcid1Tlv tlv = findNfcid1Tlv(original);
                         if (tlv == null) continue;
 
-                        info("RF: NFCID1 FOUND source=" + source + " arg=" + i
-                                + " len=" + tlv.length + " uid=" + bytesToHex(tlv.value));
+                        info("RF: NFCID1 FOUND pid=" + pid + " source=" + source + " arg=" + i + " len=" + tlv.length + " uid=" + bytesToHex(tlv.value));
+                        writeStatus(values(KEY_RF_STATUS, "OBSERVED", KEY_RF_UID, bytesToHex(tlv.value), KEY_RF_SOURCE, source, KEY_RF_ERROR, "", KEY_RF_PID, pid,
+                                KEY_TRACE_STAGE, "NFCID1_FOUND", KEY_TRACE_SOURCE, source, KEY_TRACE_PID, pid));
 
                         if (config.active && config.uid != null && !config.uid.isBlank()) {
                             byte[] desired = hexToBytes(config.uid);
                             if (!(desired.length == 4 || desired.length == 7 || desired.length == 10)) {
-                                writeStatus(values(KEY_RF_STATUS, "FAILED", KEY_RF_ERROR,
-                                        "UID length must be 4/7/10 bytes for LA_NFCID1"));
-                                warn("RF: invalid NFCID1 length=" + desired.length);
+                                writeStatus(values(KEY_RF_STATUS, "FAILED", KEY_RF_ERROR, "UID length must be 4/7/10 bytes", KEY_RF_PID, pid));
                                 continue;
                             }
-
                             byte[] rewritten = replaceExistingNfcid1Tlv(original, tlv, desired);
                             if (rewritten != null) {
                                 args[i] = rewritten;
                                 changed = true;
-                                writeStatus(values(
-                                        KEY_RF_STATUS, "APPLYING",
-                                        KEY_RF_UID, bytesToHex(desired),
-                                        KEY_RF_SOURCE, source,
-                                        KEY_RF_ERROR, ""
-                                ));
-                                info("RF: NFCID1 REWRITE source=" + source
-                                        + " oldLen=" + tlv.length
-                                        + " oldUid=" + bytesToHex(tlv.value)
-                                        + " newLen=" + desired.length
-                                        + " newUid=" + bytesToHex(desired));
+                                writeStatus(values(KEY_RF_STATUS, "APPLYING", KEY_RF_UID, bytesToHex(desired), KEY_RF_SOURCE, source, KEY_RF_ERROR, "", KEY_RF_PID, pid,
+                                        KEY_TRACE_STAGE, "NFCID1_REWRITTEN", KEY_TRACE_SOURCE, source, KEY_TRACE_PID, pid));
+                                info("RF: NFCID1 REWRITE pid=" + pid + " source=" + source + " oldLen=" + tlv.length + " oldUid=" + bytesToHex(tlv.value)
+                                        + " newLen=" + desired.length + " newUid=" + bytesToHex(desired) + " packet=" + bytesToHex(rewritten));
                             }
-                        } else {
-                            writeStatus(values(
-                                    KEY_RF_STATUS, "OBSERVED",
-                                    KEY_RF_UID, bytesToHex(tlv.value),
-                                    KEY_RF_SOURCE, source,
-                                    KEY_RF_ERROR, ""
-                            ));
                         }
                     }
 
                     Object result = changed ? chain.proceed(args) : chain.proceed();
+                    info("TRACE: RETURN pid=" + pid + " source=" + source + " result=" + String.valueOf(result));
                     if (changed) {
                         boolean success = !(result instanceof Boolean) || Boolean.TRUE.equals(result);
-                        writeStatus(values(
-                                KEY_RF_STATUS, success ? "RF_CONFIG_ACCEPTED" : "FAILED",
-                                KEY_RF_RESULT, String.valueOf(result),
-                                KEY_RF_ERROR, success ? "" : "RF config returned false"
-                        ));
-                        info("RF: CONFIG " + (success ? "ACCEPTED" : "FAILED")
-                                + " source=" + source + " result=" + String.valueOf(result));
+                        writeStatus(values(KEY_RF_STATUS, success ? "RF_CONFIG_ACCEPTED" : "FAILED", KEY_RF_RESULT, String.valueOf(result),
+                                KEY_RF_ERROR, success ? "" : "RF config returned false", KEY_RF_PID, pid,
+                                KEY_TRACE_STAGE, success ? "RF_CONFIG_ACCEPTED" : "RF_CONFIG_FAILED", KEY_TRACE_SOURCE, source, KEY_TRACE_PID, pid));
+                        info("RF: CONFIG " + (success ? "ACCEPTED" : "FAILED") + " pid=" + pid + " source=" + source + " result=" + String.valueOf(result));
                     }
                     return result;
                 });
-
-                info("RF: HOOK INSTALLED " + method.toGenericString());
+                info("TRACE: HOOK INSTALLED " + method.toGenericString());
                 installed++;
             }
             return installed;
         } catch (ClassNotFoundException e) {
+            info("TRACE: class absent " + className);
             return 0;
         } catch (Throwable t) {
-            error("RF: hook install failed " + className, t);
+            error("TRACE: hook install failed " + className, t);
             return 0;
         }
     }
 
-    private boolean isRfConfigCandidate(String name, Class<?>[] types) {
+    private boolean isTraceCandidate(String name, Class<?>[] types) {
         String lower = name.toLowerCase(Locale.ROOT);
-        if (!(lower.contains("config") || lower.contains("vendor") || lower.contains("raw")
-                || lower.contains("rf") || lower.contains("write"))) return false;
+        boolean named = lower.contains("config") || lower.contains("vendor") || lower.contains("raw") || lower.contains("rf")
+                || lower.contains("hce") || lower.contains("nci") || lower.contains("discover") || lower.contains("listen") || lower.contains("write");
+        if (!named) return false;
         for (Class<?> type : types) if (type == byte[].class) return true;
+        return lower.contains("config") || lower.contains("hce") || lower.contains("rf") || lower.contains("discover") || lower.contains("listen");
+    }
+
+    private boolean looksLikeCoreSetConfig(byte[] data) {
+        if (data == null || data.length < 2) return false;
+        for (int i = 0; i + 1 < data.length; i++) {
+            if ((data[i] & 0xFF) == 0x20 && (data[i + 1] & 0xFF) == 0x02) return true;
+        }
         return false;
     }
 
     private Nfcid1Tlv findNfcid1Tlv(byte[] data) {
         if (data == null || data.length < 2) return null;
         for (int i = 0; i + 1 < data.length; i++) {
-            int tag = data[i] & 0xFF;
-            if (tag != PARAM_LA_NFCID1) continue;
+            if ((data[i] & 0xFF) != PARAM_LA_NFCID1) continue;
             int len = data[i + 1] & 0xFF;
             if (!(len == 0 || len == 4 || len == 7 || len == 10)) continue;
             if (i + 2 + len > data.length) continue;
@@ -264,8 +266,7 @@ public class NfcDiagnosticsModule extends XposedModule {
 
     private byte[] replaceExistingNfcid1Tlv(byte[] data, Nfcid1Tlv tlv, byte[] desired) {
         int oldEnd = tlv.offset + 2 + tlv.length;
-        int newSize = data.length - tlv.length + desired.length;
-        byte[] out = new byte[newSize];
+        byte[] out = new byte[data.length - tlv.length + desired.length];
         System.arraycopy(data, 0, out, 0, tlv.offset);
         out[tlv.offset] = (byte) PARAM_LA_NFCID1;
         out[tlv.offset + 1] = (byte) desired.length;
@@ -281,7 +282,6 @@ public class NfcDiagnosticsModule extends XposedModule {
             if (app == null) return SimConfig.DISABLED;
             cursor = app.getContentResolver().query(CONFIG_URI, null, null, null, null);
             if (cursor == null) return SimConfig.DISABLED;
-
             boolean active = false;
             String uid = null, sak = null, atqa = null;
             while (cursor.moveToNext()) {
@@ -336,18 +336,15 @@ public class NfcDiagnosticsModule extends XposedModule {
 
     private byte[] hexToBytes(String value) {
         String hex = normalizeHex(value);
-        if (hex.isEmpty() || (hex.length() & 1) != 0)
-            throw new IllegalArgumentException("invalid hex length=" + hex.length());
+        if (hex.isEmpty() || (hex.length() & 1) != 0) throw new IllegalArgumentException("invalid hex length=" + hex.length());
         byte[] out = new byte[hex.length() / 2];
-        for (int i = 0; i < out.length; i++)
-            out[i] = (byte) Integer.parseInt(hex.substring(i * 2, i * 2 + 2), 16);
+        for (int i = 0; i < out.length; i++) out[i] = (byte) Integer.parseInt(hex.substring(i * 2, i * 2 + 2), 16);
         return out;
     }
 
     private String normalizeHex(String value) {
         if (value == null) return "";
-        return value.replace(":", "").replace(" ", "")
-                .replace("0x", "").replace("0X", "").toUpperCase(Locale.ROOT);
+        return value.replace(":", "").replace(" ", "").replace("0x", "").replace("0X", "").toUpperCase(Locale.ROOT);
     }
 
     private String defaultIfBlank(String value, String fallback) {
@@ -378,23 +375,14 @@ public class NfcDiagnosticsModule extends XposedModule {
         final int offset;
         final int length;
         final byte[] value;
-        Nfcid1Tlv(int offset, int length, byte[] value) {
-            this.offset = offset;
-            this.length = length;
-            this.value = value;
-        }
+        Nfcid1Tlv(int offset, int length, byte[] value) { this.offset = offset; this.length = length; this.value = value; }
     }
 
     private static final class SimConfig {
         static final SimConfig DISABLED = new SimConfig(false, null, null, null);
         final boolean active;
         final String uid, sak, atqa;
-        SimConfig(boolean active, String uid, String sak, String atqa) {
-            this.active = active;
-            this.uid = uid;
-            this.sak = sak;
-            this.atqa = atqa;
-        }
+        SimConfig(boolean active, String uid, String sak, String atqa) { this.active = active; this.uid = uid; this.sak = sak; this.atqa = atqa; }
     }
 
     private void info(String msg) { log(Log.INFO, TAG, msg); Log.i(TAG, msg); }
