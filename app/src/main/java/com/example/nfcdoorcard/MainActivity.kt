@@ -67,7 +67,7 @@ data class RuntimeStatus(
 )
 
 class MainActivity : ComponentActivity() {
-    companion object { private const val EXPECTED_HOOK_BUILD = 9 }
+    companion object { private const val EXPECTED_HOOK_BUILD = 10 }
 
     private var nfcAdapter: NfcAdapter? = null
     private var pendingIntent: PendingIntent? = null
@@ -92,6 +92,10 @@ class MainActivity : ComponentActivity() {
         )
         savedCardsState = loadCards()
         AppLogger.i("NFC mode controller started; production vendor binder enabled")
+        // Diagnostics are opt-in for every app launch. This keeps the Hook hot path quiet by default.
+        contentResolver.insert(ConfigProvider.URI, ContentValues().apply {
+            put(ConfigProvider.KEY_DIAGNOSTIC_LOGGING_ENABLED, false)
+        })
         setContent { MaterialTheme { Surface(Modifier.fillMaxSize()) { NfcAppContent() } } }
     }
 
@@ -103,7 +107,17 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() { super.onResume(); if (readModeEnabled) enableReadDispatch() }
     override fun onPause() { disableReadDispatch(); super.onPause() }
-    override fun onDestroy() { disableReadDispatch(); operationExecutor.shutdownNow(); diagnosticExecutor.shutdownNow(); super.onDestroy() }
+    override fun onDestroy() {
+        disableReadDispatch()
+        runCatching {
+            contentResolver.insert(ConfigProvider.URI, ContentValues().apply {
+                put(ConfigProvider.KEY_DIAGNOSTIC_LOGGING_ENABLED, false)
+            })
+        }
+        operationExecutor.shutdownNow()
+        diagnosticExecutor.shutdownNow()
+        super.onDestroy()
+    }
 
     private fun enableReadDispatch() {
         if (!readModeEnabled) return
@@ -253,6 +267,9 @@ class MainActivity : ComponentActivity() {
                                 checked = logsEnabled,
                                 onCheckedChange = { enabled ->
                                     logsEnabled = enabled
+                                    contentResolver.insert(ConfigProvider.URI, ContentValues().apply {
+                                        put(ConfigProvider.KEY_DIAGNOSTIC_LOGGING_ENABLED, enabled)
+                                    })
                                     if (!enabled) logText = ""
                                 }
                             )
