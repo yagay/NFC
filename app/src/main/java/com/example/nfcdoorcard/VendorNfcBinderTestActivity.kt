@@ -16,17 +16,15 @@ import java.lang.reflect.InvocationTargetException
 import java.util.concurrent.Executors
 
 /**
- * V10: obtain the OEM Vendor NFC Binder using the exact INfcAdapter Binder transaction
- * reflected from this device: TRANSACTION_getNfcAdapterVendorInterface = 6.
- *
- * This avoids app-side hidden-API reflection of getNfcAdapterVendorInterface(String).
- * No transaction code is guessed.
+ * V11: direct app-UID Vendor NFC Binder test using values observed from the real HeyTap caller.
+ * INfcAdapter transaction 6 and IVendorNfcAdapter transaction 15 were reflected from this device.
+ * The real caller was observed using vendorName="vendor".
  */
 class VendorNfcBinderTestActivity : ComponentActivity() {
     companion object {
         private const val INFC_DESCRIPTOR = "android.nfc.INfcAdapter"
         private const val TX_GET_VENDOR_INTERFACE = 6
-        private const val VENDOR_NAME = "nxp"
+        private const val VENDOR_NAME = "vendor"
         private const val VENDOR_DESCRIPTOR = "com.vendor.nfc.IVendorNfcAdapter"
         private const val TX_ENABLE_SHARE_MODE = 15
     }
@@ -37,19 +35,16 @@ class VendorNfcBinderTestActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        title = "Vendor NFC Binder 测试 V10"
-
+        title = "Vendor NFC Binder 测试 V11"
         output = TextView(this).apply {
             textSize = 12f
             setTextIsSelectable(true)
-            text = "V10 不再反射隐藏 getter。\n\n已由设备侧元数据确认：INfcAdapter.getNfcAdapterVendorInterface(String) 的 transaction=6。V10 由 App UID 对主 NFC Binder 发送 transaction 6，参数 vendorName=nxp；只有返回 Binder descriptor 精确匹配 Vendor NFC 接口时，才继续 transaction 15。"
+            text = "V11 使用真实 HeyTap 调用观测到的 vendorName=vendor。\n\n流程：App UID → INfcAdapter transaction 6 → 校验 com.vendor.nfc.IVendorNfcAdapter → transaction 15 → RF_UID_APPLIED → false 清理。"
         }
-
         runButton = Button(this).apply {
-            text = "开始 Vendor NFC Binder 测试 V10"
-            setOnClickListener { runV10() }
+            text = "开始 Vendor NFC Binder 测试 V11"
+            setOnClickListener { runV11() }
         }
-
         setContentView(ScrollView(this).apply {
             addView(LinearLayout(this@VendorNfcBinderTestActivity).apply {
                 orientation = LinearLayout.VERTICAL
@@ -65,13 +60,12 @@ class VendorNfcBinderTestActivity : ComponentActivity() {
         super.onDestroy()
     }
 
-    private fun runV10() {
+    private fun runV11() {
         runButton.isEnabled = false
         output.text = "测试中..."
-
         executor.execute {
             val report = buildString {
-                appendLine("=== VENDOR NFC BINDER TEST V10 ===")
+                appendLine("=== VENDOR NFC BINDER TEST V11 ===")
                 appendLine("time=${System.currentTimeMillis()}")
                 appendLine("app_uid=${Process.myUid()} app_pid=${Process.myPid()} package=$packageName")
 
@@ -80,10 +74,14 @@ class VendorNfcBinderTestActivity : ComponentActivity() {
                 val targetUid = before[ConfigProvider.KEY_UID].orEmpty()
                 val beforeEvents = before["refresh_probe_events"]?.toIntOrNull() ?: 0
                 val reflectedGetTx = before["vendor_infc_stub_transactions"].orEmpty()
+                val observedName = before["vendor_observed_name"].orEmpty()
+                val observedDescriptor = before["vendor_observed_descriptor"].orEmpty()
+
                 appendLine("simulation_enabled=$simulationEnabled target_uid=$targetUid before_probe_events=$beforeEvents")
                 appendLine("main_descriptor=$INFC_DESCRIPTOR get_vendor_tx=$TX_GET_VENDOR_INTERFACE vendor_name=$VENDOR_NAME")
                 appendLine("vendor_descriptor=$VENDOR_DESCRIPTOR enable_share_tx=$TX_ENABLE_SHARE_MODE")
                 appendLine("metadata_stub_transactions=$reflectedGetTx")
+                appendLine("observed_vendor_name=$observedName observed_vendor_descriptor=$observedDescriptor")
 
                 if (!simulationEnabled || targetUid.isBlank()) {
                     appendLine("RESULT=TEST_NOT_RUN reason=simulation_not_enabled")
@@ -91,6 +89,14 @@ class VendorNfcBinderTestActivity : ComponentActivity() {
                 }
                 if (!reflectedGetTx.contains("TRANSACTION_getNfcAdapterVendorInterface=6")) {
                     appendLine("RESULT=TEST_NOT_RUN reason=device_metadata_does_not_confirm_transaction_6")
+                    return@buildString
+                }
+                if (observedName.isNotBlank() && observedName != VENDOR_NAME) {
+                    appendLine("RESULT=TEST_NOT_RUN reason=observed_vendor_name_mismatch actual=$observedName")
+                    return@buildString
+                }
+                if (observedDescriptor.isNotBlank() && observedDescriptor != VENDOR_DESCRIPTOR) {
+                    appendLine("RESULT=TEST_NOT_RUN reason=observed_vendor_descriptor_mismatch actual=$observedDescriptor")
                     return@buildString
                 }
 
@@ -142,7 +148,7 @@ class VendorNfcBinderTestActivity : ComponentActivity() {
 
                 runCatching {
                     contentResolver.insert(ConfigProvider.URI, ContentValues().apply {
-                        put(ConfigProvider.KEY_RF_STATUS, "WAITING_BINDER_TEST_V10")
+                        put(ConfigProvider.KEY_RF_STATUS, "WAITING_BINDER_TEST_V11")
                         put(ConfigProvider.KEY_RF_UID, "")
                         put(ConfigProvider.KEY_RF_RESULT, "")
                         put(ConfigProvider.KEY_RF_ERROR, "")
@@ -156,7 +162,6 @@ class VendorNfcBinderTestActivity : ComponentActivity() {
                 try {
                     enterAccepted = transactShareMode(vendorBinder, true, this)
                     appendLine("enableNfcShareMode(true)=$enterAccepted")
-
                     val deadline = System.currentTimeMillis() + 3000L
                     while (System.currentTimeMillis() < deadline) {
                         val state = readProviderMap()
@@ -185,8 +190,8 @@ class VendorNfcBinderTestActivity : ComponentActivity() {
                 appendLine("RESULT=${if (enterAccepted == true && rfApplied) "TEST_PASS" else "TEST_FAIL_CALL_OR_RF"}")
             }
 
-            AppLogger.i("VENDOR_BINDER_TEST_V10:\n$report")
-            runCatching { File(cacheDir, "vendor_nfc_binder_test_v10.txt").writeText(report) }
+            AppLogger.i("VENDOR_BINDER_TEST_V11:\n$report")
+            runCatching { File(cacheDir, "vendor_nfc_binder_test_v11.txt").writeText(report) }
             runOnUiThread {
                 output.text = report
                 runButton.isEnabled = true
