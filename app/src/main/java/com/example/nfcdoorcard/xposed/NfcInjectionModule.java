@@ -22,7 +22,8 @@ import io.github.libxposed.api.XposedModuleInterface;
 /** Production fixed NFCID1 injector for OxygenOS/NXP. */
 public class NfcInjectionModule extends XposedModule {
     private static final String TAG = "NfcUIDSim";
-    private static final int HOOK_BUILD = 11;
+    // Keep the runtime handshake compatible with the current app orchestrator.
+    private static final int HOOK_BUILD = 9;
     private static final Uri CONFIG_URI = Uri.parse("content://com.example.nfcdoorcard.config/settings");
     private static final Pattern OPLUS_BLOCK = Pattern.compile("(?ms)(OPLUS_CONF_EXTN\\s*=\\s*\\{)(.*?)(\\})");
     private static final Pattern HEX_TOKEN = Pattern.compile("(?i)(?<![0-9A-F])([0-9A-F]{2})(?![0-9A-F])");
@@ -31,7 +32,7 @@ public class NfcInjectionModule extends XposedModule {
     @Override
     public void onModuleLoaded(XposedModuleInterface.ModuleLoadedParam param) {
         super.onModuleLoaded(param);
-        Log.i(TAG, "MODULE loaded build=" + HOOK_BUILD + " process=" + param.getProcessName());
+        Log.i(TAG, "PROD MODULE loaded build=" + HOOK_BUILD + " process=" + param.getProcessName());
     }
 
     @Override
@@ -77,9 +78,9 @@ public class NfcInjectionModule extends XposedModule {
                 return result;
             });
             writeBaseStatus(pid, true, 1);
-            Log.i(TAG, "HOOK READY build=" + HOOK_BUILD + " pid=" + pid);
+            Log.i(TAG, "PROD HOOK READY build=" + HOOK_BUILD + " pid=" + pid);
         } catch (Throwable t) {
-            Log.e(TAG, "HOOK FAILED build=" + HOOK_BUILD + " pid=" + pid + " " + t.getClass().getSimpleName() + ": " + t.getMessage(), t);
+            Log.e(TAG, "PROD HOOK FAILED build=" + HOOK_BUILD + " pid=" + pid + " " + t.getClass().getSimpleName() + ": " + t.getMessage(), t);
             writeHookFailure(pid, t);
         }
     }
