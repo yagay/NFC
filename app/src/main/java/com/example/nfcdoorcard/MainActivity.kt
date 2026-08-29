@@ -165,19 +165,8 @@ class MainActivity : ComponentActivity() {
         var operationMessage by remember { mutableStateOf<String?>(null) }
         val logListState = rememberLazyListState()
 
-        LaunchedEffect(selectedSource) {
-            while (true) {
-                executor.execute {
-                    val newStatus = readRuntimeStatus()
-                    val logs = fetchLogsSync(selectedSource)
-                    runOnUiThread {
-                        status = newStatus
-                        logText = if (selectedSource == LogSource.STATUS) buildStatusSummary(newStatus) + "\n\n" + logs else logs
-                    }
-                }
-                kotlinx.coroutines.delay(2000)
-            }
-        }
+        // Startup-safe mode: do not automatically run root/logcat/provider diagnostics.
+        // HeyTap bridge continues independently in the background LSPosed process.
 
         Scaffold(topBar = {
             TopAppBar(
