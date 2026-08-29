@@ -72,7 +72,7 @@ public class NfcInjectionModule extends XposedModule {
         }
         activeAdapter = adapter;
 
-        installRefreshProbes(cl, pid);
+        // Production path: keep only the UID injection hook. Diagnostic refresh probes are disabled.
 
         try {
             Method method = adapter.resolveInjectionMethod(cl);
