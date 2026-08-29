@@ -1,45 +1,50 @@
-# NFC Door Card
+# NFC Expert Pro (v7)
 
-Android 12–17 (API 31–37) NFC diagnostics + conservative HCE prototype.
+A specialized NFC simulation and diagnostic tool for Android devices, optimized for OxygenOS 16 / Android 15+.
 
-## Current features
+## Overview
 
-- NFC tag/card inspection using Android Reader Mode.
-- Shows UID, technology list, NFC-A ATQA and SAK when available.
-- Distinguishes MIFARE Classic, ISO-DEP, NFC-A, NFC-B, NFC-F/FeliCa and NFC-V/ISO 15693.
-- Minimal `HostApduService` demo AID (`F0010203040506`) with logcat diagnostics.
-- Root availability check through a single hardened `RootShell` implementation.
-- Modern libxposed API/service 102 integration.
-- Static LSPosed scope for `com.android.nfc`.
-- `NativeNfcManager.doInitialize()` diagnostic hook only; no controller configuration writes are performed.
-- Device-protected UID test configuration is exposed through a read-only provider; the NFC process reads and logs `active` / target UID during `doInitialize()` for diagnostics only.
-- Wallet entries use independent IDs, so separate cards with the same UID can coexist; legacy UID-keyed entries remain readable.
+This project leverages the **LibXposed** framework to perform low-level NFC hardware abstraction layer (HAL) hijacking. It is designed to solve the common issue where system-level NFC resets or power management events interfere with UID simulation on modern Android devices.
 
-## UID test request semantics
+## Key Features
 
-The app can save a target UID as a **test request** and restart the NFC service to exercise the diagnostic lifecycle. This does **not** mean the NFC controller UID has been changed. The current build intentionally does not invoke vendor-specific controller configuration methods.
+- **Real-time Module Status**: Visual indicator in the UI showing whether the Xposed module is successfully injected and active.
+- **Hardware-Level UID Simulation**: Directly hooks `NativeNfcManager` (NXP/ST/Standard variants) to force target UID, SAK, and ATQA values.
+- **State Enforcement**: Intercepts system events (screen state, wallet switches, routing updates) to prevent the system from "backstabbing" and resetting the simulated UID.
+- **Comprehensive Multi-Level Diagnostics**:
+    - **HIJACK**: Real-time logs from the Xposed hook.
+    - **LSPosed**: Framework-level loading and error logs.
+    - **KernelSU**: Root execution and system-level event logs.
+- **One-Click NFC Toggle**: Automatically restarts the NFC service to apply changes using root privileges.
 
-## Why low-level UID emulation is not enabled
+## Project Structure
 
-Android HCE is intended for ISO-DEP/APDU services and does not provide an application API for choosing a fixed NFC-A UID. MIFARE Classic also uses a protocol/crypto path that ordinary Android HCE does not reproduce. Device-specific NFC controller changes can crash the NFC service or interfere with payment routing, so they should only be considered after collecting target-device diagnostics and confirming the exact vendor API semantics.
+- `MainActivity.kt`: Modern Compose-based UI with integrated diagnostic console and card management.
+- `XposedEntry.kt`: Core LibXposed implementation using the latest API 102.
+- `ConfigProvider.kt`: Secure IPC mechanism for passing simulation parameters from the UI to the NFC process.
+- `AppLogger.kt`: Internal diagnostic buffer for tracking App-side events.
 
-## Build
+## Installation & Setup
 
-Use JDK 17. `libxposed` service 102 requires `compileSdk = 37`, while `targetSdk` remains 36. The APK supports runtime Android 12–17 (API 31–37). The project currently uses AGP 9.2.1 and Gradle 9.4.1.
+1. **Prerequisites**: 
+    - A rooted device with **KernelSU** or **Magisk**.
+    - **LSPosed (Dexposed/Mod)** installed and working.
+2. **Build**: Build the APK and install it on your device.
+3. **Activation**:
+    - Open LSPosed Manager.
+    - Enable the "NFC" module.
+    - **Crucial**: Ensure the scope includes "System Framework" and the **NFC Service** (usually `com.android.nfc` or `com.oplus.nfc`).
+    - Reboot the device or toggle NFC in the app.
+4. **Verification**: Check if the "Module Active" indicator at the top of the App is green.
 
-GitHub Actions workflow: `.github/workflows/build-apk.yml`. The hosted runner currently provides the API 37 platform used by compilation; the workflow also installs the stable API 36/build-tools package used by the Android toolchain.
+## Development
 
-```bash
-gradle --no-daemon :app:assembleDebug
-```
+- **Language**: 100% Kotlin
+- **UI**: Jetpack Compose (Material 3)
+- **Xposed API**: LibXposed (Service 102)
+- **Minimum SDK**: 31 (Android 12)
+- **Compile SDK**: 34
 
-## Useful device diagnostics
+## License
 
-1. Read the physical card with this app and record UID / Tech / ATQA / SAK.
-2. `adb shell dumpsys nfc`
-3. List NFC vendor files (names only):
-   `adb shell su -c 'find /vendor/etc /odm/etc /product/etc -maxdepth 2 -iname "*nfc*" -o -iname "libnfc*" 2>/dev/null'`
-4. Relevant NFC logs:
-   `adb shell logcat -b all -d | grep -iE "nfc|NfcService|NfcDoorHCE|NfcUIDSim|libnfc|sn100|st21|pn5"`
-
-Do not replace vendor NFC files from another ROM/device.
+Personal Research Project. Use responsibly for legal NFC diagnostics only.
