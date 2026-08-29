@@ -7,14 +7,12 @@ import android.database.Cursor
 import android.net.Uri
 import android.provider.Settings
 import android.util.Log
-import io.github.libxposed.api.XposedInterface
 import io.github.libxposed.api.XposedModule
 import io.github.libxposed.api.XposedModuleInterface
-import io.github.libxposed.api.XposedModuleInterface.ModuleLoadedParam
 import java.lang.reflect.Method
 import java.util.Locale
 
-class XposedEntry(base: XposedInterface, param: ModuleLoadedParam) : XposedModule(base, param) {
+class XposedEntry : XposedModule() {
 
     companion object {
         private const val TAG = "NfcUIDSim"
@@ -27,8 +25,7 @@ class XposedEntry(base: XposedInterface, param: ModuleLoadedParam) : XposedModul
     private val nativeManagers = mutableSetOf<Any>()
 
     init {
-        log("MODULE: XposedEntry instantiated (Modern API 102), process=${param.processName}")
-        Log.e(TAG, "MODULE: XposedEntry instantiated (Modern API 102), process=${param.processName}")
+        Log.e(TAG, "MODULE: XposedEntry instantiated (Modern API 102)")
     }
 
     override fun onPackageLoaded(lp: XposedModuleInterface.PackageLoadedParam) {
@@ -36,12 +33,12 @@ class XposedEntry(base: XposedInterface, param: ModuleLoadedParam) : XposedModul
         val pkg = lp.packageName
         val cl = lp.defaultClassLoader
 
-        Log.e(TAG, "MODULE: onPackageLoaded package=$pkg process=${lp.processName} first=${lp.isFirstPackage}")
+        Log.e(TAG, "MODULE: onPackageLoaded package=$pkg first=${lp.isFirstPackage}")
         if (!pkg.contains("nfc", ignoreCase = true)) return
 
-        Log.e(TAG, "MODULE: Loaded into process $pkg")
+        Log.e(TAG, "MODULE: Loaded into NFC package $pkg")
         reportModuleActive(pkg)
-        Log.e(TAG, "NFC-HIJACK: Armed in process: $pkg (Thread: ${Thread.currentThread().name})")
+        Log.e(TAG, "NFC-HIJACK: Armed in package: $pkg (Thread: ${Thread.currentThread().name})")
 
         val managerClasses = arrayOf(
             "com.android.nfc.dhimpl.NxpNativeNfcManager",
