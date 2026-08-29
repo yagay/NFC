@@ -19,7 +19,7 @@ import io.github.libxposed.api.XposedModuleInterface;
 /** Stable LSPosed entry. Vendor-specific behavior lives in NfcStackAdapter implementations. */
 public class NfcInjectionModule extends XposedModule {
     private static final String TAG = "NfcUIDSim";
-    private static final int HOOK_BUILD = 10;
+    private static final int HOOK_BUILD = 9;
     private static final Uri CONFIG_URI = Uri.parse("content://com.example.nfcdoorcard.config/settings");
 
     private final NfcStackAdapter[] adapters = new NfcStackAdapter[]{
