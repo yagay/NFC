@@ -31,9 +31,6 @@ class VendorNfcController {
 
     fun setShareMode(enabled: Boolean): Result {
         return try {
-            // Initialize the framework-side NFC service proxy first.
-            runCatching { NfcAdapter.getDefaultAdapter(null) }
-
             val service = NfcAdapter::class.java.getDeclaredField("sService").apply {
                 isAccessible = true
             }.get(null) ?: return Result(false, enabled, "INFC_SERVICE", "NfcAdapter.sService is null")
