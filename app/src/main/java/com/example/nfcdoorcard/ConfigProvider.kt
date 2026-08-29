@@ -10,7 +10,7 @@ class ConfigProvider : ContentProvider() {
     companion object {
         const val AUTHORITY = "com.example.nfcdoorcard.config"
         const val PATH_SETTINGS = "settings"
-        const val APP_BUILD = 10
+        const val APP_BUILD = 11
 
         const val KEY_APP_BUILD = "app_build"
         const val KEY_HOOK_BUILD = "hook_build"
