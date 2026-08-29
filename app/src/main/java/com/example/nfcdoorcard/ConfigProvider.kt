@@ -10,7 +10,7 @@ class ConfigProvider : ContentProvider() {
     companion object {
         const val AUTHORITY = "com.example.nfcdoorcard.config"
         const val PATH_SETTINGS = "settings"
-        const val APP_BUILD = 9
+        const val APP_BUILD = 10
 
         const val KEY_APP_BUILD = "app_build"
         const val KEY_HOOK_BUILD = "hook_build"
@@ -58,19 +58,11 @@ class ConfigProvider : ContentProvider() {
     }
 
     override fun onCreate(): Boolean {
-        context!!.getSharedPreferences("nfc_config", 0).edit()
-            .putInt(KEY_APP_BUILD, APP_BUILD)
-            .apply()
+        context!!.getSharedPreferences("nfc_config", 0).edit().putInt(KEY_APP_BUILD, APP_BUILD).apply()
         return true
     }
 
-    override fun query(
-        uri: Uri,
-        projection: Array<out String>?,
-        selection: String?,
-        selectionArgs: Array<out String>?,
-        sortOrder: String?
-    ): Cursor {
+    override fun query(uri: Uri, projection: Array<out String>?, selection: String?, selectionArgs: Array<out String>?, sortOrder: String?): Cursor {
         val prefs = context!!.getSharedPreferences("nfc_config", 0)
         val cursor = MatrixCursor(arrayOf("key", "value"))
         prefs.all.forEach { (key, value) -> cursor.addRow(arrayOf(key, value?.toString() ?: "")) }
