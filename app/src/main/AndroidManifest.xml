@@ -1,19 +1,21 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.example.nfcdoorcard">
+
     <uses-permission android:name="android.permission.NFC" />
     <uses-feature android:name="android.hardware.nfc" android:required="true" />
-    <uses-feature android:name="android.hardware.nfc.hce" android:required="false" />
+
+    <!-- Needed to restart NFC service via root -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
     <application
-        android:name=".NfcDoorApplication"
         android:allowBackup="true"
         android:label="@string/app_name"
-        android:description="@string/app_description"
         android:supportsRtl="true"
         android:theme="@style/AppTheme">
 
         <activity
-            android:name=".LegacyHardcodedUidTraceActivity"
+            android:name=".MainActivity"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
@@ -21,35 +23,35 @@
             </intent-filter>
         </activity>
 
-        <activity
-            android:name=".SystemDefaultLauncherActivity"
-            android:exported="false" />
-
-        <activity
-            android:name=".ActivationActivity"
-            android:exported="false" />
-
-        <activity
-            android:name=".MainActivity"
-            android:exported="false" />
+        <provider
+            android:name=".ConfigProvider"
+            android:authorities="com.example.nfcdoorcard.config"
+            android:directBootAware="true"
+            android:exported="true" />
 
         <provider
-            android:name=".data.UidConfigProvider"
-            android:authorities="com.example.nfcdoorcard.uidconfig"
-            android:directBootAware="true"
-            android:exported="true"
-            android:grantUriPermissions="false" />
-
-        <service
-            android:name=".nfc.DoorHostApduService"
-            android:exported="true"
-            android:permission="android.permission.BIND_NFC_SERVICE">
-            <intent-filter>
-                <action android:name="android.nfc.cardemulation.action.HOST_APDU_SERVICE" />
-            </intent-filter>
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="com.example.nfcdoorcard.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
             <meta-data
-                android:name="android.nfc.cardemulation.host_apdu_service"
-                android:resource="@xml/apduservice" />
-        </service>
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/filepaths" />
+        </provider>
+
+        <!-- Xposed Module Metadata -->
+        <meta-data
+            android:name="xposedmodule"
+            android:value="true" />
+        <meta-data
+            android:name="xposeddescription"
+            android:value="Advanced NFC Door Card Simulator for OxygenOS 16" />
+        <meta-data
+            android:name="xposedminversion"
+            android:value="93" />
+        <meta-data
+            android:name="libxposedmodule"
+            android:value="102" />
+
     </application>
 </manifest>
