@@ -4,6 +4,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.util.Log
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Re-applies the persisted desired simulation state after a phone reboot or an NFC process restart.
@@ -13,34 +14,54 @@ class AutoRestoreReceiver : BroadcastReceiver() {
     companion object {
         const val ACTION_NFC_HOOK_READY = "com.example.nfcdoorcard.action.NFC_HOOK_READY"
         private const val TAG = "NfcAutoRestore"
+        private val restoreRunning = AtomicBoolean(false)
     }
 
     override fun onReceive(context: Context, intent: Intent?) {
         val pending = goAsync()
+        if (!restoreRunning.compareAndSet(false, true)) {
+            Log.i(TAG, "restore already running; merge action=${intent?.action}")
+            pending.finish()
+            return
+        }
+
         Thread {
             try {
-                val state = readDesiredState(context)
-                if (!state.enabled || state.uid.isNullOrBlank()) {
+                val initial = readDesiredState(context)
+                if (!initial.enabled || initial.uid.isNullOrBlank()) {
                     Log.i(TAG, "skip restore action=${intent?.action} desired=false")
                     return@Thread
                 }
 
-                Log.i(TAG, "restore requested action=${intent?.action} uid=${state.uid}")
+                val desiredUid = initial.uid
+                Log.i(TAG, "restore requested action=${intent?.action} uid=$desiredUid")
                 var last: VendorNfcController.Result? = null
-                repeat(15) { attempt ->
-                    // Give the NFC framework/vendor service time to finish initialization.
-                    if (attempt > 0) Thread.sleep(1000L)
-                    last = VendorNfcController().setShareMode(true)
-                    if (last?.success == true) {
-                        Log.i(TAG, "restore accepted attempt=${attempt + 1} uid=${state.uid}")
+
+                repeat(10) { attempt ->
+                    val current = readDesiredState(context)
+                    if (!current.enabled || !current.uid.equals(desiredUid, true)) {
+                        Log.i(TAG, "restore cancelled: desired state changed")
                         return@Thread
                     }
-                    Log.i(TAG, "restore retry attempt=${attempt + 1} stage=${last?.stage} detail=${last?.detail}")
+
+                    if (attempt > 0) Thread.sleep(700L)
+                    last = VendorNfcController().setShareMode(true)
+                    if (last?.success == true) {
+                        Log.i(TAG, "binder accepted attempt=${attempt + 1} uid=$desiredUid; waiting RF confirmation")
+                        if (waitForRfApplied(context, desiredUid, 5_000L)) {
+                            Log.i(TAG, "restore confirmed RF_UID_APPLIED uid=$desiredUid attempt=${attempt + 1}")
+                            return@Thread
+                        }
+                        Log.w(TAG, "binder accepted but RF UID not confirmed; retrying uid=$desiredUid")
+                    } else {
+                        Log.i(TAG, "restore retry attempt=${attempt + 1} stage=${last?.stage} detail=${last?.detail}")
+                    }
                 }
-                Log.e(TAG, "restore failed uid=${state.uid} stage=${last?.stage} detail=${last?.detail}")
+                Log.e(TAG, "restore failed uid=$desiredUid stage=${last?.stage} detail=${last?.detail}")
             } catch (t: Throwable) {
                 Log.e(TAG, "restore exception ${t.javaClass.simpleName}: ${t.message}", t)
             } finally {
+                restoreRunning.set(false)
                 pending.finish()
             }
         }.apply {
@@ -50,18 +71,34 @@ class AutoRestoreReceiver : BroadcastReceiver() {
         }
     }
 
-    private fun readDesiredState(context: Context): DesiredState {
-        var enabled = false
-        var uid: String? = null
-        context.contentResolver.query(ConfigProvider.URI, null, null, null, null)?.use { cursor ->
-            while (cursor.moveToNext()) {
-                when (cursor.getString(0)) {
-                    ConfigProvider.KEY_SIMULATION_ENABLED -> enabled = cursor.getString(1).toBoolean()
-                    ConfigProvider.KEY_UID -> uid = cursor.getString(1)?.takeIf { it.isNotBlank() }
-                }
-            }
+    private fun waitForRfApplied(context: Context, uid: String, timeoutMs: Long): Boolean {
+        val end = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < end) {
+            val map = readProviderMap(context)
+            if (!map[ConfigProvider.KEY_SIMULATION_ENABLED].toBoolean()) return false
+            val applied = map[ConfigProvider.KEY_RF_STATUS] == "RF_UID_APPLIED" &&
+                map[ConfigProvider.KEY_RF_UID].equals(uid, true) &&
+                map[ConfigProvider.KEY_RF_RESULT] == "0"
+            if (applied) return true
+            Thread.sleep(150L)
         }
-        return DesiredState(enabled, uid)
+        return false
+    }
+
+    private fun readDesiredState(context: Context): DesiredState {
+        val map = readProviderMap(context)
+        return DesiredState(
+            enabled = map[ConfigProvider.KEY_SIMULATION_ENABLED].toBoolean(),
+            uid = map[ConfigProvider.KEY_UID]?.takeIf { it.isNotBlank() }
+        )
+    }
+
+    private fun readProviderMap(context: Context): Map<String, String> {
+        val map = mutableMapOf<String, String>()
+        context.contentResolver.query(ConfigProvider.URI, null, null, null, null)?.use { cursor ->
+            while (cursor.moveToNext()) map[cursor.getString(0)] = cursor.getString(1)
+        }
+        return map
     }
 
     private data class DesiredState(val enabled: Boolean, val uid: String?)
