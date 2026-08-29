@@ -10,7 +10,7 @@ class ConfigProvider : ContentProvider() {
     companion object {
         const val AUTHORITY = "com.example.nfcdoorcard.config"
         const val PATH_SETTINGS = "settings"
-        const val APP_BUILD = 15
+        const val APP_BUILD = 16
 
         const val KEY_APP_BUILD = "app_build"
         const val KEY_HOOK_BUILD = "hook_build"
@@ -58,14 +58,25 @@ class ConfigProvider : ContentProvider() {
     }
 
     override fun onCreate(): Boolean {
-        context!!.getSharedPreferences("nfc_config", 0).edit().putInt(KEY_APP_BUILD, APP_BUILD).apply()
+        context!!.getSharedPreferences("nfc_config", 0)
+            .edit()
+            .putInt(KEY_APP_BUILD, APP_BUILD)
+            .apply()
         return true
     }
 
-    override fun query(uri: Uri, projection: Array<out String>?, selection: String?, selectionArgs: Array<out String>?, sortOrder: String?): Cursor {
+    override fun query(
+        uri: Uri,
+        projection: Array<out String>?,
+        selection: String?,
+        selectionArgs: Array<out String>?,
+        sortOrder: String?
+    ): Cursor {
         val prefs = context!!.getSharedPreferences("nfc_config", 0)
         val cursor = MatrixCursor(arrayOf("key", "value"))
-        prefs.all.forEach { (key, value) -> cursor.addRow(arrayOf(key, value?.toString() ?: "")) }
+        prefs.all.forEach { (key, value) ->
+            cursor.addRow(arrayOf(key, value?.toString() ?: ""))
+        }
         return cursor
     }
 
@@ -84,46 +95,26 @@ class ConfigProvider : ContentProvider() {
         }
         editor.apply()
         context?.contentResolver?.notifyChange(uri, null)
-
-        if (values.containsKey(KEY_SIMULATION_ENABLED)) scheduleNfcEnableRecovery()
         return uri
     }
 
-    private fun scheduleNfcEnableRecovery() {
-        Thread {
-            runCatching {
-                Thread.sleep(2500)
-                val command = """
-                    i=0
-                    while [ ${'$'}i -lt 8 ]; do
-                      state=${'$'}(dumpsys nfc 2>/dev/null | grep -m1 -E 'mState=|state=' || true)
-                      echo "${'$'}state" | grep -Eqi 'mState=on|state=on|STATE_ON|mState=3' && exit 0
-                      svc nfc enable 2>/dev/null || true
-                      sleep 2
-                      i=${'$'}((i+1))
-                    done
-                    svc nfc enable 2>/dev/null || true
-                """.trimIndent()
-                val process = Runtime.getRuntime().exec(arrayOf("su", "-c", command))
-                process.inputStream.close()
-                process.errorStream.close()
-                process.waitFor()
-            }
-        }.apply {
-            name = "NfcEnableRecovery"
-            isDaemon = true
-            start()
-        }
-    }
-
-    override fun update(uri: Uri, values: ContentValues?, selection: String?, selectionArgs: Array<out String>?): Int {
+    override fun update(
+        uri: Uri,
+        values: ContentValues?,
+        selection: String?,
+        selectionArgs: Array<out String>?
+    ): Int {
         if (values == null) return 0
         insert(uri, values)
         return values.size()
     }
 
     override fun delete(uri: Uri, selection: String?, selectionArgs: Array<out String>?): Int {
-        context!!.getSharedPreferences("nfc_config", 0).edit().clear().putInt(KEY_APP_BUILD, APP_BUILD).apply()
+        context!!.getSharedPreferences("nfc_config", 0)
+            .edit()
+            .clear()
+            .putInt(KEY_APP_BUILD, APP_BUILD)
+            .apply()
         return 1
     }
 
