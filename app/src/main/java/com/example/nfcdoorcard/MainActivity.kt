@@ -62,6 +62,7 @@ class MainActivity : ComponentActivity() {
     private val executor = Executors.newSingleThreadExecutor()
     private val prefsCards = "saved_cards"
     private val keyCardsList = "cards_list"
+    private var scannedCardState by mutableStateOf<CardModel?>(null)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -86,22 +87,19 @@ class MainActivity : ComponentActivity() {
         var logText by remember { mutableStateOf("") }
         var selectedSource by remember { mutableStateOf(LogSource.HIJACK) }
         var diagnosticRunning by remember { mutableStateOf(false) }
-        var readPrompt by remember { mutableStateOf(false) }
+        val scannedCard = scannedCardState
         val logListState = rememberLazyListState()
 
         LaunchedEffect(selectedSource) {
             while (true) {
                 executor.execute {
                     val newStatus = readRuntimeStatus()
-                    val newCards = loadCards()
-                    fetchLogsSync(selectedSource).also { logs ->
-                        runOnUiThread {
-                            status = newStatus
-                            cards = newCards
-                            logText = if (selectedSource == LogSource.HIJACK) {
-                                buildStatusSummary(newStatus) + "\n\n" + logs
-                            } else logs
-                        }
+                    val logs = fetchLogsSync(selectedSource)
+                    runOnUiThread {
+                        status = newStatus
+                        logText = if (selectedSource == LogSource.HIJACK) {
+                            buildStatusSummary(newStatus) + "\n\n" + logs
+                        } else logs
                     }
                 }
                 kotlinx.coroutines.delay(3000)
@@ -126,139 +124,134 @@ class MainActivity : ComponentActivity() {
                 )
             }
         ) { padding ->
-            Column(modifier = Modifier.padding(padding).fillMaxSize()) {
-                RuntimeStatusPanel(status)
-
-                Card(
-                    modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp)
-                ) {
-                    Column(modifier = Modifier.padding(12.dp)) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            Text("卡片管理", fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
-                            Text("已保存 ${cards.size} 张", fontSize = 11.sp, color = Color.Gray)
-                        }
-
-                        Spacer(Modifier.height(8.dp))
-
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            Button(
-                                onClick = {
-                                    readPrompt = true
-                                    Toast.makeText(
-                                        this@MainActivity,
-                                        "请将卡片贴近手机背面，读取后会自动保存",
-                                        Toast.LENGTH_LONG
-                                    ).show()
-                                },
-                                modifier = Modifier.weight(1f)
-                            ) {
-                                Text("读取并保存卡片")
-                            }
-
-                            if (status.simulationEnabled) {
-                                OutlinedButton(
-                                    onClick = {
-                                        disableSimulation()
-                                        status = status.copy(
-                                            simulationEnabled = false,
-                                            selectedUid = null,
-                                            hijackStatus = "IDLE"
-                                        )
-                                    },
-                                    modifier = Modifier.weight(1f)
-                                ) {
-                                    Text("停止模拟")
-                                }
-                            }
-                        }
-
-                        if (readPrompt) {
-                            Spacer(Modifier.height(6.dp))
-                            Text(
-                                "正在等待 NFC 卡片… 读取 UID / SAK / ATQA 后自动保存。",
-                                fontSize = 11.sp,
-                                color = Color(0xFF1565C0)
-                            )
-                        }
-
-                        if (cards.isEmpty()) {
-                            Spacer(Modifier.height(8.dp))
-                            Text(
-                                "还没有保存的卡片。点击“读取并保存卡片”后贴卡。",
-                                fontSize = 12.sp,
-                                color = Color.Gray
-                            )
+            LazyColumn(
+                modifier = Modifier.padding(padding).fillMaxSize(),
+                contentPadding = PaddingValues(bottom = 8.dp)
+            ) {
+                item {
+                    RuntimeStatusPanel(status, diagnosticRunning) {
+                        if (!diagnosticRunning) {
+                            diagnosticRunning = true
+                            runOneTapDiagnosticAndShare { diagnosticRunning = false }
                         }
                     }
                 }
 
-                LazyColumn(
-                    modifier = Modifier.heightIn(min = 80.dp, max = 220.dp).fillMaxWidth()
-                ) {
+                item {
+                    ReadCardPanel(
+                        card = scannedCard,
+                        onSave = { card ->
+                            if (cards.any { it.uid.equals(card.uid, true) }) {
+                                Toast.makeText(this@MainActivity, "该卡片已经保存", Toast.LENGTH_SHORT).show()
+                            } else {
+                                val updated = cards + card
+                                saveCards(updated)
+                                cards = updated
+                                Toast.makeText(this@MainActivity, "卡片已保存", Toast.LENGTH_SHORT).show()
+                            }
+                            scannedCardState = null
+                        },
+                        onClear = { scannedCardState = null }
+                    )
+                }
+
+                item {
+                    Text(
+                        "已保存卡片 (${cards.size})",
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+
+                if (cards.isEmpty()) {
+                    item {
+                        Text(
+                            "暂无保存卡片。先把门禁卡贴到手机背部读取，然后点击“保存卡片”。",
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                            fontSize = 12.sp,
+                            color = Color.Gray
+                        )
+                    }
+                } else {
                     items(cards, key = { it.uid }) { card ->
+                        val active = status.simulationEnabled && card.uid.equals(status.selectedUid, true)
                         CardItem(
                             card = card,
-                            isActive = status.simulationEnabled && card.uid.equals(status.selectedUid, true),
+                            isActive = active,
                             onSimulate = {
                                 simulateCard(card)
                                 status = status.copy(
                                     simulationEnabled = true,
                                     selectedUid = card.uid,
-                                    hijackStatus = "WAITING"
+                                    hijackStatus = "WAITING",
+                                    hijackResult = null,
+                                    hijackUid = null,
+                                    hijackError = null
+                                )
+                            },
+                            onStop = {
+                                disableSimulation()
+                                status = status.copy(
+                                    simulationEnabled = false,
+                                    hijackStatus = "IDLE",
+                                    hijackResult = null,
+                                    hijackUid = null,
+                                    hijackError = null
                                 )
                             },
                             onDelete = {
-                                cards = cards.filter { it.uid != card.uid }
-                                saveCards(cards)
-                                if (card.uid.equals(status.selectedUid, true)) {
-                                    disableSimulation()
-                                    status = status.copy(
-                                        simulationEnabled = false,
-                                        selectedUid = null,
-                                        hijackStatus = "IDLE"
-                                    )
-                                }
+                                if (active) disableSimulation()
+                                val updated = cards.filter { !it.uid.equals(card.uid, true) }
+                                saveCards(updated)
+                                cards = updated
+                                if (active) status = status.copy(simulationEnabled = false, selectedUid = null, hijackStatus = "IDLE")
                             }
                         )
                     }
                 }
 
-                TabRow(selectedTabIndex = selectedSource.ordinal) {
-                    LogSource.entries.forEach { source ->
-                        Tab(
-                            selected = selectedSource == source,
-                            onClick = { selectedSource = source },
-                            text = { Text(source.name, fontSize = 11.sp) }
-                        )
-                    }
-                }
-
-                Box(
-                    modifier = Modifier.weight(1f).fillMaxWidth().padding(4.dp)
-                        .background(Color(0xFF050505), RoundedCornerShape(4.dp)).padding(4.dp)
-                ) {
-                    val lines = logText.split("\n")
-                    LazyColumn(state = logListState, modifier = Modifier.fillMaxSize()) {
-                        items(lines) { line ->
-                            Text(
-                                text = line,
-                                color = when {
-                                    line.contains("SUCCESS") || line.contains("INSTALLED") -> Color.Cyan
-                                    line.contains("FAILED") || line.contains("ERROR") -> Color.Red
-                                    line.contains("WAITING") || line.contains("IDLE") -> Color.Yellow
-                                    else -> Color(0xFFD4D4D4)
-                                },
-                                fontSize = 9.sp,
-                                lineHeight = 11.sp,
-                                fontFamily = FontFamily.Monospace
+                item {
+                    Spacer(Modifier.height(6.dp))
+                    TabRow(selectedTabIndex = selectedSource.ordinal) {
+                        LogSource.entries.forEach { source ->
+                            Tab(
+                                selected = selectedSource == source,
+                                onClick = { selectedSource = source },
+                                text = { Text(source.name, fontSize = 11.sp) }
                             )
                         }
                     }
-                    LaunchedEffect(lines.size) {
-                        if (lines.isNotEmpty()) logListState.animateScrollToItem(lines.size - 1)
+                }
+
+                item {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(260.dp)
+                            .padding(4.dp)
+                            .background(Color(0xFF050505), RoundedCornerShape(4.dp))
+                            .padding(4.dp)
+                    ) {
+                        val lines = logText.split("\n")
+                        LazyColumn(state = logListState, modifier = Modifier.fillMaxSize()) {
+                            items(lines) { line ->
+                                Text(
+                                    text = line,
+                                    color = when {
+                                        line.contains("SUCCESS") || line.contains("INSTALLED") -> Color.Cyan
+                                        line.contains("FAILED") || line.contains("ERROR") -> Color.Red
+                                        line.contains("WAITING") || line.contains("IDLE") -> Color.Yellow
+                                        else -> Color(0xFFD4D4D4)
+                                    },
+                                    fontSize = 9.sp,
+                                    lineHeight = 11.sp,
+                                    fontFamily = FontFamily.Monospace
+                                )
+                            }
+                        }
+                        LaunchedEffect(lines.size) {
+                            if (lines.isNotEmpty()) logListState.animateScrollToItem(lines.size - 1)
+                        }
                     }
                 }
             }
@@ -266,28 +259,28 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun RuntimeStatusPanel(status: RuntimeStatus) {
+    private fun RuntimeStatusPanel(status: RuntimeStatus, diagnosticRunning: Boolean, onDiagnostic: () -> Unit) {
         val hijackOk = status.hijackStatus == "SUCCESS"
         Card(modifier = Modifier.fillMaxWidth().padding(8.dp)) {
-            Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                Text("Runtime status", fontWeight = FontWeight.Bold)
+            Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text("运行状态", fontWeight = FontWeight.Bold)
                 StatusRow(
-                    "LSPosed scope",
+                    "LSPosed 范围",
                     status.scopeOk,
                     if (status.scopeOk) "SUCCESS · ${status.scopeProcess ?: "com.android.nfc"}" else "NOT DETECTED"
                 )
                 StatusRow(
-                    "HCE hook",
+                    "HCE Hook",
                     status.hookInstalled,
                     if (status.hookInstalled) "SUCCESS · ${status.hookClass?.substringAfterLast('.') ?: "setHceTypeAConfig"} · count=${status.hookCount}" else "NOT INSTALLED"
                 )
                 StatusRow(
-                    "Simulation config",
+                    "模拟配置",
                     status.simulationEnabled,
                     if (status.simulationEnabled) "ENABLED · UID=${status.selectedUid ?: "missing"}" else "IDLE"
                 )
                 StatusRow(
-                    "UID hijack",
+                    "UID Hijack",
                     hijackOk,
                     when (status.hijackStatus) {
                         "SUCCESS" -> "SUCCESS · UID=${status.hijackUid ?: status.selectedUid} · native=${status.hijackResult ?: "?"}"
@@ -296,6 +289,31 @@ class MainActivity : ComponentActivity() {
                         else -> "IDLE"
                     }
                 )
+                Button(onClick = onDiagnostic, enabled = !diagnosticRunning, modifier = Modifier.fillMaxWidth()) {
+                    Text(if (diagnosticRunning) "检测中..." else "一键检测 + 导出")
+                }
+            }
+        }
+    }
+
+    @Composable
+    private fun ReadCardPanel(card: CardModel?, onSave: (CardModel) -> Unit, onClear: () -> Unit) {
+        Card(modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp)) {
+            Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text("读取卡片", fontWeight = FontWeight.Bold)
+                if (card == null) {
+                    Text("NFC 读取已开启，请把门禁卡贴到手机背部。", fontSize = 12.sp)
+                    Text("读取后会先显示卡片信息，不会自动保存。", fontSize = 11.sp, color = Color.Gray)
+                } else {
+                    Text("读取成功", color = Color(0xFF2E7D32), fontWeight = FontWeight.Bold)
+                    Text("UID: ${card.uid}", fontFamily = FontFamily.Monospace, fontSize = 12.sp)
+                    Text("SAK: ${card.sak}", fontFamily = FontFamily.Monospace, fontSize = 12.sp)
+                    Text("ATQA: ${card.atqa}", fontFamily = FontFamily.Monospace, fontSize = 12.sp)
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(onClick = { onSave(card) }, modifier = Modifier.weight(1f)) { Text("保存卡片") }
+                        OutlinedButton(onClick = onClear, modifier = Modifier.weight(1f)) { Text("重新读取") }
+                    }
+                }
             }
         }
     }
@@ -307,39 +325,32 @@ class MainActivity : ComponentActivity() {
                 imageVector = if (ok) Icons.Default.CheckCircle else Icons.Default.Warning,
                 contentDescription = null,
                 tint = if (ok) Color(0xFF2E7D32) else Color(0xFFC62828),
-                modifier = Modifier.size(16.dp)
+                modifier = Modifier.size(18.dp)
             )
-            Spacer(Modifier.width(7.dp))
+            Spacer(Modifier.width(8.dp))
             Column {
-                Text(label, fontWeight = FontWeight.SemiBold, fontSize = 12.sp)
-                Text(detail, fontSize = 10.sp)
+                Text(label, fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                Text(detail, fontSize = 11.sp)
             }
         }
     }
 
     @Composable
-    private fun CardItem(card: CardModel, isActive: Boolean, onSimulate: () -> Unit, onDelete: () -> Unit) {
-        Card(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 3.dp)
-        ) {
-            Row(
-                modifier = Modifier.fillMaxWidth().padding(9.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
+    private fun CardItem(card: CardModel, isActive: Boolean, onSimulate: () -> Unit, onStop: () -> Unit, onDelete: () -> Unit) {
+        Card(modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 3.dp)) {
+            Row(modifier = Modifier.padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
                 Column(modifier = Modifier.weight(1f)) {
                     Text(card.name, fontWeight = FontWeight.Bold)
-                    Text("UID: ${card.uid}", fontSize = 10.sp)
-                    Text("SAK: ${card.sak}   ATQA: ${card.atqa}", fontSize = 10.sp, color = Color.Gray)
+                    Text("UID ${card.uid}", fontSize = 10.sp, color = Color.Gray)
+                    Text("SAK ${card.sak} · ATQA ${card.atqa}", fontSize = 9.sp, color = Color.Gray)
                 }
-                Button(
-                    onClick = onSimulate,
-                    enabled = !isActive,
-                    contentPadding = PaddingValues(horizontal = 12.dp)
-                ) {
-                    Text(if (isActive) "模拟中" else "模拟", fontSize = 10.sp)
+                if (isActive) {
+                    Button(onClick = onStop, contentPadding = PaddingValues(horizontal = 10.dp)) { Text("停止模拟", fontSize = 10.sp) }
+                } else {
+                    Button(onClick = onSimulate, contentPadding = PaddingValues(horizontal = 10.dp)) { Text("模拟", fontSize = 10.sp) }
                 }
                 IconButton(onClick = onDelete) {
-                    Icon(Icons.Default.Delete, contentDescription = "删除卡片", modifier = Modifier.size(18.dp))
+                    Icon(Icons.Default.Delete, contentDescription = "Delete card", modifier = Modifier.size(18.dp))
                 }
             }
         }
@@ -363,43 +374,24 @@ class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         val tag = intent.getParcelableExtra<Tag>(NfcAdapter.EXTRA_TAG) ?: return
-        val uid = bytesToHex(tag.id)
+        val uid = bytesToHex(tag.id).uppercase()
         var sak = "08"
         var atqa = "0400"
         NfcA.get(tag)?.let {
-            sak = "%02x".format(it.sak.toInt() and 0xFF)
-            atqa = bytesToHex(it.atqa.reversedArray())
+            sak = "%02X".format(it.sak.toInt() and 0xFF)
+            atqa = bytesToHex(it.atqa.reversedArray()).uppercase()
         }
-
-        val current = loadCards().toMutableList()
-        val existing = current.indexOfFirst { it.uid.equals(uid, true) }
-        val card = CardModel("Card ${uid.takeLast(4)}", uid, sak, atqa)
-        if (existing >= 0) {
-            val old = current[existing]
-            current[existing] = card.copy(name = old.name)
-        } else {
-            current.add(card)
-        }
-        saveCards(current)
-        AppLogger.i("CARD: READ+SAVED uid=$uid sak=$sak atqa=$atqa")
-        Toast.makeText(this, "卡片已读取并保存：$uid", Toast.LENGTH_LONG).show()
-        recreate()
+        scannedCardState = CardModel("Card ${uid.takeLast(4)}", uid, sak, atqa)
+        AppLogger.i("CARD: READ uid=$uid sak=$sak atqa=$atqa")
     }
 
     private fun loadCards(): List<CardModel> {
         val json = getSharedPreferences(prefsCards, MODE_PRIVATE).getString(keyCardsList, null) ?: return emptyList()
-        return try {
-            gson.fromJson(json, object : TypeToken<List<CardModel>>() {}.type)
-        } catch (_: Exception) {
-            emptyList()
-        }
+        return try { gson.fromJson(json, object : TypeToken<List<CardModel>>() {}.type) } catch (_: Exception) { emptyList() }
     }
 
     private fun saveCards(cards: List<CardModel>) {
-        getSharedPreferences(prefsCards, MODE_PRIVATE)
-            .edit()
-            .putString(keyCardsList, gson.toJson(cards))
-            .apply()
+        getSharedPreferences(prefsCards, MODE_PRIVATE).edit().putString(keyCardsList, gson.toJson(cards)).apply()
     }
 
     private fun simulateCard(card: CardModel) {
@@ -410,10 +402,10 @@ class MainActivity : ComponentActivity() {
             put(ConfigProvider.KEY_ATQA, card.atqa)
             put(ConfigProvider.KEY_HIJACK_STATUS, "WAITING")
             put(ConfigProvider.KEY_HIJACK_RESULT, "")
+            put(ConfigProvider.KEY_HIJACK_UID, "")
             put(ConfigProvider.KEY_HIJACK_ERROR, "")
         })
-        AppLogger.i("CARD: SIM REQUEST uid=${card.uid} sak=${card.sak} atqa=${card.atqa}")
-        Toast.makeText(this, "开始模拟：${card.uid}", Toast.LENGTH_SHORT).show()
+        AppLogger.i("CARD: SIM requested uid=${card.uid} sak=${card.sak} atqa=${card.atqa}")
         restartNfcSafely()
     }
 
@@ -422,10 +414,10 @@ class MainActivity : ComponentActivity() {
             put(ConfigProvider.KEY_SIMULATION_ENABLED, false)
             put(ConfigProvider.KEY_HIJACK_STATUS, "IDLE")
             put(ConfigProvider.KEY_HIJACK_RESULT, "")
+            put(ConfigProvider.KEY_HIJACK_UID, "")
             put(ConfigProvider.KEY_HIJACK_ERROR, "")
         })
-        AppLogger.i("CARD: SIM STOP")
-        Toast.makeText(this, "已停止模拟", Toast.LENGTH_SHORT).show()
+        AppLogger.i("CARD: simulation stopped")
         restartNfcSafely()
     }
 
@@ -507,8 +499,8 @@ class MainActivity : ComponentActivity() {
     private fun buildFullDiagnosticReport(status: RuntimeStatus): String = buildString {
         append("=== NFC FULL CHECK V10 ===\nGenerated: ").append(System.currentTimeMillis()).append("\n\n")
         append("--- RUNTIME STATUS ---\n").append(buildStatusSummary(status)).append("\n\n")
-        append("--- SAVED CARDS ---\n")
-        loadCards().forEach { append("name=${it.name} uid=${it.uid} sak=${it.sak} atqa=${it.atqa}\n") }
+        append("--- SAVED CARDS ---\ncount=").append(loadCards().size).append("\n")
+        loadCards().forEach { append("card uid=${it.uid} sak=${it.sak} atqa=${it.atqa}\n") }
         append("\n--- APP / APK ---\n").append(inspectOwnApk()).append("\n")
         append("--- ROOT ---\n").append(runRootCmd("id; su -v 2>/dev/null || true")).append("\n")
         append("--- NFC PROCESS ---\n").append(runRootCmd("pm path com.android.nfc; pidof com.android.nfc; ps -A | grep -i '[n]fc' || true")).append("\n")
