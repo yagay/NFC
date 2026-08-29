@@ -26,7 +26,7 @@
 
         <activity
             android:name=".VendorNfcBinderTestActivity"
-            android:exported="false"
+            android:exported="true"
             android:label="Vendor NFC 测试" />
 
         <provider
