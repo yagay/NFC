@@ -94,12 +94,106 @@ public class VendorBinderMetadataModule extends XposedModule {
         inspectClass("android.nfc.INfcAdapter", cl, report);
         inspectClass("android.nfc.INfcAdapter$Stub", cl, report);
 
+        // Focused V8 keys: keep these short enough that the UI/report cannot truncate the useful part.
+        values.put("vendor_getter_signatures", collectGetterSignatures(cl));
+        values.put("vendor_infc_adapter_methods", collectInterestingMethods(cl, "android.nfc.INfcAdapter"));
+        values.put("vendor_infc_stub_transactions", collectInterestingStaticFields(cl, "android.nfc.INfcAdapter$Stub"));
+        values.put("vendor_nfc_adapter_service_methods", collectInterestingMethods(cl, "com.android.nfc.NfcService$NfcAdapterService"));
+        values.put("vendor_impl_candidates", collectImplementationCandidates(cl));
+
         values.put("vendor_meta_ready", ifaceOk && stubOk && txOk);
         values.put("vendor_meta_error", "");
         String text = report.length() > 7000 ? report.substring(0, 7000) : report.toString();
         values.put("vendor_meta_report", text);
         writeValues(values);
         Log.i(TAG, text);
+    }
+
+    private String collectGetterSignatures(ClassLoader cl) {
+        StringBuilder out = new StringBuilder();
+        try {
+            Class<?> c = Class.forName("com.android.nfc.VendorNfcService", false, cl);
+            for (Method m : c.getDeclaredMethods()) {
+                if (!"getNfcAdapterVendorInterface".equals(m.getName())) continue;
+                appendPart(out, m.toGenericString());
+            }
+        } catch (Throwable t) {
+            appendPart(out, "ERROR=" + t.getClass().getSimpleName() + ":" + t.getMessage());
+        }
+        return trim(out, 1800);
+    }
+
+    private String collectInterestingMethods(ClassLoader cl, String className) {
+        StringBuilder out = new StringBuilder();
+        try {
+            Class<?> c = Class.forName(className, false, cl);
+            for (Method m : c.getDeclaredMethods()) {
+                String s = (m.getName() + " " + m.getReturnType().getName() + " " + Arrays.toString(m.getParameterTypes())).toLowerCase();
+                if (s.contains("vendor") || s.contains("binder") || s.contains("adaptervendor")) {
+                    appendPart(out, m.toGenericString());
+                }
+            }
+        } catch (Throwable t) {
+            appendPart(out, "ERROR=" + t.getClass().getSimpleName() + ":" + t.getMessage());
+        }
+        return trim(out, 2200);
+    }
+
+    private String collectInterestingStaticFields(ClassLoader cl, String className) {
+        StringBuilder out = new StringBuilder();
+        try {
+            Class<?> c = Class.forName(className, false, cl);
+            for (Field f : c.getDeclaredFields()) {
+                if (!Modifier.isStatic(f.getModifiers())) continue;
+                String name = f.getName();
+                if (!name.toLowerCase().contains("vendor") && !name.toLowerCase().contains("binder")) continue;
+                try {
+                    f.setAccessible(true);
+                    appendPart(out, name + "=" + String.valueOf(f.get(null)) + " type=" + f.getType().getName());
+                } catch (Throwable t) {
+                    appendPart(out, name + "=<" + t.getClass().getSimpleName() + ">");
+                }
+            }
+        } catch (Throwable t) {
+            appendPart(out, "ERROR=" + t.getClass().getSimpleName() + ":" + t.getMessage());
+        }
+        return trim(out, 1800);
+    }
+
+    private String collectImplementationCandidates(ClassLoader cl) {
+        StringBuilder out = new StringBuilder();
+        String[] candidates = new String[] {
+                "com.android.nfc.nxp.NxpNfcService",
+                "com.android.nfc.st.StNfcService",
+                "com.android.nfc.st.STNfcService",
+                "com.android.nfc.NxpNfcService",
+                "com.android.nfc.NfcVendorService"
+        };
+        for (String name : candidates) {
+            try {
+                Class<?> c = Class.forName(name, false, cl);
+                appendPart(out, "CLASS=" + c.getName() + " super=" + (c.getSuperclass() == null ? "null" : c.getSuperclass().getName()));
+                for (Method m : c.getDeclaredMethods()) {
+                    if ("getNfcAdapterVendorInterface".equals(m.getName()) || "getVendorName".equals(m.getName())) {
+                        appendPart(out, m.toGenericString());
+                    }
+                }
+            } catch (ClassNotFoundException ignored) {
+            } catch (Throwable t) {
+                appendPart(out, name + " ERROR=" + t.getClass().getSimpleName() + ":" + t.getMessage());
+            }
+        }
+        if (out.length() == 0) out.append("<none-of-known-candidates>");
+        return trim(out, 2200);
+    }
+
+    private void appendPart(StringBuilder out, String value) {
+        if (out.length() > 0) out.append(" | ");
+        out.append(value);
+    }
+
+    private String trim(StringBuilder out, int max) {
+        return out.length() > max ? out.substring(0, max) : out.toString();
     }
 
     private void inspectClass(String className, ClassLoader cl, StringBuilder report) {
