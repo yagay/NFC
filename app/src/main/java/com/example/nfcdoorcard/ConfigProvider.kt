@@ -13,19 +13,21 @@ class ConfigProvider : ContentProvider() {
     companion object {
         const val AUTHORITY = "com.example.nfcdoorcard.config"
         val CONTENT_URI: Uri = Uri.parse("content://$AUTHORITY/settings")
-        
+
         const val KEY_SIMULATION_ENABLED = "simulation_enabled"
         const val KEY_UID = "uid"
         const val KEY_SAK = "sak"
         const val KEY_ATQA = "atqa"
-        
+        const val KEY_MODULE_ACTIVE = "module_active"
+        const val KEY_MODULE_PROCESS = "module_process"
+        const val KEY_MODULE_BOOT_COUNT = "module_boot_count"
+
         const val PREFS_NAME = "nfc_sim_prefs"
     }
 
     private lateinit var prefs: SharedPreferences
 
     override fun onCreate(): Boolean {
-        // Move to device protected storage for early access by NFC service
         val directBootContext = context?.createDeviceProtectedStorageContext() ?: context
         prefs = directBootContext!!.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         return true
@@ -51,8 +53,7 @@ class ConfigProvider : ContentProvider() {
         if (values == null) return null
         val editor = prefs.edit()
         values.keySet().forEach { key ->
-            val value = values.get(key)
-            when (value) {
+            when (val value = values.get(key)) {
                 is Boolean -> editor.putBoolean(key, value)
                 is String -> editor.putString(key, value)
                 is Int -> editor.putInt(key, value)
