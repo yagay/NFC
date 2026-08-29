@@ -30,7 +30,11 @@ public class NfcInjectionModule extends XposedModule {
             "com.android.nfc.NfcService",
             "com.oplus.nfc.common.NfcChipDeviceImpl",
             "com.android.nfc.nxp.NxpNfcService",
-            "com.android.nfc.nxp.NxpNfcService$NxpNfcAdapterService"
+            "com.android.nfc.nxp.NxpNfcService$NxpNfcAdapterService",
+            "com.android.nfc.cardemulation.RegisteredServicesCache",
+            "com.android.nfc.cardemulation.RegisteredAidCache",
+            "com.android.nfc.cardemulation.AidRoutingManager",
+            "com.android.nfc.cardemulation.CardEmulationManager"
     };
 
     private final NfcStackAdapter[] adapters = new NfcStackAdapter[]{
@@ -169,6 +173,20 @@ public class NfcInjectionModule extends XposedModule {
         String name = method.getName().toLowerCase(Locale.ROOT);
         String owner = method.getDeclaringClass().getName();
 
+        if (owner.equals("com.android.nfc.cardemulation.RegisteredServicesCache")) {
+            return name.equals("registeraidgroupforservice") || name.equals("removeaidgroupforservice") ||
+                    name.equals("onservicesupdated") || name.contains("invalidatecache");
+        }
+        if (owner.equals("com.android.nfc.cardemulation.RegisteredAidCache")) {
+            return name.equals("onservicesupdated") || name.equals("generateaidcachelocked") ||
+                    name.equals("updateroutinglocked") || name.contains("routing");
+        }
+        if (owner.equals("com.android.nfc.cardemulation.AidRoutingManager")) {
+            return name.equals("configurerouting") || name.equals("commit") || name.contains("routing");
+        }
+        if (owner.equals("com.android.nfc.cardemulation.CardEmulationManager")) {
+            return name.equals("onservicesupdated") || name.contains("aidgroup") || name.contains("routing");
+        }
         if (owner.equals("com.oplus.nfc.common.NfcChipDeviceImpl")) {
             return name.equals("setrfconfig") || name.equals("setconfig") || name.contains("transitconfig") ||
                     name.contains("restore") || name.contains("rfconfig");
