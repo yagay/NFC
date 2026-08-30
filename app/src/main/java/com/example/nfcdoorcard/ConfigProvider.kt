@@ -77,7 +77,7 @@ class ConfigProvider : ContentProvider() {
 
         private val LEGACY_PREFIXES = listOf(
             "adapter_", "heytap_", "hijack_", "trace_", "config_block_", "nci_frame_",
-            "nfcid1_", "rf_refresh_", "vendor_observed_"
+            "nfcid1_", "rf_refresh_", "vendor_"
         )
         private val LEGACY_KEYS = setOf(
             "last_native_result", "hce_get_uid", "rf_field_count", "text_config_length",
@@ -103,9 +103,7 @@ class ConfigProvider : ContentProvider() {
         if (current >= STATE_SCHEMA_VERSION) return
         val editor = prefs.edit()
         prefs.all.keys.forEach { key ->
-            if (key in LEGACY_KEYS || LEGACY_PREFIXES.any { prefix -> key.startsWith(prefix) }) {
-                editor.remove(key)
-            }
+            if (key in LEGACY_KEYS || LEGACY_PREFIXES.any { prefix -> key.startsWith(prefix) }) editor.remove(key)
         }
         editor
             .remove(KEY_PROFILE_STATUS)
@@ -127,13 +125,7 @@ class ConfigProvider : ContentProvider() {
             .apply()
     }
 
-    override fun query(
-        uri: Uri,
-        projection: Array<out String>?,
-        selection: String?,
-        selectionArgs: Array<out String>?,
-        sortOrder: String?
-    ): Cursor {
+    override fun query(uri: Uri, projection: Array<out String>?, selection: String?, selectionArgs: Array<out String>?, sortOrder: String?): Cursor {
         if (!isTrustedCaller()) {
             Log.w("NfcConfigProvider", "Rejected config read from uid=${Binder.getCallingUid()}")
             return MatrixCursor(arrayOf("key", "value"))
@@ -165,12 +157,7 @@ class ConfigProvider : ContentProvider() {
         return uri
     }
 
-    override fun update(
-        uri: Uri,
-        values: ContentValues?,
-        selection: String?,
-        selectionArgs: Array<out String>?
-    ): Int {
+    override fun update(uri: Uri, values: ContentValues?, selection: String?, selectionArgs: Array<out String>?): Int {
         if (values == null || !isTrustedCaller()) return 0
         insert(uri, values)
         return values.size()
@@ -178,17 +165,12 @@ class ConfigProvider : ContentProvider() {
 
     override fun delete(uri: Uri, selection: String?, selectionArgs: Array<out String>?): Int {
         if (!isTrustedCaller()) return 0
-        prefs().edit().clear()
-            .putInt(KEY_STATE_SCHEMA, STATE_SCHEMA_VERSION)
-            .putInt(KEY_APP_BUILD, APP_BUILD)
-            .apply()
+        prefs().edit().clear().putInt(KEY_STATE_SCHEMA, STATE_SCHEMA_VERSION).putInt(KEY_APP_BUILD, APP_BUILD).apply()
         context?.contentResolver?.notifyChange(uri, null)
         return 1
     }
 
-    private fun prefs(): SharedPreferences = context!!
-        .createDeviceProtectedStorageContext()
-        .getSharedPreferences(PREFS_NAME, 0)
+    private fun prefs(): SharedPreferences = context!!.createDeviceProtectedStorageContext().getSharedPreferences(PREFS_NAME, 0)
 
     private fun isTrustedCaller(): Boolean {
         val callingUid = Binder.getCallingUid()
