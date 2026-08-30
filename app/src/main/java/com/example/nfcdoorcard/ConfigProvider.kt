@@ -110,6 +110,16 @@ class ConfigProvider : ContentProvider() {
             KEY_REFRESH_TRIGGER_GENERATION, KEY_REFRESH_TRIGGER_RF_CONFIRMED,
             KEY_FULL_DIAG_STAGE, KEY_FULL_DIAG_SUMMARY
         )
+        private val TERMINAL_COMMAND_STATUSES = setOf("SUCCESS", "FAILED")
+        private val TERMINAL_OWNED_KEYS = setOf(
+            KEY_COMMAND_CONSUMED_GENERATION, KEY_COMMAND_HANDLED_GENERATION, KEY_COMMAND_ACTION,
+            KEY_COMMAND_STATUS, KEY_COMMAND_DETAIL, KEY_COMMAND_PID,
+            KEY_OPERATION_STATE, KEY_EFFECTIVE_STATE, KEY_VERIFICATION_CONFIDENCE,
+            KEY_RF_ACCEPTED, KEY_RF_NATIVE_RESULT, KEY_RF_NATIVE_RESULT_TYPE,
+            KEY_RF_STATUS, KEY_RF_UID, KEY_RF_SOURCE, KEY_RF_RESULT, KEY_RF_ERROR,
+            KEY_RF_PID, KEY_RF_GENERATION, KEY_RF_VERIFICATION,
+            KEY_FULL_DIAG_STAGE, KEY_FULL_DIAG_SUMMARY
+        )
     }
 
     override fun onCreate(): Boolean {
@@ -177,10 +187,13 @@ class ConfigProvider : ContentProvider() {
             return uri
         }
 
+        val incoming = ContentValues(values)
         val prefs = prefs()
         val currentGeneration = (prefs.all[KEY_COMMAND_GENERATION] as? Number)?.toLong() ?: 0L
-        val stateGeneration = values.getAsLong(KEY_STATE_GENERATION)
-        val declaredCommandGeneration = values.getAsLong(KEY_COMMAND_GENERATION)
+        val currentHandledGeneration = (prefs.all[KEY_COMMAND_HANDLED_GENERATION] as? Number)?.toLong() ?: Long.MIN_VALUE
+        val currentCommandStatus = prefs.getString(KEY_COMMAND_STATUS, "IDLE") ?: "IDLE"
+        val stateGeneration = incoming.getAsLong(KEY_STATE_GENERATION)
+        val declaredCommandGeneration = incoming.getAsLong(KEY_COMMAND_GENERATION)
 
         if (stateGeneration != null && stateGeneration > 0L) {
             if (currentGeneration > 0L && stateGeneration < currentGeneration) {
@@ -195,9 +208,32 @@ class ConfigProvider : ContentProvider() {
             }
         }
 
+        // A completed generation is monotonic. com.android.nfc can restart after STOP, which resets
+        // the hook's in-memory completedGeneration cache. Late ContentObserver/trigger writes from
+        // the new process must still be allowed to refresh hook/runtime metadata, but they may not
+        // downgrade SUCCESS/FAILED back to RUNNING/TRIGGERED/STOPPING/PENDING for the same command.
+        val terminalCurrentGeneration = currentGeneration > 0L &&
+            currentHandledGeneration == currentGeneration && currentCommandStatus in TERMINAL_COMMAND_STATUSES
+        val advancesCommand = declaredCommandGeneration != null && declaredCommandGeneration > currentGeneration
+        if (terminalCurrentGeneration && !advancesCommand) {
+            val removed = mutableListOf<String>()
+            TERMINAL_OWNED_KEYS.forEach { key ->
+                if (incoming.containsKey(key)) {
+                    incoming.remove(key)
+                    removed += key
+                }
+            }
+            if (removed.isNotEmpty()) {
+                Log.i(
+                    "NfcConfigProvider",
+                    "Protected terminal generation=$currentGeneration status=$currentCommandStatus; stripped=${removed.joinToString(",")} uid=${Binder.getCallingUid()}"
+                )
+            }
+        }
+
         val editor = prefs.edit()
-        values.keySet().forEach { key ->
-            when (val value = values.get(key)) {
+        incoming.keySet().forEach { key ->
+            when (val value = incoming.get(key)) {
                 is Boolean -> editor.putBoolean(key, value)
                 is Int -> editor.putInt(key, value)
                 is Long -> editor.putLong(key, value)
