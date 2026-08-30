@@ -22,19 +22,18 @@ fun RuntimeStatusPanel(status: RuntimeStatus, operationMessage: String?, readMod
     val commandInFlight = status.commandStatus in setOf("PENDING", "RUNNING", "TRIGGERED", "RESTART_REQUIRED") &&
         status.commandGeneration != status.handledGeneration
     val semanticBusy = status.operationState in setOf("APPLYING", "STOPPING", "RESETTING_CONTROLLER")
-    val commandTone = when {
-        commandInFlight || semanticBusy -> StatusTone.BUSY
-        status.commandStatus in setOf("FAILED", "TRIGGER_FAILED", "OBSERVER_FAILED") || status.operationState == "FAILED" -> StatusTone.ERROR
-        else -> StatusTone.IDLE
-    }
+    val commandFailed = status.commandStatus in setOf("FAILED", "TRIGGER_FAILED", "OBSERVER_FAILED") || status.operationState == "FAILED"
+    // The command row is diagnostic/history. Keep the single blue BUSY indicator on the
+    // user-facing simulation row so one operation is not shown as three simultaneous blue states.
+    val commandTone = if (commandFailed) StatusTone.ERROR else StatusTone.IDLE
     val commandDisplay = when {
         status.operationState == "RESETTING_CONTROLLER" ->
-            "执行中 · 正在重新初始化 NFC Controller · gen=${status.commandGeneration} · pid=${status.commandPid}"
+            "已提交 STOP · 正在重新初始化 NFC Controller · gen=${status.commandGeneration} · pid=${status.commandPid}"
         commandInFlight || semanticBusy ->
-            "执行中 · ${status.operationState} · gen=${status.commandGeneration} consumed=${status.consumedGeneration} completed=${status.handledGeneration} · ${status.commandAction.ifBlank { "UNKNOWN" }} · pid=${status.commandPid}"
+            "已提交 ${status.commandAction.ifBlank { "UNKNOWN" }} · ${status.operationState} · gen=${status.commandGeneration} consumed=${status.consumedGeneration} completed=${status.handledGeneration} · pid=${status.commandPid}"
         status.commandStatus == "SUCCESS" && status.commandGeneration == status.handledGeneration ->
             "当前空闲 · 最近操作 ${status.commandAction.ifBlank { "UNKNOWN" }} 成功 · gen=${status.commandGeneration} · pid=${status.commandPid}"
-        status.commandStatus in setOf("FAILED", "TRIGGER_FAILED", "OBSERVER_FAILED") || status.operationState == "FAILED" ->
+        commandFailed ->
             "最近操作 ${status.commandAction.ifBlank { "UNKNOWN" }} 失败 · ${status.commandStatus} · gen=${status.commandGeneration} · pid=${status.commandPid}"
         else -> "当前空闲 · 暂无命令"
     }
@@ -53,7 +52,7 @@ fun RuntimeStatusPanel(status: RuntimeStatus, operationMessage: String?, readMod
                 simulationTone = StatusTone.OK
                 simulationDetail = "模拟已生效 · UID=${status.selectedUid ?: "-"}"
             }
-            status.commandStatus == "FAILED" || status.commandStatus == "TRIGGER_FAILED" || status.operationState == "FAILED" -> {
+            commandFailed -> {
                 simulationTone = StatusTone.ERROR
                 simulationDetail = "模拟失败 · ${status.commandStatus}"
             }
@@ -69,9 +68,9 @@ fun RuntimeStatusPanel(status: RuntimeStatus, operationMessage: String?, readMod
     } else {
         when {
             stockVerified -> {
-                simulationTone = if (status.rfVerification == "PROCESS_RESTART") StatusTone.WARNING else StatusTone.OK
+                simulationTone = StatusTone.STOCK
                 simulationDetail = if (status.rfVerification == "PROCESS_RESTART")
-                    "模拟已停止 · 原厂 RF 通过 Controller 重新初始化恢复"
+                    "模拟已停止 · 原厂 RF 已通过 NFC 生命周期恢复"
                 else "模拟已停止 · 原厂 RF 已验证恢复"
             }
             status.operationState in setOf("STOPPING", "RESETTING_CONTROLLER") || (status.commandAction == "STOP" && commandInFlight) -> {
@@ -79,7 +78,7 @@ fun RuntimeStatusPanel(status: RuntimeStatus, operationMessage: String?, readMod
                 simulationDetail = if (status.operationState == "RESETTING_CONTROLLER")
                     "正在重新初始化 NFC Controller 并恢复原厂 RF" else "正在停止模拟并恢复原厂 RF"
             }
-            status.commandStatus == "FAILED" || status.operationState == "FAILED" -> {
+            commandFailed -> {
                 simulationTone = StatusTone.ERROR
                 simulationDetail = "停止模拟失败 · ${status.commandDetail ?: status.rfError ?: "unknown"}"
             }
@@ -95,9 +94,9 @@ fun RuntimeStatusPanel(status: RuntimeStatus, operationMessage: String?, readMod
     }
 
     val rfTone = when {
-        status.effectiveState in setOf("ACTIVE", "STOCK") && status.verificationConfidence == "VERIFIED" && status.rfAccepted ->
-            if (status.rfVerification == "PROCESS_RESTART") StatusTone.WARNING else StatusTone.OK
-        status.operationState in setOf("APPLYING", "STOPPING", "RESETTING_CONTROLLER") -> StatusTone.BUSY
+        status.effectiveState == "ACTIVE" && status.verificationConfidence == "VERIFIED" && status.rfAccepted -> StatusTone.OK
+        status.effectiveState == "STOCK" && status.verificationConfidence == "VERIFIED" && status.rfAccepted -> StatusTone.STOCK
+        status.operationState in setOf("APPLYING", "STOPPING", "RESETTING_CONTROLLER") -> StatusTone.WARNING
         status.rfStatus == "IDLE" && status.operationState == "IDLE" -> StatusTone.IDLE
         status.rfStatus.startsWith("STALE") -> StatusTone.WARNING
         status.operationState == "FAILED" || status.rfStatus.contains("FAILED") || !status.rfError.isNullOrBlank() -> StatusTone.ERROR
@@ -171,6 +170,7 @@ fun CardDetails(card: CardModel) {
 fun StatusRow(label: String, tone: StatusTone, detail: String) {
     val symbol = when (tone) {
         StatusTone.OK -> "●"
+        StatusTone.STOCK -> "●"
         StatusTone.IDLE -> "●"
         StatusTone.BUSY -> "●"
         StatusTone.WARNING -> "▲"
@@ -178,6 +178,7 @@ fun StatusRow(label: String, tone: StatusTone, detail: String) {
     }
     val color = when (tone) {
         StatusTone.OK -> Color(0xFF2E7D32)
+        StatusTone.STOCK -> Color(0xFF00838F)
         StatusTone.IDLE -> Color.Gray
         StatusTone.BUSY -> Color(0xFF1565C0)
         StatusTone.WARNING -> Color(0xFFF9A825)
