@@ -12,12 +12,12 @@ android {
         applicationId = "com.yagay.nfcdoorcard"
         minSdk = 31
         targetSdk = 35
-        versionCode = 48
-        versionName = "1.0.47"
+        versionCode = 49
+        versionName = "1.0.48"
 
-        // Runtime protocol v7; hook build 34; diagnostic-only 1.0.47 adds high-retention correlated NCI TX/RX + Oplus SuperCard/routing/boot trace capture without changing NFC injection behaviour.
+        // Runtime protocol v7; hook build 35; 1.0.48 makes real controller initialize/deinitialize + NfcService enable/disable lifecycle the primary recovery signal, with adapter broadcasts as fallback.
         // Application ID, source namespace, Provider authority and LSPosed entry all use com.yagay.nfcdoorcard.
-        buildConfigField("int", "HOOK_BUILD", "34")
+        buildConfigField("int", "HOOK_BUILD", "35")
     }
 
     buildTypes {

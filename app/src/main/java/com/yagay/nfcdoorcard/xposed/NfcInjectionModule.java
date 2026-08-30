@@ -50,6 +50,7 @@ public class NfcInjectionModule extends XposedModule {
     private static final long EARLY_CONFIG_RETRY_MS = 20L;
     private static final long EARLY_REPLAY_TIMEOUT_MS = 8_000L;
     private static final long EARLY_REPLAY_RETRY_MS = 50L;
+    private static final long CONTROLLER_LIFECYCLE_DEBOUNCE_MS = 1_200L;
 
     private final ExecutorService stateSyncExecutor = Executors.newSingleThreadExecutor(r -> daemon(r, "NfcUIDSim-StateSync"));
     private final ExecutorService commandExecutor = Executors.newSingleThreadExecutor(r -> daemon(r, "NfcUIDSim-Command"));
@@ -67,6 +68,11 @@ public class NfcInjectionModule extends XposedModule {
     private volatile ContentObserver commandObserver;
     private volatile BroadcastReceiver adapterStateReceiver;
     private volatile boolean observerRegistered;
+    private volatile boolean controllerInvalid;
+    private volatile boolean controllerReadyObserved;
+    private volatile int controllerLifecycleHookCount;
+    private volatile long lastControllerInvalidAt;
+    private volatile long lastControllerReadyAt;
     private volatile boolean lifecycleReapplyPending;
     private volatile long lifecycleRecoveryGeneration = Long.MIN_VALUE;
     private volatile long lifecycleRecoveryStartedAt;
@@ -114,7 +120,12 @@ public class NfcInjectionModule extends XposedModule {
         if (!"com.android.nfc".equals(lp.getPackageName())) return;
         final int pid = Process.myPid();
         final ClassLoader cl = lp.getDefaultClassLoader();
+        // A fresh com.android.nfc process is always a fresh physical-controller proof domain.
+        // Provider state may not be readable this early, so mark memory invalid now and commit the
+        // epoch barrier again once the command bridge has a Context.
+        markControllerInvalid("process_start_early");
         installEarlyKnownRfHook(cl, pid);
+        installControllerLifecycleHooks(cl, pid);
         installEarlyAdapterStateBridge(pid);
         commandExecutor.execute(() -> initializeRuntime(cl, pid));
     }
@@ -137,6 +148,134 @@ public class NfcInjectionModule extends XposedModule {
         } catch (Throwable t) {
             Log.w(TAG, "EARLY RF HOOK unavailable " + t.getClass().getSimpleName() + ": " + t.getMessage());
         }
+    }
+
+    /**
+     * Observe real NFC controller/service lifecycle methods in addition to adapter broadcasts.
+     * We never alter return values or arguments here: these hooks are read-only lifecycle signals.
+     * This covers controller resets where OxygenOS/NXP reinitializes NFC without a reliable public
+     * ACTION_ADAPTER_STATE_CHANGED OFF/ON pair.
+     */
+    private void installControllerLifecycleHooks(ClassLoader cl, int pid) {
+        String[] classes = {
+                "com.android.nfc.dhimpl.NativeNfcManager",
+                "com.android.nfc.dhimpl.NxpNativeNfcManager",
+                "com.android.nfc.NfcService"
+        };
+        int installed = 0;
+        for (String className : classes) {
+            try {
+                Class<?> cls = Class.forName(className, false, cl);
+                for (Method method : cls.getDeclaredMethods()) {
+                    String name = method.getName();
+                    boolean invalidator = "deinitialize".equals(name) || "disableInternal".equals(name);
+                    boolean ready = "initialize".equals(name) || "enableInternal".equals(name);
+                    if (!invalidator && !ready) continue;
+                    try {
+                        method.setAccessible(true);
+                        final String signal = className + "#" + name + methodSignature(method);
+                        hook(method).intercept(chain -> {
+                            if (invalidator) markControllerInvalid("hook:" + signal);
+                            Object result = chain.proceed();
+                            if (ready && controllerCallSucceeded(method, result)) {
+                                markControllerReady("hook:" + signal);
+                            }
+                            return result;
+                        });
+                        installed++;
+                        Log.i(TAG, "CONTROLLER LIFECYCLE hook installed signal=" + signal + " pid=" + pid);
+                    } catch (Throwable hookError) {
+                        Log.w(TAG, "CONTROLLER LIFECYCLE hook skipped " + className + "#" + name + " " +
+                                hookError.getClass().getSimpleName() + ": " + hookError.getMessage());
+                    }
+                }
+            } catch (Throwable ignored) {
+                // Capability not present on this NFC stack. Other known classes/broadcast fallback
+                // remain available, so absence is not treated as a module failure.
+            }
+        }
+        controllerLifecycleHookCount = installed;
+        persistControllerLifecycle("HOOKS_READY", "discovery", "count=" + installed);
+        Log.i(TAG, "CONTROLLER LIFECYCLE hooks=" + installed + " pid=" + pid);
+    }
+
+    private static String methodSignature(Method method) {
+        StringBuilder sb = new StringBuilder("(");
+        Class<?>[] params = method.getParameterTypes();
+        for (int i = 0; i < params.length; i++) {
+            if (i > 0) sb.append(',');
+            sb.append(params[i].getSimpleName());
+        }
+        return sb.append(")->").append(method.getReturnType().getSimpleName()).toString();
+    }
+
+    private static boolean controllerCallSucceeded(Method method, Object result) {
+        Class<?> returnType = method.getReturnType();
+        if (returnType == void.class) return true;
+        if (returnType == boolean.class || returnType == Boolean.class) {
+            return Boolean.TRUE.equals(result);
+        }
+        if (result instanceof Number) {
+            // Native NFC wrappers conventionally use 0 as success; positive values are also
+            // accepted here for Java service methods that return an enabled/state token.
+            return ((Number) result).longValue() >= 0L;
+        }
+        return result != null;
+    }
+
+    private void markControllerInvalid(String reason) {
+        long now = System.currentTimeMillis();
+        boolean firstInvalid;
+        synchronized (this) {
+            firstInvalid = !controllerInvalid;
+            controllerInvalid = true;
+            controllerReadyObserved = false;
+            if (firstInvalid) lastControllerInvalidAt = now;
+        }
+        if (!firstInvalid) return;
+        invalidateRfEvidenceForControllerReset(reason);
+        persistControllerLifecycle("INVALID", reason, "pid=" + Process.myPid());
+        finishLifecycleRecovery(lifecycleRecoveryGeneration);
+        Log.i(TAG, "CONTROLLER INVALID reason=" + reason + " pid=" + Process.myPid());
+    }
+
+    private void markControllerReady(String reason) {
+        long now = System.currentTimeMillis();
+        boolean wasInvalid;
+        synchronized (this) {
+            // initialize() and enableInternal() can be nested in one enable transaction. Treat the
+            // pair as one physical ready edge rather than advancing the epoch twice.
+            if (lastControllerReadyAt > 0L && now - lastControllerReadyAt < CONTROLLER_LIFECYCLE_DEBOUNCE_MS) {
+                return;
+            }
+            wasInvalid = controllerInvalid;
+            controllerInvalid = false;
+            controllerReadyObserved = true;
+            lastControllerReadyAt = now;
+        }
+        // Some OEM paths expose only a ready/initialize edge. Conservatively invalidate old proof
+        // before recovery when no matching disable/deinitialize edge was observed.
+        if (!wasInvalid) invalidateRfEvidenceForControllerReset("implicit_invalid_before_" + reason);
+        persistControllerLifecycle("READY", reason,
+                "pid=" + Process.myPid() + ";wasInvalid=" + wasInvalid);
+        Log.i(TAG, "CONTROLLER READY reason=" + reason + " pid=" + Process.myPid() +
+                " wasInvalid=" + wasInvalid);
+        scheduleLifecycleRecovery("controller_ready:" + reason);
+    }
+
+    private void persistControllerLifecycle(String status, String source, String detail) {
+        ContentValues v = baseHookState();
+        SimConfig cfg = cachedConfig;
+        if (cfg.initialized && cfg.generation > 0L) v.put("state_generation", cfg.generation);
+        v.put("controller_lifecycle_status", status == null ? "" : status);
+        v.put("controller_lifecycle_source", source == null ? "" : source);
+        v.put("controller_lifecycle_detail", detail == null ? "" : detail);
+        v.put("controller_lifecycle_hook_count", controllerLifecycleHookCount);
+        v.put("controller_lifecycle_invalid", controllerInvalid);
+        v.put("controller_lifecycle_ready_observed", controllerReadyObserved);
+        v.put("controller_lifecycle_last_invalid_at", lastControllerInvalidAt);
+        v.put("controller_lifecycle_last_ready_at", lastControllerReadyAt);
+        writeValuesWithRetry(v, 8, 75L);
     }
 
     /** Register adapter OFF/ON tracking as early as the system context becomes available.
@@ -510,6 +649,10 @@ public class NfcInjectionModule extends XposedModule {
             commandObserver = observer;
             observerRegistered = true;
             registerAdapterStateReceiver(app);
+            // New process == new physical controller proof domain. Do this after Context/provider
+            // availability so an early package-load invalidation cannot be lost before Direct Boot
+            // storage is readable.
+            invalidateRfEvidenceForControllerReset("process_start");
             refreshConfigAndProcess("startup");
         } catch (Throwable t) {
             writeSimpleCommandState("OBSERVER_FAILED", "Cannot register ConfigProvider observer: " + t.getMessage(), 0L, "", false);
@@ -523,13 +666,12 @@ public class NfcInjectionModule extends XposedModule {
                 if (intent == null || !"android.nfc.action.ADAPTER_STATE_CHANGED".equals(intent.getAction())) return;
                 int state = intent.getIntExtra("android.nfc.extra.ADAPTER_STATE", -1);
                 if (state == 3) {
-                    scheduleLifecycleRecovery("adapter_state_on");
+                    // Broadcast is now a fallback/secondary ready signal. The primary signals are
+                    // initialize()/enableInternal() hooks, but an ON broadcast still forces a
+                    // closed-loop recovery when a vendor stack does not expose those methods.
+                    markControllerReady("adapter_state_on");
                 } else if (state == 1 || state == 4) {
-                    // Turning NFC off resets controller RF state even when com.android.nfc keeps
-                    // the same PID. Invalidate prior RF verification so the following ON event
-                    // cannot mistake stale evidence for a successful lifecycle reapply.
-                    invalidateRfEvidenceForAdapterReset(state == 4 ? "adapter_turning_off" : "adapter_off");
-                    finishLifecycleRecovery(lifecycleRecoveryGeneration);
+                    markControllerInvalid(state == 4 ? "adapter_turning_off" : "adapter_off");
                 }
             }
         };
@@ -551,7 +693,7 @@ public class NfcInjectionModule extends XposedModule {
      * selected UID, but explicitly invalidate only observed RF evidence. The next adapter ON event
      * will then run the closed-loop lifecycle recovery and require a fresh native-accepted RF write.
      */
-    private void invalidateRfEvidenceForAdapterReset(String reason) {
+    private void invalidateRfEvidenceForControllerReset(String reason) {
         SimConfig cfg = readConfig();
         if (!cfg.initialized || !cfg.active || cfg.generation <= 0L) return;
         long nextEpoch = Math.max(cfg.controllerEpoch + 1L, System.currentTimeMillis());
