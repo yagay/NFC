@@ -33,10 +33,18 @@ public final class HookDiscoveryEngine {
         return ranked.isEmpty() ? null : ranked.get(0);
     }
 
-    public List<HookTarget> discoverRfCandidates(ClassLoader classLoader) {
+    /** Fast path used during com.android.nfc startup before the full application is ready. */
+    public List<HookTarget> discoverKnownRfCandidates(ClassLoader classLoader) {
         List<HookTarget> out = new ArrayList<>();
         Set<String> seen = new HashSet<>();
         for (String name : PROVEN_RF_CLASSES) inspectRfClass(classLoader, name, "known-family", out, seen, true);
+        return top(out);
+    }
+
+    public List<HookTarget> discoverRfCandidates(ClassLoader classLoader) {
+        List<HookTarget> out = new ArrayList<>(discoverKnownRfCandidates(classLoader));
+        Set<String> seen = new HashSet<>();
+        for (HookTarget target : out) seen.add(target.fingerprint());
 
         int inspected = 0;
         for (String name : enumerateClassNames(classLoader)) {
