@@ -39,14 +39,12 @@ public class NfcInjectionModule extends XposedModule {
             new GenericNxpAdapter()
     };
 
-    /** Provider writes are serialized so old status cannot overtake newer RF evidence. */
     private final ExecutorService stateSyncExecutor = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(r, "NfcUIDSim-StateSync");
         t.setDaemon(true);
         return t;
     });
 
-    /** Desired-state reads and OEM trigger calls are serialized independently of RF hot path. */
     private final ExecutorService commandExecutor = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(r, "NfcUIDSim-Command");
         t.setDaemon(true);
@@ -97,9 +95,6 @@ public class NfcInjectionModule extends XposedModule {
 
                 SimConfig cfg = currentConfig();
 
-                // STOP commands deliberately pass the OEM RF config through untouched.
-                // A native result=0 on that untouched config is direct evidence that stock
-                // RF was reloaded, so a routine stop no longer needs to restart NFC.
                 if (!cfg.active) {
                     Object result = chain.proceed();
                     if (cfg.initialized && "STOP".equals(cfg.commandAction) && nativeOk(result)
@@ -125,9 +120,6 @@ public class NfcInjectionModule extends XposedModule {
                             && disabledFailureUid != null
                             && disabledFailureUid.equals(uidHex);
                     if (sameFailedAttempt) return chain.proceed();
-
-                    // Every new generation is an explicit new user attempt, including a retry
-                    // of the same UID. Do not require an NFC process restart just to retry it.
                     disabledAfterFailure = false;
                     disabledFailureUid = null;
                     disabledFailureGeneration = Long.MIN_VALUE;
@@ -230,8 +222,6 @@ public class NfcInjectionModule extends XposedModule {
         if (isGenerationCompleted(cfg.generation, pid)) return;
         if (cfg.generation == lastTriggeredGeneration) return;
 
-        // Legacy persisted desired state (before generation protocol) is treated as generation 0
-        // and is restored once per NFC process. New UI builds always publish generation > 0.
         lastTriggeredGeneration = cfg.generation;
 
         String action = cfg.active ? "APPLY" : "STOP";
@@ -239,6 +229,15 @@ public class NfcInjectionModule extends XposedModule {
         writeSimpleCommandState("RUNNING", "Executing " + action + " inside com.android.nfc", cfg.generation, action, false);
 
         NfcProcessVendorController.Result trigger = vendorController.setShareMode(cfg.active);
+
+        // transaction 15 may synchronously execute changeRfParamsByConfig in this same
+        // process. In that case the RF interceptor has already published SUCCESS/FAILED.
+        // Never enqueue TRIGGERED/TRIGGER_FAILED afterward and regress the terminal state.
+        if (isGenerationCompleted(cfg.generation, pid)) {
+            Log.i(TAG, "COMMAND terminal RF result already recorded generation=" + cfg.generation + " pid=" + pid);
+            return;
+        }
+
         if (trigger.success) {
             writeSimpleCommandState(
                     "TRIGGERED",
