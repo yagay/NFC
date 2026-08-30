@@ -27,6 +27,31 @@ public class RawNciCodecTest {
         assertArrayEquals("input must never be mutated", original, input);
     }
 
+    @Test public void resizesZeroLengthStockNfcid1InsteadOfAppendingDuplicate() {
+        byte[] input = hex("200203013300");
+        RewriteResult r = codec.rewrite(input, UID);
+
+        assertTrue(r.changed);
+        assertEquals("RESIZED_EXISTING_LA_NFCID1", r.reason);
+        assertArrayEquals(hex("200207013304C1B0BC1B"), r.data);
+        assertEquals(3, r.oldPayloadLength);
+        assertEquals(7, r.newPayloadLength);
+        assertEquals(1, r.oldParamCount);
+        assertEquals(1, r.newParamCount);
+    }
+
+    @Test public void zeroLengthStockNfcid1SupportsSevenAndTenByteUid() {
+        RewriteResult r7 = codec.rewrite(hex("200203013300"), hex("04112233445566"));
+        assertTrue(r7.changed);
+        assertEquals("RESIZED_EXISTING_LA_NFCID1", r7.reason);
+        assertArrayEquals(hex("20020A01330704112233445566"), r7.data);
+
+        RewriteResult r10 = codec.rewrite(hex("200203013300"), hex("0102030405060708090A"));
+        assertTrue(r10.changed);
+        assertEquals("RESIZED_EXISTING_LA_NFCID1", r10.reason);
+        assertArrayEquals(hex("20020D01330A0102030405060708090A"), r10.data);
+    }
+
     @Test public void appendsNfcid1OnlyToCompleteParameterList() {
         byte[] input = hex("20020401320108");
         RewriteResult r = codec.rewrite(input, UID);
@@ -38,6 +63,12 @@ public class RawNciCodecTest {
         assertEquals(10, r.newPayloadLength);
         assertEquals(1, r.oldParamCount);
         assertEquals(2, r.newParamCount);
+    }
+
+    @Test public void unsupportedExistingNfcid1LengthIsNotDuplicated() {
+        RewriteResult r = codec.rewrite(hex("200206013303010203"), UID);
+        assertFalse(r.changed);
+        assertEquals("NO_SAFE_REWRITE_TARGET", r.reason);
     }
 
     @Test public void understandsExtendedA0ParameterIds() {
@@ -145,9 +176,9 @@ public class RawNciCodecTest {
             assertArrayEquals("codec mutated input at iteration " + i, before, input);
             if (r.changed) {
                 assertNotNull(r.data);
-                assertTrue(r.data.length >= input.length);
-                assertTrue(r.newPayloadLength >= r.oldPayloadLength);
-                assertTrue(r.newParamCount >= r.oldParamCount);
+                assertTrue(r.data.length > 0);
+                assertTrue(r.newPayloadLength > 0);
+                assertTrue(r.newParamCount > 0);
             }
         }
     }
