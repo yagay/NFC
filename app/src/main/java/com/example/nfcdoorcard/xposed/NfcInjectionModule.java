@@ -132,6 +132,11 @@ public class NfcInjectionModule extends XposedModule {
             int payloadScore = payloadEngine.inspectScore(original);
             if (payloadScore <= 0) return chain.proceed();
 
+            HookTarget verified = activeTarget;
+            if (!learningMode && verified != null && !verified.fingerprint().equals(target.fingerprint())) {
+                return chain.proceed();
+            }
+
             SimConfig cfg = currentConfig();
             if (cfg.diagnostics) {
                 String caller = compactCallStack(24);
@@ -146,9 +151,8 @@ public class NfcInjectionModule extends XposedModule {
                         && !isGenerationCompleted(cfg.generation, pid)) {
                     Log.i(TAG, "STOCK RF ACCEPTED target=" + target.fingerprint() + " pid=" + pid +
                             " generation=" + cfg.generation + " result=" + result);
-                    // STOP proves stock restoration for this generation, but MUST NOT verify a new hook profile.
                     completeCommand(cfg, "RF_STOCK_RESTORED", "", target.fingerprint(), String.valueOf(result),
-                            "Stock RF accepted by RF_CONFIG_WRITE candidate");
+                            "Stock RF accepted by verified RF_CONFIG_WRITE target");
                 }
                 return result;
             }
@@ -160,9 +164,6 @@ public class NfcInjectionModule extends XposedModule {
                 return chain.proceed();
             }
 
-            // In learning mode, several candidates are instrumented but only the first candidate
-            // that actually observes a recognized RF payload may mutate this runtime. This avoids
-            // nested wrappers rewriting the same frame more than once.
             if (learningMode && !claimLearningOwner(target)) return chain.proceed();
 
             if (disabledAfterFailure) {
@@ -189,10 +190,14 @@ public class NfcInjectionModule extends XposedModule {
                 disabledAfterFailure = false;
                 disabledFailureUid = null;
                 disabledFailureGeneration = Long.MIN_VALUE;
-                activeTarget = target;
-                // Only a real APPLY rewrite accepted with native result=0 can verify a profile.
-                markTargetVerified(target);
-                learningMode = false;
+                synchronized (this) {
+                    if (learningMode) {
+                        activeTarget = target;
+                        markTargetVerified(target);
+                        learningMode = false;
+                        learningOwnerFingerprint = target.fingerprint();
+                    }
+                }
                 if (!isGenerationCompleted(cfg.generation, pid)) {
                     completeCommand(cfg, "RF_UID_APPLIED", uidHex, rewritten.codecId, String.valueOf(result),
                             "UID applied by verified target " + target.className + "#" + target.methodName);
@@ -210,7 +215,9 @@ public class NfcInjectionModule extends XposedModule {
     }
 
     private synchronized boolean claimLearningOwner(HookTarget target) {
-        if (!learningMode) return true;
+        if (!learningMode) {
+            return activeTarget == null || activeTarget.fingerprint().equals(target.fingerprint());
+        }
         String fp = target.fingerprint();
         if (learningOwnerFingerprint == null) {
             learningOwnerFingerprint = fp;
@@ -442,7 +449,7 @@ public class NfcInjectionModule extends XposedModule {
         v.put("hook_class", "NfcInjectionModule");
         v.put("hook_count", installedHookCount);
         v.put("hook_pid", pid);
-        if (activeTarget != null) v.put("rf_hook_fingerprint", activeTarget.fingerprint());
+        if (activeTarget != null) putTarget(v, activeTarget);
         return v;
     }
 
