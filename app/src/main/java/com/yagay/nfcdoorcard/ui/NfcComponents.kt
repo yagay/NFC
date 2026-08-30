@@ -120,13 +120,13 @@ fun RuntimeStatusPanel(status: RuntimeStatus, operationMessage: String?, readMod
             )
             Text(
                 "底层诊断: ${status.rfStatus} · gen=${status.rfGeneration} · pid=${status.rfPid} · raw=${status.rfNativeResult ?: "-"} (${status.rfNativeResultType ?: "-"}) · verify=${status.rfVerification ?: "-"}",
-                fontSize = 10.sp, color = Color.Gray
+                fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant
             )
             Text("触发方式: LSPosed · com.android.nfc 进程内控制", fontSize = 11.sp)
             Text("读卡模式: ${if (readModeEnabled) "开启" else "关闭"}", fontSize = 11.sp)
-            operationMessage?.let { Text(it, fontSize = 11.sp, color = Color.Gray) }
-            status.commandDetail?.takeIf { it.isNotBlank() }?.let { Text("最近命令: $it", fontSize = 10.sp, color = Color.Gray) }
-            status.rfError?.takeIf { it.isNotBlank() }?.let { Text("RF error: $it", fontSize = 10.sp, color = Color.Red) }
+            operationMessage?.let { Text(it, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+            status.commandDetail?.takeIf { it.isNotBlank() }?.let { Text("最近命令: $it", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+            status.rfError?.takeIf { it.isNotBlank() }?.let { Text("RF error: $it", fontSize = 10.sp, color = MaterialTheme.colorScheme.error) }
         }
     }
 }
@@ -141,7 +141,7 @@ fun ReadCardPanel(card: CardModel?, readMode: Boolean, simulationActive: Boolean
                 readMode -> { Text("读卡已开启，请把门禁卡贴到手机背部。", fontSize = 12.sp); OutlinedButton(onStopRead, Modifier.fillMaxWidth()) { Text("退出读卡模式") } }
                 card == null -> { Text("默认不读取卡片。需要添加新卡时再进入读卡模式。", fontSize = 12.sp); Button(onStartRead, Modifier.fillMaxWidth()) { Text("进入读卡模式") } }
                 else -> {
-                    Text("读取成功", color = Color(0xFF2E7D32), fontWeight = FontWeight.Bold)
+                    Text("读取成功", color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
                     CardDetails(card)
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         Button({ onSave(card) }, Modifier.weight(1f)) { Text("保存卡片") }
@@ -161,8 +161,8 @@ fun CardDetails(card: CardModel) {
         Text("UID: ${card.uid}", fontFamily = FontFamily.Monospace, fontSize = 12.sp)
         Text("SAK: ${card.sak}", fontFamily = FontFamily.Monospace, fontSize = 12.sp)
         Text("ATQA: ${card.atqa}", fontFamily = FontFamily.Monospace, fontSize = 12.sp)
-        Text("UID 长度: ${card.uid.replace(Regex("[^0-9A-Fa-f]"), "").length / 2} bytes", fontSize = 11.sp, color = Color.Gray)
-        Text("类型: ISO/IEC 14443 Type A", fontSize = 11.sp, color = Color.Gray)
+        Text("UID 长度: ${card.uid.replace(Regex("[^0-9A-Fa-f]"), "").length / 2} bytes", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Text("类型: ISO/IEC 14443 Type A", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
 }
 
@@ -176,13 +176,14 @@ fun StatusRow(label: String, tone: StatusTone, detail: String) {
         StatusTone.WARNING -> "▲"
         StatusTone.ERROR -> "●"
     }
+    val colors = MaterialTheme.colorScheme
     val color = when (tone) {
-        StatusTone.OK -> Color(0xFF2E7D32)
-        StatusTone.STOCK -> Color(0xFF00838F)
-        StatusTone.IDLE -> Color.Gray
-        StatusTone.BUSY -> Color(0xFF1565C0)
+        StatusTone.OK -> colors.primary
+        StatusTone.STOCK -> colors.tertiary
+        StatusTone.IDLE -> colors.onSurfaceVariant
+        StatusTone.BUSY -> colors.secondary
         StatusTone.WARNING -> Color(0xFFF9A825)
-        StatusTone.ERROR -> Color(0xFFC62828)
+        StatusTone.ERROR -> colors.error
     }
     Row(verticalAlignment = Alignment.CenterVertically) {
         Text(symbol, color = color, fontSize = 18.sp)
@@ -198,8 +199,8 @@ fun CardItem(card: CardModel, isActive: Boolean, expanded: Boolean, onToggleDeta
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {
                     Text(card.name, fontWeight = FontWeight.Bold)
-                    Text("UID ${card.uid}", fontSize = 10.sp, color = Color.Gray)
-                    Text(if (expanded) "点击收起详情" else "点击查看详情", fontSize = 9.sp, color = Color.Gray)
+                    Text("UID ${card.uid}", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(if (expanded) "点击收起详情" else "点击查看详情", fontSize = 9.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
                 if (isActive) Button(onStop, contentPadding = PaddingValues(horizontal = 10.dp)) { Text("停止模拟", fontSize = 10.sp) }
                 else Button(onSimulate, contentPadding = PaddingValues(horizontal = 10.dp)) { Text("模拟", fontSize = 10.sp) }
