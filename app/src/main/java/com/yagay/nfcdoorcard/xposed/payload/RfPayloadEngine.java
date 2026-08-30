@@ -1,51 +1,41 @@
 package com.yagay.nfcdoorcard.xposed.payload;
 
-import java.util.ArrayList;
-import java.util.Comparator;
-import java.util.List;
-
 /** Selects a codec per payload instead of locking the process to one vendor adapter. */
 public final class RfPayloadEngine {
-    private final RfPayloadCodec[] codecs = new RfPayloadCodec[] {
-            new OplusTextConfigCodec(),
-            new RawNciCodec()
-    };
+    private final RfPayloadCodec oplusCodec = new OplusTextConfigCodec();
+    private final RfPayloadCodec rawCodec = new RawNciCodec();
 
     public int inspectScore(byte[] input) {
-        int best = 0;
-        for (RfPayloadCodec codec : codecs) {
-            try { best = Math.max(best, codec.inspect(input)); } catch (Throwable ignored) { }
-        }
-        return best;
+        return Math.max(inspect(oplusCodec, input), inspect(rawCodec, input));
     }
 
     public RewriteResult rewrite(byte[] input, byte[] uid) {
-        List<Entry> ranked = new ArrayList<>();
-        for (RfPayloadCodec codec : codecs) {
-            int score;
-            try { score = codec.inspect(input); } catch (Throwable t) { score = 0; }
-            if (score > 0) ranked.add(new Entry(codec, score));
-        }
-        ranked.sort(Comparator.comparingInt((Entry e) -> e.score).reversed());
+        int oplusScore = inspect(oplusCodec, input);
+        int rawScore = inspect(rawCodec, input);
+        if (oplusScore <= 0 && rawScore <= 0) return RewriteResult.skip("none", "UNKNOWN_PAYLOAD");
 
-        StringBuilder reasons = new StringBuilder();
-        for (Entry entry : ranked) {
-            RewriteResult result;
-            try { result = entry.codec.rewrite(input, uid); }
-            catch (Throwable t) {
-                result = RewriteResult.skip(entry.codec.id(), t.getClass().getSimpleName() + ": " + t.getMessage());
-            }
-            if (result.changed) return result;
-            if (reasons.length() > 0) reasons.append(" | ");
-            reasons.append(entry.codec.id()).append(':').append(result.reason);
-        }
-        if (reasons.length() == 0) reasons.append("UNKNOWN_PAYLOAD");
-        return RewriteResult.skip("none", reasons.toString());
+        RfPayloadCodec first = oplusScore >= rawScore ? oplusCodec : rawCodec;
+        RfPayloadCodec second = first == oplusCodec ? rawCodec : oplusCodec;
+        int secondScore = first == oplusCodec ? rawScore : oplusScore;
+
+        RewriteResult firstResult = rewriteSafely(first, input, uid);
+        if (firstResult.changed) return firstResult;
+        if (secondScore <= 0) return RewriteResult.skip("none", first.id() + ':' + firstResult.reason);
+
+        RewriteResult secondResult = rewriteSafely(second, input, uid);
+        if (secondResult.changed) return secondResult;
+        return RewriteResult.skip("none",
+                first.id() + ':' + firstResult.reason + " | " + second.id() + ':' + secondResult.reason);
     }
 
-    private static final class Entry {
-        final RfPayloadCodec codec;
-        final int score;
-        Entry(RfPayloadCodec codec, int score) { this.codec = codec; this.score = score; }
+    private static int inspect(RfPayloadCodec codec, byte[] input) {
+        try { return codec.inspect(input); } catch (Throwable ignored) { return 0; }
+    }
+
+    private static RewriteResult rewriteSafely(RfPayloadCodec codec, byte[] input, byte[] uid) {
+        try { return codec.rewrite(input, uid); }
+        catch (Throwable t) {
+            return RewriteResult.skip(codec.id(), t.getClass().getSimpleName() + ": " + t.getMessage());
+        }
     }
 }
