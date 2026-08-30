@@ -16,6 +16,7 @@ android {
         versionName = "1.0.50"
 
         // Runtime protocol v7; hook build 37; 1.0.50 removes obsolete RF settling/final-sequence machinery and keeps controller-ready exact replay as the primary recovery path, with share-mode only as compatibility fallback.
+        // Historical cleanup is behavior-preserving: controller lifecycle/epoch, exact replay, reversible STOP and restart fallback remain intact.
         // Application ID, source namespace, Provider authority and LSPosed entry all use com.yagay.nfcdoorcard.
         buildConfigField("int", "HOOK_BUILD", "37")
     }
