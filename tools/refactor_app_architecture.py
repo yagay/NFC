@@ -85,7 +85,6 @@ def main():
 
     text = text.replace("saveCards(savedCardsState)", "cardRepository.save(savedCardsState)")
 
-    # Logs may read a fresh snapshot for their own text, but must not mutate RuntimeStatusViewModel.
     text = one(text,
         "                val snapshot = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {\n"
         "                    val newStatus = readRuntimeStatus(includeRootPid = false)\n"
@@ -104,7 +103,6 @@ def main():
         "                updateLogWindow(logLines, incoming)\n",
         "separate logs from runtime state")
 
-    # UI never fabricates RuntimeStatus. Provider observation is the normal status authority.
     text = one(text,
         "                                simulateCard(card) { newStatus, message -> runOnUiThread { runtimeViewModel.update(newStatus); operationMessage = message } }\n"
         "                                runtimeViewModel.update(status.copy(\n"
@@ -122,11 +120,11 @@ def main():
         "                                stopSimulation { _, message -> runOnUiThread { operationMessage = message } }\n",
         "remove optimistic stop status")
 
-    # Remove Activity-owned persistence implementation.
+    # text[b:] already includes the diagnostics method signature; do not duplicate it.
     text = between(text,
         "    private fun loadCards(): List<CardModel> {",
         "    private fun saveDiagnosticWithoutSharing(onDone: () -> Unit) {",
-        "    private fun saveDiagnosticWithoutSharing(onDone: () -> Unit) {",
+        "",
         "remove Activity card persistence")
     text = text.replace("        val cards = loadCards(); appendLine(\"count=${cards.size}\"); cards.forEach { appendLine(\"card uid=${it.uid} sak=${it.sak} atqa=${it.atqa}\") }",
                         "        val cards = cardRepository.load(); appendLine(\"count=${cards.size}\"); cards.forEach { appendLine(\"card uid=${it.uid} sak=${it.sak} atqa=${it.atqa}\") }")
