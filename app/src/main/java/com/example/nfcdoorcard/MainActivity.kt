@@ -55,9 +55,6 @@ class MainActivity : ComponentActivity() {
         runtimeRepository = RuntimeStatusRepository(this, nfcSystemService)
         savedCardsState = loadCards()
         AppLogger.i("NFC controller started; LSPosed in-process command engine enabled")
-        contentResolver.insert(ConfigProvider.URI, ContentValues().apply {
-            put(ConfigProvider.KEY_DIAGNOSTIC_LOGGING_ENABLED, false)
-        })
         setContent { MaterialTheme { Surface(Modifier.fillMaxSize()) { NfcAppContent() } } }
     }
 
@@ -77,11 +74,6 @@ class MainActivity : ComponentActivity() {
     override fun onPause() { disableReadDispatch(); super.onPause() }
     override fun onDestroy() {
         disableReadDispatch()
-        runCatching {
-            contentResolver.insert(ConfigProvider.URI, ContentValues().apply {
-                put(ConfigProvider.KEY_DIAGNOSTIC_LOGGING_ENABLED, false)
-            })
-        }
         operationExecutor.shutdownNow()
         diagnosticExecutor.shutdownNow()
         super.onDestroy()
@@ -133,7 +125,7 @@ class MainActivity : ComponentActivity() {
         val logLines = remember { mutableStateListOf<String>() }
         var selectedSource by remember { mutableStateOf(LogSource.STATUS) }
         var diagnosticRunning by remember { mutableStateOf(false) }
-        var logsEnabled by remember { mutableStateOf(false) }
+        var logsEnabled by remember { mutableStateOf(getDiagnosticLoggingEnabled()) }
         var expandedUid by remember { mutableStateOf<String?>(null) }
         var operationMessage by remember { mutableStateOf<String?>(null) }
         val logListState = rememberLazyListState()
@@ -444,6 +436,9 @@ class MainActivity : ComponentActivity() {
     private fun isCurrentCommandGeneration(generation: Long): Boolean = runtimeRepository.isCurrentCommandGeneration(generation)
 
     private fun getSimulationEnabled(): Boolean = runtimeRepository.simulationEnabled()
+
+    private fun getDiagnosticLoggingEnabled(): Boolean =
+        readProviderMap()[ConfigProvider.KEY_DIAGNOSTIC_LOGGING_ENABLED]?.toBooleanStrictOrNull() ?: false
 
     private fun readProviderMap(): Map<String, String> = runtimeRepository.readProviderMap()
 
