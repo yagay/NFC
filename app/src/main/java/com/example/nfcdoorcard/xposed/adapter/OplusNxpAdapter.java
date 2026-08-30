@@ -52,24 +52,14 @@ public final class OplusNxpAdapter implements NfcStackAdapter {
         byte[] block = parseHexTokens(matcher.group(2));
         if (block.length < 4) return InjectionResult.skip("OPLUS_BLOCK_TOO_SHORT");
 
-        int frameStart = -1;
-        int frameEnd = -1;
-        for (int i = 0; i + 3 < block.length; i++) {
-            if ((block[i] & 0xFF) == 0x20 && (block[i + 1] & 0xFF) == 0x02) {
-                int payloadLen = block[i + 2] & 0xFF;
-                int end = i + 3 + payloadLen;
-                if (end <= block.length) {
-                    frameStart = i;
-                    frameEnd = end;
-                    break;
-                }
-            }
-        }
-        if (frameStart < 0) return InjectionResult.skip("CORE_SET_CONFIG_NOT_FOUND");
+        int frameStart = findValidatedCoreSetConfig(block);
+        if (frameStart < 0) return InjectionResult.skip("VALID_CORE_SET_CONFIG_NOT_FOUND");
 
+        int oldPayload = block[frameStart + 2] & 0xFF;
+        int frameEnd = frameStart + 3 + oldPayload;
+        int oldCount = block[frameStart + 3] & 0xFF;
         byte[] frame = Arrays.copyOfRange(block, frameStart, frameEnd);
-        int oldPayload = frame[2] & 0xFF;
-        int oldCount = frame[3] & 0xFF;
+
         if (oldPayload + 6 > 0xFF || oldCount >= 0xFF) return InjectionResult.skip("FRAME_LENGTH_OVERFLOW");
         if (containsNfcid1(frame)) return InjectionResult.skip("LA_NFCID1_ALREADY_PRESENT");
 
@@ -89,6 +79,38 @@ public final class OplusNxpAdapter implements NfcStackAdapter {
         String replacement = matcher.group(1) + "\n" + formatHexBlock(newBlock) + "\n" + matcher.group(3);
         String rewritten = text.substring(0, matcher.start()) + replacement + text.substring(matcher.end());
         return InjectionResult.changed(rewritten.getBytes(StandardCharsets.UTF_8), oldPayload, oldPayload + 6, oldCount, oldCount + 1);
+    }
+
+    private static int findValidatedCoreSetConfig(byte[] data) {
+        for (int i = 0; i + 3 < data.length; i++) {
+            if ((data[i] & 0xFF) != 0x20 || (data[i + 1] & 0xFF) != 0x02) continue;
+            int payloadLen = data[i + 2] & 0xFF;
+            int end = i + 3 + payloadLen;
+            if (payloadLen < 1 || end > data.length) continue;
+            int count = data[i + 3] & 0xFF;
+            if (validParamList(data, i, end, count)) return i;
+        }
+        return -1;
+    }
+
+    private static boolean validParamList(byte[] data, int start, int end, int count) {
+        int pos = start + 4;
+        for (int n = 0; n < count; n++) {
+            if (pos >= end) return false;
+            int first = data[pos] & 0xFF;
+            int lenPos;
+            if (first == 0xA0) {
+                if (pos + 2 >= end) return false;
+                lenPos = pos + 2;
+            } else {
+                if (pos + 1 >= end) return false;
+                lenPos = pos + 1;
+            }
+            int len = data[lenPos] & 0xFF;
+            pos = lenPos + 1 + len;
+            if (pos > end) return false;
+        }
+        return pos == end;
     }
 
     private static boolean containsNfcid1(byte[] frame) {
