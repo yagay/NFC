@@ -67,14 +67,26 @@ public class RawNciCodecTest {
         assertEquals("NO_SAFE_REWRITE_TARGET", r.reason);
     }
 
-    @Test public void rewritesOnlyFirstSafeFrameAndPreservesTrailingFrame() {
+    @Test public void multipleFramesPreferExistingNfcid1OverAppending() {
+        byte[] first = hex("20020401320108");
         byte[] second = hex("20020701330455667788");
-        byte[] input = concat(hex("010203"), hex("20020401320108"), second);
+        byte[] input = concat(hex("010203"), first, second);
         RewriteResult r = codec.rewrite(input, UID);
 
         assertTrue(r.changed);
-        byte[] expected = concat(hex("010203"), hex("20020A023201083304C1B0BC1B"), second);
+        assertEquals("REPLACED_EXISTING_LA_NFCID1", r.reason);
+        byte[] expected = concat(hex("010203"), first, hex("200207013304C1B0BC1B"));
         assertArrayEquals(expected, r.data);
+    }
+
+    @Test public void appendPreservesTrailingNonNciBytes() {
+        byte[] tail = hex("7E7D7C01020304");
+        byte[] input = concat(hex("20020401320108"), tail);
+        RewriteResult r = codec.rewrite(input, UID);
+
+        assertTrue(r.changed);
+        assertEquals("APPENDED_LA_NFCID1", r.reason);
+        assertArrayEquals(concat(hex("20020A023201083304C1B0BC1B"), tail), r.data);
     }
 
     @Test public void invalidUidIsRejected() {
