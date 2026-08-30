@@ -1,0 +1,45 @@
+name: Trigger Closed Loop Refactor
+
+on:
+  push:
+    paths:
+      - '.github/workflows/trigger-closed-loop-refactor.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  refactor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - name: Apply refactor
+        run: python3 .github/scripts/patch_trigger_closed_loop.py
+      - name: Unit tests and builds
+        run: ./gradlew --no-daemon testDebugUnitTest assembleDebug lintDebug assembleRelease
+      - name: Verify Xposed metadata and APKs
+        run: |
+          set -eux
+          for apk in app/build/outputs/apk/debug/*.apk app/build/outputs/apk/release/*.apk; do
+            unzip -l "$apk" | grep -q 'META-INF/xposed/java_init.list'
+            unzip -l "$apk" | grep -q 'META-INF/xposed/module.prop'
+            unzip -p "$apk" META-INF/xposed/java_init.list | grep -q 'com.example.nfcdoorcard.xposed.NfcInjectionModule'
+            "$ANDROID_HOME/build-tools/$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)/zipalign" -c -P 16 -v 4 "$apk"
+            "$ANDROID_HOME/build-tools/$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)/apksigner" verify --verbose "$apk"
+          done
+      - name: Commit verified refactor
+        run: |
+          set -eux
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          rm -f .github/workflows/trigger-closed-loop-refactor.yml .github/scripts/patch_trigger_closed_loop.py
+          git add -A
+          git commit -m 'Close RF refresh trigger loop'
+          git push origin HEAD:main
