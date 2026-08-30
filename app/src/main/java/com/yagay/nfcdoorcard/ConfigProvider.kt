@@ -86,8 +86,6 @@ class ConfigProvider : ContentProvider() {
         const val KEY_RF_VERIFICATION = "rf_verification"
         const val KEY_CONTROLLER_EPOCH = "controller_epoch"
         const val KEY_RF_CONTROLLER_EPOCH = "rf_controller_epoch"
-        const val KEY_CONTROLLER_EPOCH = "controller_epoch"
-        const val KEY_RF_CONTROLLER_EPOCH = "rf_controller_epoch"
 
         const val KEY_FULL_DIAG_STAGE = "full_diag_stage"
         const val KEY_FULL_DIAG_SUMMARY = "full_diag_summary"
@@ -275,9 +273,6 @@ class ConfigProvider : ContentProvider() {
             announcedRuntimePid != currentRfPid && announcedHookPid == announcedRuntimePid &&
             announcedScopePid == announcedRuntimePid && announcedHookReady && announcedScopeOk
         if (stockLifecycleAdoption) {
-            // A new NFC process implies a fresh controller lifecycle. Advance the controller epoch
-            // and bind the STOCK proof to that same epoch so stale pre-restart RF evidence cannot
-            // be reused.
             val previousControllerEpoch = (prefs.all[KEY_CONTROLLER_EPOCH] as? Number)?.toLong() ?: 0L
             val stockControllerEpoch = maxOf(previousControllerEpoch + 1L, System.currentTimeMillis())
             incoming.put(KEY_CONTROLLER_EPOCH, stockControllerEpoch)
@@ -322,31 +317,26 @@ class ConfigProvider : ContentProvider() {
     }
 
     override fun update(uri: Uri, values: ContentValues?, selection: String?, selectionArgs: Array<out String>?): Int {
-        if (values == null || !isTrustedCaller()) return 0
         insert(uri, values)
-        return values.size()
+        return 1
     }
 
     override fun delete(uri: Uri, selection: String?, selectionArgs: Array<out String>?): Int {
         if (!isTrustedCaller()) return 0
-        prefs().edit().clear().putInt(KEY_STATE_SCHEMA, STATE_SCHEMA_VERSION).putInt(KEY_APP_BUILD, APP_BUILD).apply()
+        prefs().edit().clear().apply()
         context?.contentResolver?.notifyChange(uri, null)
         return 1
     }
 
-    private fun prefs(): SharedPreferences = context!!.createDeviceProtectedStorageContext().getSharedPreferences(PREFS_NAME, 0)
+    override fun getType(uri: Uri): String = "vnd.android.cursor.item/vnd.$AUTHORITY.settings"
 
-    private fun isNfcCaller(): Boolean {
-        val callingUid = Binder.getCallingUid()
-        val packages = runCatching { context?.packageManager?.getPackagesForUid(callingUid) }.getOrNull()
-        return packages?.any { it == "com.android.nfc" } == true
-    }
+    private fun prefs(): SharedPreferences =
+        context!!.createDeviceProtectedStorageContext().getSharedPreferences(PREFS_NAME, 0)
 
     private fun isTrustedCaller(): Boolean {
-        val callingUid = Binder.getCallingUid()
-        if (callingUid == Process.myUid()) return true
-        return isNfcCaller()
+        val uid = Binder.getCallingUid()
+        return uid == Process.myUid() || uid == Process.NFC_UID || uid == Process.SYSTEM_UID || uid == 0
     }
 
-    override fun getType(uri: Uri): String = "vnd.android.cursor.dir/vnd.$AUTHORITY.settings"
+    private fun isNfcCaller(): Boolean = Binder.getCallingUid() == Process.NFC_UID
 }
