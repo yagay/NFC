@@ -54,6 +54,12 @@ public class NfcInjectionModule extends XposedModule {
     private volatile String disabledFailureUid;
     private volatile long disabledFailureGeneration = Long.MIN_VALUE;
 
+    // Exact pre-injection RF payload captured from the verified APPLY call. STOP must restore
+    // this snapshot instead of trusting an arbitrary OEM callback that merely returns 0.
+    private volatile byte[] stockPayloadSnapshot;
+    private volatile String stockPayloadTargetFingerprint;
+    private volatile long stockPayloadCapturedGeneration = Long.MIN_VALUE;
+
     @Override public void onModuleLoaded(XposedModuleInterface.ModuleLoadedParam param) {
         super.onModuleLoaded(param);
         Log.i(TAG, "PROD MODULE loaded build=" + HOOK_BUILD + " process=" + param.getProcessName());
@@ -146,13 +152,43 @@ public class NfcInjectionModule extends XposedModule {
             }
 
             if (!cfg.active) {
+                if (cfg.initialized && "STOP".equals(cfg.commandAction) && !isGenerationCompleted(cfg.generation, pid)) {
+                    byte[] stock = stockPayloadSnapshot;
+                    String stockTarget = stockPayloadTargetFingerprint;
+                    if (stock != null && target.fingerprint().equals(stockTarget)) {
+                        byte[] restorePayload = stock.clone();
+                        Log.i(TAG, "STOCK SNAPSHOT RESTORE target=" + target.fingerprint() + " pid=" + pid +
+                                " generation=" + cfg.generation + " capturedGeneration=" + stockPayloadCapturedGeneration +
+                                " bytes=" + restorePayload.length);
+                        Object result = chain.proceed(new Object[]{restorePayload});
+                        if (nativeOk(result)) {
+                            synchronized (this) {
+                                stockPayloadSnapshot = null;
+                                stockPayloadTargetFingerprint = null;
+                                stockPayloadCapturedGeneration = Long.MIN_VALUE;
+                            }
+                            Log.i(TAG, "STOCK SNAPSHOT RESTORED target=" + target.fingerprint() + " pid=" + pid +
+                                    " generation=" + cfg.generation + " result=" + result);
+                            completeCommand(cfg, "RF_STOCK_RESTORED", "", "stock-snapshot|" + target.fingerprint(),
+                                    String.valueOf(result), "Original stock RF snapshot restored by verified RF_CONFIG_WRITE target");
+                        } else {
+                            failCommand(cfg, "RF_STOCK_FAILED", "",
+                                    "Native rejected saved stock RF snapshot; NFC restart required", String.valueOf(result));
+                        }
+                        return result;
+                    }
+                }
+
                 Object result = chain.proceed();
                 if (cfg.initialized && "STOP".equals(cfg.commandAction) && nativeOk(result)
                         && !isGenerationCompleted(cfg.generation, pid)) {
-                    Log.i(TAG, "STOCK RF ACCEPTED target=" + target.fingerprint() + " pid=" + pid +
-                            " generation=" + cfg.generation + " result=" + result);
-                    completeCommand(cfg, "RF_STOCK_RESTORED", "", target.fingerprint(), String.valueOf(result),
-                            "Stock RF accepted by verified RF_CONFIG_WRITE target");
+                    // A return value of 0 alone is not proof that the emulated UID was removed.
+                    // Without the exact pre-APPLY snapshot, force the app's NFC-process restart fallback.
+                    Log.w(TAG, "STOCK RESTORE UNVERIFIED target=" + target.fingerprint() + " pid=" + pid +
+                            " generation=" + cfg.generation + " result=" + result + " snapshotMissing=true");
+                    failCommand(cfg, "RF_STOCK_FAILED", "",
+                            "OEM stock callback returned 0 but no saved pre-APPLY RF snapshot is available; restart required",
+                            String.valueOf(result));
                 }
                 return result;
             }
@@ -196,6 +232,16 @@ public class NfcInjectionModule extends XposedModule {
                         markTargetVerified(target);
                         learningMode = false;
                         learningOwnerFingerprint = target.fingerprint();
+                    }
+                    // Preserve the first known-good stock payload until a verified STOP restores it.
+                    // A card-to-card APPLY must not replace the original stock snapshot.
+                    if (stockPayloadSnapshot == null ||
+                            !target.fingerprint().equals(stockPayloadTargetFingerprint)) {
+                        stockPayloadSnapshot = original.clone();
+                        stockPayloadTargetFingerprint = target.fingerprint();
+                        stockPayloadCapturedGeneration = cfg.generation;
+                        Log.i(TAG, "STOCK SNAPSHOT CAPTURED target=" + target.fingerprint() + " pid=" + pid +
+                                " generation=" + cfg.generation + " bytes=" + original.length);
                     }
                 }
                 if (!isGenerationCompleted(cfg.generation, pid)) {
@@ -450,6 +496,9 @@ public class NfcInjectionModule extends XposedModule {
         v.put("hook_count", installedHookCount);
         v.put("hook_pid", pid);
         if (activeTarget != null) putTarget(v, activeTarget);
+        v.put("stock_snapshot_available", stockPayloadSnapshot != null);
+        v.put("stock_snapshot_generation", stockPayloadCapturedGeneration == Long.MIN_VALUE ? 0L : stockPayloadCapturedGeneration);
+        v.put("stock_snapshot_target", stockPayloadTargetFingerprint == null ? "" : stockPayloadTargetFingerprint);
         return v;
     }
 
