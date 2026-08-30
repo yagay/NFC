@@ -1,0 +1,31 @@
+name: Apply overwrite trace diagnostics
+
+on:
+  push:
+    paths:
+      - '.github/workflows/apply-trace-diagnostics.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply migration
+        run: python tools/apply_trace_diagnostics.py
+      - name: Verify expected changes
+        run: |
+          grep -q 'versionName = "1.0.47"' app/build.gradle.kts
+          grep -q 'NFC OVERWRITE TRACE / CORRELATED TIMELINE' app/src/main/java/com/yagay/nfcdoorcard/MainActivity.kt
+          grep -q 'NCI TX/RX FULL TIMELINE' app/src/main/java/com/yagay/nfcdoorcard/MainActivity.kt
+          grep -q 'OPLUS RUNTIME CARD / SUPER-CARD TIMELINE' app/src/main/java/com/yagay/nfcdoorcard/MainActivity.kt
+      - name: Commit product changes and remove migration files
+        run: |
+          rm -f tools/apply_trace_diagnostics.py .github/workflows/apply-trace-diagnostics.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'feat: add correlated NFC overwrite diagnostics'
+          git push
