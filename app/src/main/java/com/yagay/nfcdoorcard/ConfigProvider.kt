@@ -15,6 +15,7 @@ class ConfigProvider : ContentProvider() {
         const val AUTHORITY = "com.yagay.nfcdoorcard.config"
         const val PATH_SETTINGS = "settings"
         private const val PREFS_NAME = "nfc_config"
+        private const val ANDROID_NFC_UID = 1027
         const val STATE_SCHEMA_VERSION = 7
         const val PROFILE_SCHEMA_VERSION = 3
         val APP_BUILD: Int = BuildConfig.VERSION_CODE
@@ -394,8 +395,8 @@ class ConfigProvider : ContentProvider() {
 
     private fun isTrustedCaller(): Boolean {
         val uid = Binder.getCallingUid()
-        return uid == Process.myUid() || uid == Process.NFC_UID || uid == Process.SYSTEM_UID || uid == 0
+        return uid == Process.myUid() || uid == ANDROID_NFC_UID || uid == Process.SYSTEM_UID || uid == 0
     }
 
-    private fun isNfcCaller(): Boolean = Binder.getCallingUid() == Process.NFC_UID
+    private fun isNfcCaller(): Boolean = Binder.getCallingUid() == ANDROID_NFC_UID
 }
