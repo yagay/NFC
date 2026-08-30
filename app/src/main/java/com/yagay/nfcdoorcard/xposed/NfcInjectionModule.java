@@ -61,6 +61,8 @@ public class NfcInjectionModule extends XposedModule {
     private final RefreshTriggerEngine refreshTriggerEngine = new RefreshTriggerEngine();
 
     private volatile HookTarget activeTarget;
+    private volatile ClassLoader nfcClassLoader;
+    private volatile boolean fullTriggerDiscoveryDone;
     private volatile String activeCodec = "";
     private volatile SimConfig cachedConfig = SimConfig.uninitialized();
     private volatile ContentObserver commandObserver;
@@ -119,6 +121,7 @@ public class NfcInjectionModule extends XposedModule {
         if (!"com.android.nfc".equals(lp.getPackageName())) return;
         final int pid = Process.myPid();
         final ClassLoader cl = lp.getDefaultClassLoader();
+        nfcClassLoader = cl;
         // A fresh com.android.nfc process is always a fresh physical-controller proof domain.
         // Provider state may not be readable this early, so mark memory invalid now and commit the
         // epoch barrier again once the command bridge has a Context.
@@ -318,7 +321,6 @@ public class NfcInjectionModule extends XposedModule {
 
         List<HookTarget> installTargets = new ArrayList<>();
         List<HookTarget> triggerTargets = discoveryEngine.discoverKnownTriggerCandidates(cl);
-        if (triggerTargets.isEmpty()) triggerTargets = discoveryEngine.discoverTriggerCandidates(cl);
         persistTriggerCandidates(pid, triggerTargets);
         HookTarget cached = profileStore.loadValid(app, cl);
         if (cached != null) {
@@ -573,6 +575,37 @@ public class NfcInjectionModule extends XposedModule {
         });
     }
 
+    private synchronized void ensureFullTriggerDiscovery() {
+        if (fullTriggerDiscoveryDone) return;
+        fullTriggerDiscoveryDone = true;
+        ClassLoader cl = nfcClassLoader;
+        if (cl == null) return;
+        try {
+            List<HookTarget> candidates = discoveryEngine.discoverTriggerCandidates(cl);
+            persistTriggerCandidates(Process.myPid(), candidates);
+            int installed = 0;
+            for (int i = 0; i < Math.min(MAX_TRIGGER_HOOKS, candidates.size()); i++) {
+                try {
+                    installRefreshTriggerHook(cl, Process.myPid(), candidates.get(i));
+                    installed++;
+                } catch (Throwable t) {
+                    Log.w(TAG, "LAZY REFRESH TRIGGER hook skipped target=" + candidates.get(i) + " " +
+                            t.getClass().getSimpleName() + ": " + t.getMessage());
+                }
+            }
+            Log.i(TAG, "LAZY REFRESH TRIGGER discovery installed=" + installed +
+                    " candidates=" + candidates.size() + " pid=" + Process.myPid());
+        } catch (Throwable t) {
+            Log.w(TAG, "LAZY REFRESH TRIGGER discovery failed " + t.getClass().getSimpleName() +
+                    ": " + t.getMessage());
+        }
+    }
+
+    private boolean hasVerifiedReplayForCurrentProcess() {
+        RfInvocationSnapshot snapshot = lastVerifiedRfInvocation;
+        return snapshot != null && snapshot.capturedPid == Process.myPid();
+    }
+
     private NfcProcessVendorController.Result triggerRfRefresh(SimConfig cfg, boolean enabled, String reason) {
         return triggerRfRefresh(cfg, enabled, reason, TRIGGER_RF_WINDOW_MS);
     }
@@ -580,6 +613,10 @@ public class NfcInjectionModule extends XposedModule {
     private NfcProcessVendorController.Result triggerRfRefresh(SimConfig cfg, boolean enabled, String reason, long windowMs) {
         armTriggerWindow(cfg.generation, reason, windowMs);
         RefreshTriggerEngine.Invocation javaTrigger = refreshTriggerEngine.invoke(enabled);
+        if (!javaTrigger.success && !fullTriggerDiscoveryDone) {
+            ensureFullTriggerDiscovery();
+            javaTrigger = refreshTriggerEngine.invoke(enabled);
+        }
         if (javaTrigger.success) {
             pendingTriggerTarget = javaTrigger.targetFingerprint;
             persistRefreshRuntime("TRIGGERED", javaTrigger.targetFingerprint, "java-verified", cfg.generation, false);
@@ -753,44 +790,55 @@ public class NfcInjectionModule extends XposedModule {
         Log.i(TAG, "LIFECYCLE RECOVERY start reason=" + reason + " generation=" + cfg.generation +
                 " uid=" + uidHex + " pid=" + pid);
 
+        boolean replayAttempted = false;
+        int fallbackAttempts = 0;
+        String lastFailure = "No recovery action executed";
+        long deadline = System.currentTimeMillis() + LIFECYCLE_TOTAL_TIMEOUT_MS;
         try {
-            // Small fixed controller-ready debounce replaces the old RF quiet-period/final-sequence
-            // state machine. Correctness comes from a fresh native-accepted proof in this controller
-            // epoch, not from timing guesses or share-mode return values.
             sleep(LIFECYCLE_REPLAY_DELAY_MS);
-            SimConfig latest = readConfig();
-            if (!latest.initialized || !latest.active || latest.generation != cfg.generation) return;
-            if (isLifecycleVerified(cfg.generation, pid, uidHex)) return;
+            while (System.currentTimeMillis() < deadline) {
+                SimConfig latest = readConfig();
+                boolean commandSucceeded = latest.initialized && latest.active &&
+                        latest.generation == cfg.generation && latest.handledGeneration == latest.generation &&
+                        "SUCCESS".equals(latest.commandStatus);
+                boolean verified = commandSucceeded && isLifecycleVerified(cfg.generation, pid, uidHex);
+                RecoveryStateMachine.Action action = RecoveryStateMachine.next(
+                        new RecoveryStateMachine.Snapshot(
+                                latest.initialized && latest.active,
+                                commandSucceeded,
+                                verified,
+                                hasVerifiedReplayForCurrentProcess(),
+                                replayAttempted,
+                                fallbackAttempts,
+                                LIFECYCLE_MAX_TRIGGER_ATTEMPTS));
 
-            String lastFailure;
-            synchronized (this) { recoveryWriteArmed = true; }
-            boolean replayed = replayVerifiedRfInvocation(latest, uidHex);
-            if (replayed && waitForLifecycleVerified(cfg.generation, pid, uidHex, LIFECYCLE_TRIGGER_WAIT_MS)) {
-                lifecycleFailureGeneration = Long.MIN_VALUE;
-                lifecycleFailureControllerEpoch = Long.MIN_VALUE;
-                return;
-            }
-            synchronized (this) { recoveryWriteArmed = false; }
-            lastFailure = replayed ?
-                    "Exact RF replay invoked but no fresh native proof was observed" :
-                    "Exact RF replay unavailable/failed";
+                if (action == RecoveryStateMachine.Action.NONE) return;
+                if (action == RecoveryStateMachine.Action.MARK_FAILED) break;
 
-            // Compatibility fallback for fresh processes that do not yet have a verified replay
-            // template. A trigger is only useful if it causes a real RF writer invocation; its
-            // boolean return never counts as success by itself.
-            long deadline = System.currentTimeMillis() + LIFECYCLE_TOTAL_TIMEOUT_MS;
-            for (int attempt = 1; attempt <= LIFECYCLE_MAX_TRIGGER_ATTEMPTS &&
-                    System.currentTimeMillis() < deadline; attempt++) {
-                latest = readConfig();
-                if (!latest.initialized || !latest.active || latest.generation != cfg.generation) break;
                 synchronized (this) { recoveryWriteArmed = true; }
-                NfcProcessVendorController.Result trigger = triggerRfRefresh(
-                        latest, true, "lifecycle-fallback:" + reason + ":attempt-" + attempt,
-                        LIFECYCLE_TRIGGER_RF_WINDOW_MS);
-                lastFailure = trigger.stage + ": " + trigger.detail;
-                long remaining = Math.max(0L, deadline - System.currentTimeMillis());
-                long wait = Math.min(LIFECYCLE_TRIGGER_WAIT_MS, remaining);
-                if (wait > 0L && waitForLifecycleVerified(cfg.generation, pid, uidHex, wait)) return;
+                if (action == RecoveryStateMachine.Action.EXACT_REPLAY) {
+                    replayAttempted = true;
+                    boolean replayed = replayVerifiedRfInvocation(latest, uidHex);
+                    lastFailure = replayed ?
+                            "Exact RF replay invoked but no fresh native proof was observed" :
+                            "Exact RF replay unavailable/failed";
+                    if (replayed && waitForLifecycleVerified(
+                            cfg.generation, pid, uidHex, LIFECYCLE_TRIGGER_WAIT_MS)) {
+                        lifecycleFailureGeneration = Long.MIN_VALUE;
+                        lifecycleFailureControllerEpoch = Long.MIN_VALUE;
+                        return;
+                    }
+                } else {
+                    fallbackAttempts++;
+                    NfcProcessVendorController.Result trigger = triggerRfRefresh(
+                            latest, true,
+                            "lifecycle-fallback:" + reason + ":attempt-" + fallbackAttempts,
+                            LIFECYCLE_TRIGGER_RF_WINDOW_MS);
+                    lastFailure = trigger.stage + ": " + trigger.detail;
+                    long remaining = Math.max(0L, deadline - System.currentTimeMillis());
+                    long wait = Math.min(LIFECYCLE_TRIGGER_WAIT_MS, remaining);
+                    if (wait > 0L && waitForLifecycleVerified(cfg.generation, pid, uidHex, wait)) return;
+                }
                 synchronized (this) { recoveryWriteArmed = false; }
             }
 
