@@ -105,6 +105,7 @@ public class NfcInjectionModule extends XposedModule {
         final int pid = Process.myPid();
         final ClassLoader cl = lp.getDefaultClassLoader();
         installEarlyKnownRfHook(cl, pid);
+        installEarlyAdapterStateBridge(pid);
         commandExecutor.execute(() -> initializeRuntime(cl, pid));
     }
 
@@ -126,6 +127,31 @@ public class NfcInjectionModule extends XposedModule {
         } catch (Throwable t) {
             Log.w(TAG, "EARLY RF HOOK unavailable " + t.getClass().getSimpleName() + ": " + t.getMessage());
         }
+    }
+
+    /** Register adapter OFF/ON tracking as early as the system context becomes available.
+     * This is deliberately independent of waitForApplication(): controller power transitions can
+     * happen before the NFC Application object is published, and missing OFF would leave stale RF
+     * evidence valid for the following ON cycle.
+     */
+    private void installEarlyAdapterStateBridge(int pid) {
+        lifecycleExecutor.execute(() -> {
+            long end = System.currentTimeMillis() + 2_000L;
+            while (adapterStateReceiver == null && System.currentTimeMillis() < end) {
+                Context ctx = currentContext();
+                if (ctx != null) {
+                    registerAdapterStateReceiver(ctx);
+                    if (adapterStateReceiver != null) {
+                        Log.i(TAG, "EARLY ADAPTER STATE bridge ready pid=" + pid);
+                        return;
+                    }
+                }
+                sleep(25L);
+            }
+            if (adapterStateReceiver == null) {
+                Log.w(TAG, "EARLY ADAPTER STATE bridge unavailable pid=" + pid);
+            }
+        });
     }
 
     private void initializeRuntime(ClassLoader cl, int pid) {
@@ -311,6 +337,11 @@ public class NfcInjectionModule extends XposedModule {
 
             activeCodec = rewritten.codecId;
             writeRfProgress(cfg, "APPLYING", uidHex, rewritten.reason, rewritten.codecId);
+            persistRewriteDiagnostics(rewritten);
+            Log.i(TAG, "RF_REWRITE codec=" + rewritten.codecId + " reason=" + rewritten.reason +
+                    " oldPayload=" + rewritten.oldPayloadLength + " newPayload=" + rewritten.newPayloadLength +
+                    " oldCount=" + rewritten.oldParamCount + " newCount=" + rewritten.newParamCount +
+                    " originalBytes=" + original.length + " rewrittenBytes=" + rewritten.data.length);
             Log.i(TAG, "NFCID1 APPLY target=" + target.fingerprint() + " codec=" + rewritten.codecId +
                     " reason=" + rewritten.reason + " pid=" + pid + " generation=" + cfg.generation + " uid=" + uidHex +
                     " lifecycle=" + lifecycleReapplyPending);
@@ -465,7 +496,8 @@ public class NfcInjectionModule extends XposedModule {
         }
     }
 
-    private void registerAdapterStateReceiver(Application app) {
+    private synchronized void registerAdapterStateReceiver(Context app) {
+        if (adapterStateReceiver != null) return;
         BroadcastReceiver receiver = new BroadcastReceiver() {
             @Override public void onReceive(Context context, Intent intent) {
                 if (intent == null || !"android.nfc.action.ADAPTER_STATE_CHANGED".equals(intent.getAction())) return;
@@ -889,6 +921,18 @@ public class NfcInjectionModule extends XposedModule {
             if (kept >= maxFrames) break;
         }
         return sb.length() == 0 ? "unknown" : sb.toString();
+    }
+
+    private void persistRewriteDiagnostics(RewriteResult rewritten) {
+        if (rewritten == null) return;
+        ContentValues v = new ContentValues();
+        v.put("rf_rewrite_reason", rewritten.reason == null ? "" : rewritten.reason);
+        v.put("rf_rewrite_codec", rewritten.codecId == null ? "" : rewritten.codecId);
+        v.put("rf_rewrite_old_payload_len", rewritten.oldPayloadLength);
+        v.put("rf_rewrite_new_payload_len", rewritten.newPayloadLength);
+        v.put("rf_rewrite_old_param_count", rewritten.oldParamCount);
+        v.put("rf_rewrite_new_param_count", rewritten.newParamCount);
+        writeValuesWithRetry(v, 8, 75L);
     }
 
     private void persistRfCaller(int pid, String caller) {

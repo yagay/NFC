@@ -20,7 +20,7 @@ public final class OplusTextConfigCodec implements RfPayloadCodec {
     private static final Pattern HEX_TOKEN = Pattern.compile("(?i)(?<![0-9A-F])([0-9A-F]{2})(?![0-9A-F])");
     private final RawNciCodec raw = new RawNciCodec();
 
-    @Override public String id() { return "oplus-text-config-v3"; }
+    @Override public String id() { return "oplus-text-config-v4"; }
 
     @Override public int inspect(byte[] input) {
         if (input == null || input.length == 0) return 0;
@@ -39,6 +39,7 @@ public final class OplusTextConfigCodec implements RfPayloadCodec {
         if (block.length < 4) return RewriteResult.skip(id(), "OPLUS_BLOCK_TOO_SHORT");
 
         RewriteResult nested = raw.rewrite(block, uid);
+        if (!nested.changed) nested = boundedExistingNfcid1Resize(block, uid, nested.reason);
         if (!nested.changed) nested = provenOplusAppend(block, uid, nested.reason);
         if (!nested.changed) return RewriteResult.skip(id(), "RAW_NCI:" + nested.reason);
 
@@ -47,6 +48,54 @@ public final class OplusTextConfigCodec implements RfPayloadCodec {
         return RewriteResult.changed(id(), nested.reason, rewritten.getBytes(StandardCharsets.UTF_8),
                 nested.oldPayloadLength, nested.newPayloadLength,
                 nested.oldParamCount, nested.newParamCount);
+    }
+
+    /**
+     * OPLUS wrappers on some vendor builds contain a valid CORE_SET_CONFIG frame that the strict
+     * generic parser cannot fully prove because of proprietary parameter encoding. Before adding a
+     * second LA_NFCID1, look for exactly one bounded existing 0x33 parameter with a stock/supported
+     * length. A unique 33 00 is especially important on OxygenOS/NXP: resizing it is reversible.
+     * If the candidate is ambiguous, do nothing and let the conservative append fallback decide.
+     */
+    private RewriteResult boundedExistingNfcid1Resize(byte[] block, byte[] uid, String strictReason) {
+        for (int i = 0; i + 3 < block.length; i++) {
+            if ((block[i] & 0xFF) != 0x20 || (block[i + 1] & 0xFF) != 0x02) continue;
+            int oldPayload = block[i + 2] & 0xFF;
+            int frameEnd = i + 3 + oldPayload;
+            if (oldPayload < 1 || frameEnd > block.length) continue;
+            int oldCount = block[i + 3] & 0xFF;
+
+            int candidate = -1;
+            int oldLen = -1;
+            for (int p = i + 4; p + 1 < frameEnd; p++) {
+                if ((block[p] & 0xFF) != 0x33) continue;
+                int len = block[p + 1] & 0xFF;
+                if (len != 0 && len != 4 && len != 7 && len != 10) continue;
+                if (p + 2 + len > frameEnd) continue;
+                if (candidate >= 0) {
+                    return RewriteResult.skip(id(), "OPLUS_AMBIGUOUS_EXISTING_LA_NFCID1_AFTER_" + strictReason);
+                }
+                candidate = p;
+                oldLen = len;
+            }
+            if (candidate < 0) continue;
+
+            int delta = uid.length - oldLen;
+            int newPayload = oldPayload + delta;
+            if (newPayload < 1 || newPayload > 0xFF) continue;
+            byte[] out = new byte[block.length + delta];
+            int valueOffset = candidate + 2;
+            System.arraycopy(block, 0, out, 0, valueOffset);
+            out[candidate + 1] = (byte) uid.length;
+            System.arraycopy(uid, 0, out, valueOffset, uid.length);
+            int oldTail = valueOffset + oldLen;
+            int newTail = valueOffset + uid.length;
+            System.arraycopy(block, oldTail, out, newTail, block.length - oldTail);
+            out[i + 2] = (byte) newPayload;
+            return RewriteResult.changed(id(), "OPLUS_BOUNDED_RESIZED_EXISTING_LA_NFCID1_AFTER_" + strictReason, out,
+                    oldPayload, newPayload, oldCount, oldCount);
+        }
+        return RewriteResult.skip(id(), strictReason);
     }
 
     private RewriteResult provenOplusAppend(byte[] block, byte[] uid, String strictReason) {

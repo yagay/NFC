@@ -12,12 +12,12 @@ android {
         applicationId = "com.yagay.nfcdoorcard"
         minSdk = 31
         targetSdk = 35
-        versionCode = 45
-        versionName = "1.0.44"
+        versionCode = 46
+        versionName = "1.0.45"
 
-        // Runtime protocol v6; complete com.yagay.nfcdoorcard namespace migration; hook build 32; early RF replay + Android 15+ controller attribution + reversible stock LA_NFCID1 resize + controller-epoch OFF/ON reapply; safe 4/7/10-byte NFCID1 and vendor-neutral NCI discovery.
+        // Runtime protocol v6; hook build 33; pre-Application adapter lifecycle bridge + deterministic natural RF rewrite + bounded OPLUS existing-NFCID1 recovery + controller-epoch OFF/ON watchdog; safe 4/7/10-byte NFCID1 and vendor-neutral NCI discovery.
         // Application ID, source namespace, Provider authority and LSPosed entry all use com.yagay.nfcdoorcard.
-        buildConfigField("int", "HOOK_BUILD", "32")
+        buildConfigField("int", "HOOK_BUILD", "33")
     }
 
     buildTypes {
