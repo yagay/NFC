@@ -15,7 +15,7 @@ android {
         versionCode = 50
         versionName = "1.0.49"
 
-        // Runtime protocol v7; hook build 35; 1.0.48 uses controller initialize/deinitialize and NfcService enable/disable as primary lifecycle recovery signals, with adapter broadcasts as fallback.
+        // Runtime protocol v7; hook build 36; 1.0.49 replays the exact previously native-accepted RF invocation after controller READY, with share-mode only as fallback and same-epoch failure-loop suppression.
         // Application ID, source namespace, Provider authority and LSPosed entry all use com.yagay.nfcdoorcard.
         buildConfigField("int", "HOOK_BUILD", "36")
     }
