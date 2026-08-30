@@ -12,13 +12,13 @@ android {
         applicationId = "com.yagay.nfcdoorcard"
         minSdk = 31
         targetSdk = 35
-        versionCode = 54
-        versionName = "1.0.53"
+        versionCode = 55
+        versionName = "1.0.54"
 
         // Runtime protocol v7; hook build 38; 1.0.51 extracts pure recovery policy, defers full trigger discovery until fallback is needed, and keeps exact replay as the controller-ready primary path.
         // Historical cleanup is behavior-preserving: controller lifecycle/epoch, exact replay, reversible STOP and restart fallback remain intact.
         // Application ID, source namespace, Provider authority and LSPosed entry all use com.yagay.nfcdoorcard.
-        buildConfigField("int", "HOOK_BUILD", "38")
+        buildConfigField("int", "HOOK_BUILD", "39")
     }
 
     buildTypes {

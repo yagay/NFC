@@ -59,6 +59,7 @@ public class NfcInjectionModule extends XposedModule {
     private final HookProfileStore profileStore = new HookProfileStore();
     private final NfcProcessVendorController vendorController = new NfcProcessVendorController();
     private final RefreshTriggerEngine refreshTriggerEngine = new RefreshTriggerEngine();
+    private final RfReplayEngine replayEngine = new RfReplayEngine();
 
     private volatile HookTarget activeTarget;
     private volatile ClassLoader nfcClassLoader;
@@ -97,10 +98,8 @@ public class NfcInjectionModule extends XposedModule {
     private volatile long confirmedTriggerGeneration = Long.MIN_VALUE;
     private volatile String pendingTriggerTarget = "";
 
-    // RF invocation snapshots back both startup bridging and controller-ready exact replay.
+    // Startup and controller-ready replay share the same tested replay engine.
     // Share-mode/Binder triggering remains compatibility fallback only.
-    private volatile RfInvocationSnapshot pendingRfInvocationSnapshot;
-    private volatile RfInvocationSnapshot lastVerifiedRfInvocation;
     private volatile boolean earlyReplayWorkerScheduled;
     private volatile long lifecycleFailureGeneration = Long.MIN_VALUE;
     private volatile long lifecycleFailureControllerEpoch = Long.MIN_VALUE;
@@ -534,7 +533,7 @@ public class NfcInjectionModule extends XposedModule {
                 }
                 persistRestoreState();
                 captureVerifiedRfInvocation(method, chain.getThisObject(), args, target, pid);
-                clearRfInvocationSnapshot(target.fingerprint());
+                replayEngine.clearPending(target.fingerprint());
                 if (lifecycleReapplyPending) {
                     if (recoveryWriteArmed) {
                         completeLifecycleReapply(cfg, uidHex, rewritten.codecId, outcome, target);
@@ -602,8 +601,7 @@ public class NfcInjectionModule extends XposedModule {
     }
 
     private boolean hasVerifiedReplayForCurrentProcess() {
-        RfInvocationSnapshot snapshot = lastVerifiedRfInvocation;
-        return snapshot != null && snapshot.capturedPid == Process.myPid();
+        return replayEngine.hasVerified(Process.myPid());
     }
 
     private NfcProcessVendorController.Result triggerRfRefresh(SimConfig cfg, boolean enabled, String reason) {
@@ -1039,13 +1037,12 @@ public class NfcInjectionModule extends XposedModule {
     private void captureRfInvocationSnapshot(Method method, Object receiver, Object[] args, int payloadArg,
                                           HookTarget target, int pid) {
         if (method == null || args == null || payloadArg < 0 || target == null) return;
-        Object[] snapshotArgs = cloneInvocationArgs(args);
-        RfInvocationSnapshot snapshot = new RfInvocationSnapshot(
-                method, receiver, snapshotArgs, target.fingerprint(), System.currentTimeMillis(), pid);
+        RfReplayEngine.Snapshot snapshot = replayEngine.capturePending(
+                method, receiver, args, target.fingerprint(), System.currentTimeMillis(), pid);
+        if (snapshot == null) return;
         synchronized (this) {
             // Keep the newest invocation from the active verified writer. During startup an OEM can
             // emit several config writes; replaying the latest one minimizes stale side effects.
-            pendingRfInvocationSnapshot = snapshot;
             if (earlyReplayWorkerScheduled) return;
             earlyReplayWorkerScheduled = true;
         }
@@ -1056,14 +1053,14 @@ public class NfcInjectionModule extends XposedModule {
 
     private void runEarlyRfReplayWorker() {
         long deadline = System.currentTimeMillis() + EARLY_REPLAY_TIMEOUT_MS;
-        RfInvocationSnapshot snapshot = null;
+        RfReplayEngine.Snapshot snapshot = null;
         boolean shouldFallback = false;
         try {
             while (System.currentTimeMillis() < deadline) {
-                snapshot = pendingRfInvocationSnapshot;
+                snapshot = replayEngine.pending();
                 if (snapshot == null) return;
                 if (snapshot.capturedPid != Process.myPid()) {
-                    clearRfInvocationSnapshot(snapshot.targetFingerprint);
+                    replayEngine.clearPending(snapshot.targetFingerprint);
                     return;
                 }
                 SimConfig cfg = readConfig();
@@ -1078,44 +1075,41 @@ public class NfcInjectionModule extends XposedModule {
                 boolean terminalDesiredApply = cfg.active && cfg.uid != null && cfg.generation > 0L &&
                         cfg.handledGeneration == cfg.generation && "SUCCESS".equals(cfg.commandStatus);
                 if (!terminalDesiredApply) {
-                    clearRfInvocationSnapshot(snapshot.targetFingerprint);
+                    replayEngine.clearPending(snapshot.targetFingerprint);
                     return;
                 }
                 String uidHex = normalizeUid(cfg.uid);
                 if (uidHex.length() != 8 && uidHex.length() != 14 && uidHex.length() != 20) {
-                    clearRfInvocationSnapshot(snapshot.targetFingerprint);
+                    replayEngine.clearPending(snapshot.targetFingerprint);
                     return;
                 }
                 if (isLifecycleVerified(cfg.generation, Process.myPid(), uidHex)) {
-                    clearRfInvocationSnapshot(snapshot.targetFingerprint);
+                    replayEngine.clearPending(snapshot.targetFingerprint);
                     return;
                 }
-                try {
-                    snapshot.method.setAccessible(true);
-                    synchronized (this) { recoveryWriteArmed = true; }
-                    Log.i(TAG, "EARLY RF REPLAY invoke target=" + snapshot.targetFingerprint +
-                            " generation=" + cfg.generation + " uid=" + uidHex + " pid=" + Process.myPid());
-                    // Exactly one replay attempt. The reflected call re-enters the installed RF hook,
-                    // which applies the current UID and records native/controller-epoch proof.
-                    snapshot.method.invoke(snapshot.receiver, cloneInvocationArgs(snapshot.args));
-                } catch (Throwable t) {
-                    Throwable cause = t.getCause() == null ? t : t.getCause();
+                synchronized (this) { recoveryWriteArmed = true; }
+                Log.i(TAG, "EARLY RF REPLAY invoke target=" + snapshot.targetFingerprint +
+                        " generation=" + cfg.generation + " uid=" + uidHex + " pid=" + Process.myPid());
+                // Exactly one replay attempt. The reflected call re-enters the installed RF hook,
+                // which applies the current UID and records native/controller-epoch proof.
+                RfReplayEngine.ReplayResult replay = replayEngine.invoke(snapshot);
+                if (!replay.invoked && replay.error != null) {
                     Log.w(TAG, "EARLY RF REPLAY failed target=" + snapshot.targetFingerprint + " " +
-                            cause.getClass().getSimpleName() + ": " + cause.getMessage());
+                            replay.error.getClass().getSimpleName() + ": " + replay.error.getMessage());
                 }
                 if (waitForLifecycleVerified(cfg.generation, Process.myPid(), uidHex, LIFECYCLE_NATURAL_WAIT_MS)) {
-                    clearRfInvocationSnapshot(snapshot.targetFingerprint);
+                    replayEngine.clearPending(snapshot.targetFingerprint);
                     return;
                 }
-                clearRfInvocationSnapshot(snapshot.targetFingerprint);
+                replayEngine.clearPending(snapshot.targetFingerprint);
                 shouldFallback = true;
                 break;
             }
-            if (pendingRfInvocationSnapshot != null) {
-                snapshot = pendingRfInvocationSnapshot;
+            if (replayEngine.pending() != null) {
+                snapshot = replayEngine.pending();
                 Log.w(TAG, "EARLY RF REPLAY config timeout target=" + snapshot.targetFingerprint +
                         " ageMs=" + (System.currentTimeMillis() - snapshot.capturedAt));
-                clearRfInvocationSnapshot(snapshot.targetFingerprint);
+                replayEngine.clearPending(snapshot.targetFingerprint);
             }
         } finally {
             synchronized (this) {
@@ -1131,10 +1125,9 @@ public class NfcInjectionModule extends XposedModule {
     private void captureVerifiedRfInvocation(Method method, Object receiver, Object[] args,
                                              HookTarget target, int pid) {
         if (method == null || args == null || target == null) return;
-        RfInvocationSnapshot snapshot = new RfInvocationSnapshot(
-                method, receiver, cloneInvocationArgs(args), target.fingerprint(),
-                System.currentTimeMillis(), pid);
-        lastVerifiedRfInvocation = snapshot;
+        RfReplayEngine.Snapshot snapshot = replayEngine.captureVerified(
+                method, receiver, args, target.fingerprint(), System.currentTimeMillis(), pid);
+        if (snapshot == null) return;
         ContentValues v = baseHookState();
         SimConfig cfg = cachedConfig;
         if (cfg.initialized && cfg.generation > 0L) v.put("state_generation", cfg.generation);
@@ -1147,53 +1140,35 @@ public class NfcInjectionModule extends XposedModule {
     }
 
     private boolean replayVerifiedRfInvocation(SimConfig cfg, String uidHex) {
-        RfInvocationSnapshot snapshot = lastVerifiedRfInvocation;
-        if (snapshot == null || snapshot.capturedPid != Process.myPid()) {
+        RfReplayEngine.Snapshot snapshot = replayEngine.verified(Process.myPid());
+        if (snapshot == null) {
             Log.i(TAG, "RF REPLAY unavailable generation=" + cfg.generation + " pid=" + Process.myPid());
             return false;
         }
-        try {
-            snapshot.method.setAccessible(true);
-            ContentValues v = baseHookState();
-            v.put("state_generation", cfg.generation);
-            v.put("rf_replay_status", "INVOKING");
-            v.put("rf_replay_target", snapshot.targetFingerprint);
-            v.put("rf_replay_captured_at", snapshot.capturedAt);
-            v.put("rf_replay_pid", snapshot.capturedPid);
-            writeValuesWithRetry(v, 8, 75L);
-            Log.i(TAG, "RF REPLAY invoke target=" + snapshot.targetFingerprint +
-                    " generation=" + cfg.generation + " uid=" + uidHex +
-                    " pid=" + Process.myPid());
-            snapshot.method.invoke(snapshot.receiver, cloneInvocationArgs(snapshot.args));
-            return true;
-        } catch (Throwable t) {
-            Throwable cause = t.getCause() == null ? t : t.getCause();
-            ContentValues v = baseHookState();
-            v.put("state_generation", cfg.generation);
-            v.put("rf_replay_status", "INVOKE_FAILED");
-            v.put("rf_replay_target", snapshot.targetFingerprint);
-            v.put("rf_replay_error", cause.getClass().getSimpleName() + ": " + cause.getMessage());
-            writeValuesWithRetry(v, 8, 75L);
-            Log.w(TAG, "RF REPLAY failed target=" + snapshot.targetFingerprint + " " +
-                    cause.getClass().getSimpleName() + ": " + cause.getMessage());
-            return false;
-        }
-    }
+        ContentValues v = baseHookState();
+        v.put("state_generation", cfg.generation);
+        v.put("rf_replay_status", "INVOKING");
+        v.put("rf_replay_target", snapshot.targetFingerprint);
+        v.put("rf_replay_captured_at", snapshot.capturedAt);
+        v.put("rf_replay_pid", snapshot.capturedPid);
+        writeValuesWithRetry(v, 8, 75L);
+        Log.i(TAG, "RF REPLAY invoke target=" + snapshot.targetFingerprint +
+                " generation=" + cfg.generation + " uid=" + uidHex +
+                " pid=" + Process.myPid());
+        RfReplayEngine.ReplayResult replay = replayEngine.invoke(snapshot);
+        if (replay.invoked) return true;
 
-    private synchronized void clearRfInvocationSnapshot(String targetFingerprint) {
-        RfInvocationSnapshot snapshot = pendingRfInvocationSnapshot;
-        if (snapshot == null) return;
-        if (targetFingerprint != null && !targetFingerprint.isEmpty() &&
-                !targetFingerprint.equals(snapshot.targetFingerprint)) return;
-        pendingRfInvocationSnapshot = null;
-    }
-
-    private static Object[] cloneInvocationArgs(Object[] args) {
-        Object[] copy = args.clone();
-        for (int i = 0; i < copy.length; i++) {
-            if (copy[i] instanceof byte[]) copy[i] = ((byte[]) copy[i]).clone();
-        }
-        return copy;
+        Throwable cause = replay.error;
+        ContentValues failure = baseHookState();
+        failure.put("state_generation", cfg.generation);
+        failure.put("rf_replay_status", "INVOKE_FAILED");
+        failure.put("rf_replay_target", snapshot.targetFingerprint);
+        failure.put("rf_replay_error", cause == null ? "unknown" :
+                cause.getClass().getSimpleName() + ": " + cause.getMessage());
+        writeValuesWithRetry(failure, 8, 75L);
+        Log.w(TAG, "RF REPLAY failed target=" + snapshot.targetFingerprint + " " +
+                (cause == null ? "unknown" : cause.getClass().getSimpleName() + ": " + cause.getMessage()));
+        return false;
     }
 
     private Application waitForApplication(long timeoutMs) {
@@ -1670,25 +1645,6 @@ public class NfcInjectionModule extends XposedModule {
 
     private static void sleep(long millis) {
         try { Thread.sleep(millis); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
-    }
-
-    private static final class RfInvocationSnapshot {
-        final Method method;
-        final Object receiver;
-        final Object[] args;
-        final String targetFingerprint;
-        final long capturedAt;
-        final int capturedPid;
-
-        RfInvocationSnapshot(Method method, Object receiver, Object[] args, String targetFingerprint,
-                          long capturedAt, int capturedPid) {
-            this.method = method;
-            this.receiver = receiver;
-            this.args = args;
-            this.targetFingerprint = targetFingerprint;
-            this.capturedAt = capturedAt;
-            this.capturedPid = capturedPid;
-        }
     }
 
     private static final class NativeOutcome {
