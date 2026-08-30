@@ -1,16 +1,12 @@
 name: Package migration
 
-on:
-  push:
-    branches:
-      - main
+on: [push]
 
 permissions:
   contents: write
 
 jobs:
   migrate:
-    if: ${{ github.event.head_commit.message == 'chore: retry complete package namespace migration' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -21,9 +17,7 @@ jobs:
         run: |
           set -euo pipefail
           old='com.example.nfcdoorcard'
-          new='com.yagay.nfcdoorcard'
-
-          git grep -Il -z "$old" | xargs -0 -r sed -i "s/com\.example\.nfcdoorcard/com.yagay.nfcdoorcard/g"
+          git grep -Il -z "$old" | xargs -0 -r sed -i 's/com\.example\.nfcdoorcard/com.yagay.nfcdoorcard/g'
 
           if [ -d app/src/main/java/com/example/nfcdoorcard ]; then
             mkdir -p app/src/main/java/com/yagay
@@ -50,8 +44,6 @@ jobs:
             echo 'legacy package path remains' >&2
             exit 1
           fi
-
-          git status --short
 
       - name: Commit and push
         run: |
