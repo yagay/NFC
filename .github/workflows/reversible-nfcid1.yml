@@ -1,0 +1,23 @@
+name: Reversible NFCID1 migration
+
+on: [push]
+
+permissions:
+  contents: write
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Apply reversible existing NFCID1 support
+        run: python3 scripts/enable_reversible_existing_nfcid1.py
+      - name: Commit support
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app/src/main/java/com/yagay/nfcdoorcard/xposed/NfcInjectionModule.java app/build.gradle.kts
+          git commit -m "fix: make existing LA_NFCID1 resize directly reversible" || exit 0
+          git push
