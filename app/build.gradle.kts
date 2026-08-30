@@ -12,12 +12,12 @@ android {
         applicationId = "com.example.nfcdoorcard"
         minSdk = 31
         targetSdk = 35
-        versionCode = 35
-        versionName = "1.0.34"
+        versionCode = 36
+        versionName = "1.0.35"
 
-        // Runtime protocol v6; lifecycle-aware terminal-state hook build 25 is verified with this app build.
+        // Runtime protocol v6; closed-loop startup lifecycle recovery hook build 26 is verified with this app build.
         // App architecture is split into runtime repository, NFC dispatcher, system service and UI components.
-        buildConfigField("int", "HOOK_BUILD", "25")
+        buildConfigField("int", "HOOK_BUILD", "26")
     }
 
     buildTypes {
