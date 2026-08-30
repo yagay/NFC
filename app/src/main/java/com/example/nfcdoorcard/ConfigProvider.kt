@@ -192,6 +192,11 @@ class ConfigProvider : ContentProvider() {
         val currentGeneration = (prefs.all[KEY_COMMAND_GENERATION] as? Number)?.toLong() ?: 0L
         val currentHandledGeneration = (prefs.all[KEY_COMMAND_HANDLED_GENERATION] as? Number)?.toLong() ?: Long.MIN_VALUE
         val currentCommandStatus = prefs.getString(KEY_COMMAND_STATUS, "IDLE") ?: "IDLE"
+        val currentCommandAction = prefs.getString(KEY_COMMAND_ACTION, "") ?: ""
+        val currentEffective = prefs.getString(KEY_EFFECTIVE_STATE, "UNKNOWN") ?: "UNKNOWN"
+        val currentConfidence = prefs.getString(KEY_VERIFICATION_CONFIDENCE, "NONE") ?: "NONE"
+        val currentRfAccepted = prefs.getBoolean(KEY_RF_ACCEPTED, false)
+        val simulationEnabled = prefs.getBoolean(KEY_SIMULATION_ENABLED, false)
         val stateGeneration = incoming.getAsLong(KEY_STATE_GENERATION)
         val declaredCommandGeneration = incoming.getAsLong(KEY_COMMAND_GENERATION)
 
@@ -208,14 +213,33 @@ class ConfigProvider : ContentProvider() {
             }
         }
 
-        // A completed generation is monotonic. com.android.nfc can restart after STOP, which resets
-        // the hook's in-memory completedGeneration cache. Late ContentObserver/trigger writes from
-        // the new process must still be allowed to refresh hook/runtime metadata, but they may not
-        // downgrade SUCCESS/FAILED back to RUNNING/TRIGGERED/STOPPING/PENDING for the same command.
+        // A completed command generation is monotonic, but lifecycle verification is allowed to
+        // reaffirm the same terminal result after com.android.nfc restarts. This keeps two rules:
+        // 1) a late RUNNING/TRIGGERED/STOPPING write can never downgrade SUCCESS/FAILED;
+        // 2) a new NFC process may replace old-PID RF evidence with fresh VERIFIED evidence only
+        //    when it preserves the exact terminal effective state expected by simulation_enabled.
         val terminalCurrentGeneration = currentGeneration > 0L &&
             currentHandledGeneration == currentGeneration && currentCommandStatus in TERMINAL_COMMAND_STATUSES
         val advancesCommand = declaredCommandGeneration != null && declaredCommandGeneration > currentGeneration
-        if (terminalCurrentGeneration && !advancesCommand) {
+        val expectedEffective = if (simulationEnabled) "ACTIVE" else "STOCK"
+        val incomingEffective = incoming.getAsString(KEY_EFFECTIVE_STATE)
+        val incomingOperation = incoming.getAsString(KEY_OPERATION_STATE)
+        val incomingConfidence = incoming.getAsString(KEY_VERIFICATION_CONFIDENCE)
+        val incomingAccepted = incoming.getAsBoolean(KEY_RF_ACCEPTED)
+        val incomingRfGeneration = incoming.getAsLong(KEY_RF_GENERATION)
+        val incomingRfPid = incoming.getAsInteger(KEY_RF_PID) ?: 0
+        val incomingRuntimePid = incoming.getAsInteger(KEY_RUNTIME_PID) ?: 0
+        val incomingCommandStatus = incoming.getAsString(KEY_COMMAND_STATUS)
+        val terminalReaffirmation = terminalCurrentGeneration && currentCommandStatus == "SUCCESS" &&
+            stateGeneration == currentGeneration && incomingRfGeneration == currentGeneration &&
+            incomingOperation == "IDLE" && incomingEffective == expectedEffective &&
+            incomingConfidence == "VERIFIED" && incomingAccepted == true && incomingRfPid > 0 &&
+            (incomingRuntimePid == 0 || incomingRuntimePid == incomingRfPid) &&
+            (incomingCommandStatus == null || incomingCommandStatus == "SUCCESS") &&
+            currentCommandAction == if (simulationEnabled) "APPLY" else "STOP" &&
+            currentEffective == expectedEffective && currentConfidence == "VERIFIED" && currentRfAccepted
+
+        if (terminalCurrentGeneration && !advancesCommand && !terminalReaffirmation) {
             val removed = mutableListOf<String>()
             TERMINAL_OWNED_KEYS.forEach { key ->
                 if (incoming.containsKey(key)) {
@@ -229,6 +253,17 @@ class ConfigProvider : ContentProvider() {
                     "Protected terminal generation=$currentGeneration status=$currentCommandStatus; stripped=${removed.joinToString(",")} uid=${Binder.getCallingUid()}"
                 )
             }
+        } else if (terminalReaffirmation) {
+            // Command history belongs to the original user command. Lifecycle confirmation may
+            // refresh RF evidence and semantic state but must not rewrite the historical command.
+            listOf(
+                KEY_COMMAND_CONSUMED_GENERATION, KEY_COMMAND_HANDLED_GENERATION, KEY_COMMAND_ACTION,
+                KEY_COMMAND_STATUS, KEY_COMMAND_DETAIL, KEY_COMMAND_PID
+            ).forEach { incoming.remove(it) }
+            Log.i(
+                "NfcConfigProvider",
+                "Accepted terminal lifecycle reaffirmation generation=$currentGeneration effective=$expectedEffective rfPid=$incomingRfPid uid=${Binder.getCallingUid()}"
+            )
         }
 
         val editor = prefs.edit()
