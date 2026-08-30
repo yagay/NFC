@@ -15,7 +15,7 @@ android {
         versionCode = 31
         versionName = "1.0.30"
 
-        // Runtime protocol v5; NFC lifecycle hook build 22 is validated with this app build.
+        // Runtime protocol v5; generalized NFC lifecycle hook build 23 is validated with this app build.
         // App architecture is split into runtime repository, NFC dispatcher, system service and UI components.
         buildConfigField("int", "HOOK_BUILD", "23")
     }
