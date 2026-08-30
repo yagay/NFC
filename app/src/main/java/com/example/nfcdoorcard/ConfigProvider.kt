@@ -196,6 +196,7 @@ class ConfigProvider : ContentProvider() {
         val currentEffective = prefs.getString(KEY_EFFECTIVE_STATE, "UNKNOWN") ?: "UNKNOWN"
         val currentConfidence = prefs.getString(KEY_VERIFICATION_CONFIDENCE, "NONE") ?: "NONE"
         val currentRfAccepted = prefs.getBoolean(KEY_RF_ACCEPTED, false)
+        val currentRfPid = (prefs.all[KEY_RF_PID] as? Number)?.toInt() ?: 0
         val simulationEnabled = prefs.getBoolean(KEY_SIMULATION_ENABLED, false)
         val stateGeneration = incoming.getAsLong(KEY_STATE_GENERATION)
         val declaredCommandGeneration = incoming.getAsLong(KEY_COMMAND_GENERATION)
@@ -266,6 +267,46 @@ class ConfigProvider : ContentProvider() {
             )
         }
 
+        // STOP has a special lifecycle proof: when a fully initialized *new* com.android.nfc
+        // process reports READY after a terminal verified STOP, the previous injected process is
+        // gone and the controller has been initialized with simulation_enabled=false. Adopt that
+        // new PID as fresh STOCK evidence. ACTIVE is intentionally excluded: it must be reapplied
+        // and receive a real RF/native success before its old evidence can become fresh again.
+        val announcedRuntimePid = incoming.getAsInteger(KEY_RUNTIME_PID) ?: 0
+        val announcedHookPid = incoming.getAsInteger(KEY_HOOK_PID) ?: 0
+        val announcedScopePid = incoming.getAsInteger(KEY_SCOPE_PID) ?: 0
+        val announcedHookReady = incoming.getAsBoolean(KEY_HOOK_INSTALLED) == true
+        val announcedScopeOk = incoming.getAsBoolean(KEY_SCOPE_OK) == true
+        val stockLifecycleAdoption = isNfcCaller() && terminalCurrentGeneration &&
+            currentCommandStatus == "SUCCESS" && currentCommandAction == "STOP" && !simulationEnabled &&
+            currentEffective == "STOCK" && currentConfidence == "VERIFIED" && currentRfAccepted &&
+            currentGeneration > 0L && currentRfPid > 0 && announcedRuntimePid > 0 &&
+            announcedRuntimePid != currentRfPid && announcedHookPid == announcedRuntimePid &&
+            announcedScopePid == announcedRuntimePid && announcedHookReady && announcedScopeOk
+        if (stockLifecycleAdoption) {
+            incoming.put(KEY_STATE_GENERATION, currentGeneration)
+            incoming.put(KEY_OPERATION_STATE, "IDLE")
+            incoming.put(KEY_EFFECTIVE_STATE, "STOCK")
+            incoming.put(KEY_VERIFICATION_CONFIDENCE, "VERIFIED")
+            incoming.put(KEY_RF_ACCEPTED, true)
+            incoming.put(KEY_RF_STATUS, "RF_STOCK_CONFIRMED_AFTER_PROCESS_START")
+            incoming.put(KEY_RF_UID, "")
+            incoming.put(KEY_RF_SOURCE, "process-start")
+            incoming.put(KEY_RF_RESULT, "0")
+            incoming.put(KEY_RF_NATIVE_RESULT, "process-start")
+            incoming.put(KEY_RF_NATIVE_RESULT_TYPE, "lifecycle")
+            incoming.put(KEY_RF_ERROR, "")
+            incoming.put(KEY_RF_PID, announcedRuntimePid)
+            incoming.put(KEY_RF_GENERATION, currentGeneration)
+            incoming.put(KEY_RF_VERIFICATION, "PROCESS_START")
+            incoming.put(KEY_FULL_DIAG_STAGE, "RF_STOCK_CONFIRMED_AFTER_PROCESS_START")
+            incoming.put(KEY_FULL_DIAG_SUMMARY, "Terminal STOP adopted by new NFC process; stock RF confirmed by process lifecycle")
+            Log.i(
+                "NfcConfigProvider",
+                "Adopted terminal STOCK generation=$currentGeneration oldRfPid=$currentRfPid newRfPid=$announcedRuntimePid"
+            )
+        }
+
         val editor = prefs.edit()
         incoming.keySet().forEach { key ->
             when (val value = incoming.get(key)) {
@@ -297,11 +338,16 @@ class ConfigProvider : ContentProvider() {
 
     private fun prefs(): SharedPreferences = context!!.createDeviceProtectedStorageContext().getSharedPreferences(PREFS_NAME, 0)
 
+    private fun isNfcCaller(): Boolean {
+        val callingUid = Binder.getCallingUid()
+        val packages = runCatching { context?.packageManager?.getPackagesForUid(callingUid) }.getOrNull()
+        return packages?.any { it == "com.android.nfc" } == true
+    }
+
     private fun isTrustedCaller(): Boolean {
         val callingUid = Binder.getCallingUid()
         if (callingUid == Process.myUid()) return true
-        val packages = runCatching { context?.packageManager?.getPackagesForUid(callingUid) }.getOrNull()
-        return packages?.any { it == "com.android.nfc" } == true
+        return isNfcCaller()
     }
 
     override fun getType(uri: Uri): String = "vnd.android.cursor.dir/vnd.$AUTHORITY.settings"
