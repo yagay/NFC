@@ -285,14 +285,15 @@ class ConfigProvider : ContentProvider() {
         val incomingRfPid = incoming.getAsInteger(KEY_RF_PID) ?: 0
         val incomingRuntimePid = incoming.getAsInteger(KEY_RUNTIME_PID) ?: 0
         val incomingCommandStatus = incoming.getAsString(KEY_COMMAND_STATUS)
+        val incomingRfControllerEpoch = incoming.getAsLong(KEY_RF_CONTROLLER_EPOCH)
+        val freshControllerProof = currentControllerEpoch > 0L && incomingRfControllerEpoch == currentControllerEpoch
         val terminalReaffirmation = terminalCurrentGeneration && currentCommandStatus == "SUCCESS" &&
             stateGeneration == currentGeneration && incomingRfGeneration == currentGeneration &&
             incomingOperation == "IDLE" && incomingEffective == expectedEffective &&
             incomingConfidence == "VERIFIED" && incomingAccepted == true && incomingRfPid > 0 &&
-            (incomingRuntimePid == 0 || incomingRuntimePid == incomingRfPid) &&
+            freshControllerProof && (incomingRuntimePid == 0 || incomingRuntimePid == incomingRfPid) &&
             (incomingCommandStatus == null || incomingCommandStatus == "SUCCESS") &&
-            currentCommandAction == expectedAction && currentEffective == expectedEffective &&
-            currentConfidence == "VERIFIED" && currentRfAccepted
+            currentCommandAction == expectedAction
 
         if (terminalCurrentGeneration && !advancesCommand && !terminalReaffirmation) {
             val removed = mutableListOf<String>()
