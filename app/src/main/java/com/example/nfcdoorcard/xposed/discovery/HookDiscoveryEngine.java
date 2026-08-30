@@ -46,7 +46,6 @@ public final class HookDiscoveryEngine {
         return top(out);
     }
 
-    /** Diagnostic-only candidates used to recover the refresh trigger after an OTA. */
     public List<HookTarget> discoverTriggerCandidates(ClassLoader classLoader) {
         List<HookTarget> out = new ArrayList<>();
         Set<String> seen = new HashSet<>();
@@ -106,8 +105,12 @@ public final class HookDiscoveryEngine {
         if (knownFamily) score += 80;
         if (cn.contains("nfc")) score += 20;
         if (cn.contains("nxp")) score += 20;
-        if (cn.contains("oplus") || cn.contains("native")) score += 10;
-        if (cn.contains("manager") || cn.contains("service")) score += 5;
+        if (cn.contains("native")) score += 60; // prefer deepest hardware-facing implementation
+        if (cn.contains("dhimpl") || cn.contains("devicehost")) score += 20;
+        if (cn.contains("adapterservice")) score -= 35; // Java wrapper, useful for observation but not mutation owner
+        if (cn.contains("oplus")) score += 10;
+        if (cn.contains("manager")) score += 10;
+        if (cn.contains("service")) score += 2;
         if (mn.contains("rf")) score += 25;
         if (mn.contains("config")) score += 30;
         if (mn.contains("param")) score += 20;
