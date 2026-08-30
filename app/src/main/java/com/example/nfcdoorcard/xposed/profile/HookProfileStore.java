@@ -17,7 +17,7 @@ import java.util.Map;
 /** Persists and validates the verified RF_CONFIG_WRITE target against the exact runtime. */
 public final class HookProfileStore {
     private static final Uri CONFIG_URI = Uri.parse("content://com.example.nfcdoorcard.config/settings");
-    private static final int PROFILE_SCHEMA = 2;
+    private static final int PROFILE_SCHEMA = 3;
 
     public void save(Application app, HookTarget target, String status) {
         if (app == null || target == null) return;
@@ -46,8 +46,7 @@ public final class HookProfileStore {
         if (!("VERIFIED".equals(status) || "CACHED_VERIFIED".equals(status))) return null;
         if (parseInt(state.get("profile_schema"), -1) != PROFILE_SCHEMA) return null;
         if (parseInt(state.get("profile_hook_build"), -1) != BuildConfig.HOOK_BUILD) return null;
-        if (!systemIdentityMatches(app,
-                state.get("profile_system_fingerprint"), state.get("profile_nfc_version"))) return null;
+        if (!systemIdentityMatches(app, state.get("profile_system_fingerprint"), state.get("profile_nfc_version"))) return null;
 
         String className = state.get("rf_hook_class");
         String methodName = state.get("rf_hook_method");
