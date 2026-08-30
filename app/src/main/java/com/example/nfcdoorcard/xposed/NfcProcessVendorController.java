@@ -53,6 +53,18 @@ final class NfcProcessVendorController {
      * that omits parameter 0x33 does not delete the value already stored by the controller.
      */
     Result reinitializeController() {
+        Result last = null;
+        for (int attempt = 0; attempt < 3; attempt++) {
+            last = reinitializeControllerOnce();
+            if (last.success || !isControllerTransient(last.stage)) return last;
+            if (attempt < 2) sleep(120L);
+        }
+        return last == null
+                ? new Result(false, "CONTROLLER_UNKNOWN", "No controller reinit result", null)
+                : new Result(false, last.stage, last.detail + " after transient retries", last.vendorDescriptor);
+    }
+
+    private Result reinitializeControllerOnce() {
         try {
             IBinder main = serviceManagerBinder();
             if (main == null || !main.isBinderAlive() || !main.pingBinder()) {
@@ -136,6 +148,10 @@ final class NfcProcessVendorController {
         return "MAIN_BINDER".equals(stage)
                 || "GET_VENDOR_BINDER".equals(stage)
                 || "EXCEPTION".equals(stage);
+    }
+
+    private static boolean isControllerTransient(String stage) {
+        return "CONTROLLER_BINDER".equals(stage) || "CONTROLLER_EXCEPTION".equals(stage);
     }
 
     private static IBinder serviceManagerBinder() {

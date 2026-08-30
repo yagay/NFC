@@ -3,11 +3,14 @@ package com.example.nfcdoorcard
 import android.app.PendingIntent
 import android.content.ContentValues
 import android.content.Intent
+import android.database.ContentObserver
 import android.nfc.NfcAdapter
 import android.nfc.Tag
 import android.nfc.tech.NfcA
 import android.os.Bundle
 import android.os.Environment
+import android.os.Handler
+import android.os.Looper
 import android.provider.MediaStore
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -183,26 +186,57 @@ class MainActivity : ComponentActivity() {
     private fun NfcAppContent() {
         val cards = savedCardsState
         var status by remember { mutableStateOf(RuntimeStatus()) }
-        var logText by remember { mutableStateOf("") }
+        val logLines = remember { mutableStateListOf<String>() }
         var selectedSource by remember { mutableStateOf(LogSource.STATUS) }
         var diagnosticRunning by remember { mutableStateOf(false) }
         var logsEnabled by remember { mutableStateOf(false) }
         var expandedUid by remember { mutableStateOf<String?>(null) }
         var operationMessage by remember { mutableStateOf<String?>(null) }
+        var providerRevision by remember { mutableLongStateOf(0L) }
         val logListState = rememberLazyListState()
 
+        DisposableEffect(Unit) {
+            val observer = object : ContentObserver(Handler(Looper.getMainLooper())) {
+                override fun onChange(selfChange: Boolean) { providerRevision++ }
+                override fun onChange(selfChange: Boolean, uri: android.net.Uri?) { providerRevision++ }
+            }
+            contentResolver.registerContentObserver(ConfigProvider.URI, true, observer)
+            providerRevision++
+            onDispose { runCatching { contentResolver.unregisterContentObserver(observer) } }
+        }
+
+        // Provider changes are the primary state clock: fast, event-driven and root-free.
+        LaunchedEffect(providerRevision) {
+            status = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                readRuntimeStatus(includeRootPid = false)
+            }
+        }
+
+        // External watchdog catches an NFC process replacement that happens before the new
+        // process has had a chance to publish fresh provider state. Keep this deliberately low-rate.
+        LaunchedEffect(Unit) {
+            while (true) {
+                status = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                    readRuntimeStatus(includeRootPid = true)
+                }
+                kotlinx.coroutines.delay(20_000)
+            }
+        }
+
+        // Logs are independent from runtime state. Only poll them while the log panel is open.
         LaunchedEffect(selectedSource, logsEnabled) {
+            logLines.clear()
+            if (!logsEnabled) return@LaunchedEffect
             while (true) {
                 val snapshot = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-                    val newStatus = readRuntimeStatus(includeRootPid = true)
-                    val logs = if (logsEnabled) fetchLogsSync(selectedSource) else ""
-                    newStatus to logs
+                    val newStatus = readRuntimeStatus(includeRootPid = false)
+                    val raw = fetchLogsSync(selectedSource)
+                    val text = if (selectedSource == LogSource.STATUS) buildStatusSummary(newStatus) + "\n\n" + raw else raw
+                    newStatus to boundedLogLines(text)
                 }
                 status = snapshot.first
-                logText = if (logsEnabled) {
-                    if (selectedSource == LogSource.STATUS) buildStatusSummary(snapshot.first) + "\n\n" + snapshot.second else snapshot.second
-                } else ""
-                kotlinx.coroutines.delay(if (logsEnabled) 2000 else 4000)
+                updateLogWindow(logLines, snapshot.second)
+                kotlinx.coroutines.delay(2000)
             }
         }
 
@@ -269,7 +303,7 @@ class MainActivity : ComponentActivity() {
                                     contentResolver.insert(ConfigProvider.URI, ContentValues().apply {
                                         put(ConfigProvider.KEY_DIAGNOSTIC_LOGGING_ENABLED, enabled)
                                     })
-                                    if (!enabled) logText = ""
+                                    if (!enabled) logLines.clear()
                                 }
                             )
                         }
@@ -289,9 +323,9 @@ class MainActivity : ComponentActivity() {
                             Modifier.fillMaxWidth().height(340.dp).padding(6.dp)
                                 .background(Color(0xFF050505), RoundedCornerShape(4.dp)).padding(6.dp)
                         ) {
-                            val lines = logText.split("\n")
                             LazyColumn(state = logListState, modifier = Modifier.fillMaxSize()) {
-                                items(lines) { line ->
+                                items(logLines.size) { index ->
+                                    val line = logLines[index]
                                     Text(
                                         line,
                                         color = when {
@@ -305,8 +339,8 @@ class MainActivity : ComponentActivity() {
                                     )
                                 }
                             }
-                            LaunchedEffect(selectedSource, lines.size) {
-                                if (lines.isNotEmpty()) logListState.scrollToItem((lines.size - 1).coerceAtLeast(0))
+                            LaunchedEffect(selectedSource, logLines.size) {
+                                if (logLines.isNotEmpty()) logListState.scrollToItem((logLines.size - 1).coerceAtLeast(0))
                             }
                         }
                     }
@@ -325,7 +359,7 @@ class MainActivity : ComponentActivity() {
                                 enabled = !diagnosticRunning,
                                 modifier = Modifier.weight(1f)
                             ) { Text(if (diagnosticRunning) "保存中" else "导出日志") }
-                            OutlinedButton(onClick = { AppLogger.clear(); logText = "" }, modifier = Modifier.weight(1f)) { Text("清空日志") }
+                            OutlinedButton(onClick = { AppLogger.clear(); logLines.clear() }, modifier = Modifier.weight(1f)) { Text("清空日志") }
                         }
                     }
                 }
@@ -816,6 +850,34 @@ class MainActivity : ComponentActivity() {
 
     private fun currentNfcPid(): String = runRootCmd("pidof com.android.nfc 2>/dev/null | awk '{print ${'$'}1}'", 5, 4096)
         .lineSequence().firstOrNull { it.trim().matches(Regex("\\d+")) }?.trim().orEmpty()
+
+    private fun boundedLogLines(text: String, maxLines: Int = 1800): List<String> {
+        if (text.isEmpty()) return emptyList()
+        val lines = text.lineSequence().toList()
+        return if (lines.size <= maxLines) lines else lines.takeLast(maxLines)
+    }
+
+    /**
+     * Applies the smallest prefix/suffix diff possible to the Compose state list instead of
+     * replacing/splitting the entire log inside composition every refresh. The window is bounded
+     * by boundedLogLines(), so memory and recomposition cost stay predictable.
+     */
+    private fun updateLogWindow(target: MutableList<String>, incoming: List<String>) {
+        var prefix = 0
+        val commonLimit = minOf(target.size, incoming.size)
+        while (prefix < commonLimit && target[prefix] == incoming[prefix]) prefix++
+
+        var suffix = 0
+        while (suffix < commonLimit - prefix &&
+            target[target.size - 1 - suffix] == incoming[incoming.size - 1 - suffix]) {
+            suffix++
+        }
+
+        val removeUntil = target.size - suffix
+        for (i in removeUntil - 1 downTo prefix) target.removeAt(i)
+        val addUntil = incoming.size - suffix
+        if (prefix < addUntil) target.addAll(prefix, incoming.subList(prefix, addUntil))
+    }
 
     private fun loadCards(): List<CardModel> {
         val prefs = getSharedPreferences("cards", 0)

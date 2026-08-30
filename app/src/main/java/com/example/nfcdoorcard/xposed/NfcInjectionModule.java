@@ -80,7 +80,6 @@ public class NfcInjectionModule extends XposedModule {
             return;
         }
 
-        persistTriggerCandidates(pid, discoveryEngine.discoverTriggerCandidates(cl));
         List<HookTarget> installTargets = new ArrayList<>();
         HookTarget cached = profileStore.loadValid(app, cl);
         if (cached != null) {
@@ -91,6 +90,9 @@ public class NfcInjectionModule extends XposedModule {
             Log.i(TAG, "PROFILE HIT target=" + cached + " pid=" + pid);
         } else {
             learningMode = true;
+            // Trigger candidate discovery is diagnostic-only. Avoid the expensive DEX walk on
+            // the verified-profile fast path; only refresh it when RF profile discovery is needed.
+            persistTriggerCandidates(pid, discoveryEngine.discoverTriggerCandidates(cl));
             reportStatusWithRetry(pid, false, 0, "DISCOVERING", "Profile invalid/missing; learning deepest RF_CONFIG_WRITE", null);
             List<HookTarget> candidates = discoveryEngine.discoverRfCandidates(cl);
             persistDiscoveryCandidates(pid, candidates);
