@@ -38,6 +38,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var rootShell: RootShell
     private lateinit var nfcSystemService: NfcSystemService
     private lateinit var runtimeRepository: RuntimeStatusRepository
+    private lateinit var configClient: ConfigClient
     private val operationExecutor = Executors.newSingleThreadExecutor()
     private val diagnosticExecutor = Executors.newSingleThreadExecutor()
     private var scannedCardState by mutableStateOf<CardModel?>(null)
@@ -51,6 +52,7 @@ class MainActivity : ComponentActivity() {
         rootShell = RootShell(this)
         nfcSystemService = NfcSystemService(rootShell)
         runtimeRepository = RuntimeStatusRepository(this, nfcSystemService)
+        configClient = ConfigClient(contentResolver)
         savedCardsState = cardRepository.load()
         AppLogger.i("NFC controller started; LSPosed in-process command engine enabled")
         setContent { MaterialTheme { Surface(Modifier.fillMaxSize()) { NfcAppContent() } } }
@@ -189,9 +191,7 @@ class MainActivity : ComponentActivity() {
                                 checked = logsEnabled,
                                 onCheckedChange = { enabled ->
                                     logsEnabled = enabled
-                                    contentResolver.insert(ConfigProvider.URI, ContentValues().apply {
-                                        put(ConfigProvider.KEY_DIAGNOSTIC_LOGGING_ENABLED, enabled)
-                                    })
+                                    configClient.setDiagnosticLogging(enabled)
                                     if (!enabled) logLines.clear()
                                 }
                             )
@@ -307,37 +307,7 @@ class MainActivity : ComponentActivity() {
 
             if (!isStopSuccess(state, generation) && isCurrentCommandGeneration(generation)) {
                 val currentPid = currentNfcPid().toIntOrNull() ?: state.currentPid
-                val providerBeforeStockConfirm = readProviderMap()
-                val previousControllerEpoch = providerBeforeStockConfirm[ConfigProvider.KEY_CONTROLLER_EPOCH]?.toLongOrNull() ?: 0L
-                val stockControllerEpoch = maxOf(previousControllerEpoch + 1L, System.currentTimeMillis())
-                contentResolver.insert(ConfigProvider.URI, ContentValues().apply {
-                    put(ConfigProvider.KEY_STATE_GENERATION, generation)
-                    put(ConfigProvider.KEY_COMMAND_CONSUMED_GENERATION, generation)
-                    put(ConfigProvider.KEY_COMMAND_HANDLED_GENERATION, generation)
-                    put(ConfigProvider.KEY_COMMAND_ACTION, "STOP")
-                    put(ConfigProvider.KEY_COMMAND_STATUS, "SUCCESS")
-                    put(ConfigProvider.KEY_COMMAND_DETAIL, "Stock RF restored by NFC process restart fallback")
-                    put(ConfigProvider.KEY_COMMAND_PID, currentPid)
-                    put(ConfigProvider.KEY_OPERATION_STATE, "IDLE")
-                    put(ConfigProvider.KEY_EFFECTIVE_STATE, "STOCK")
-                    put(ConfigProvider.KEY_VERIFICATION_CONFIDENCE, "VERIFIED")
-                    put(ConfigProvider.KEY_RF_ACCEPTED, true)
-                    put(ConfigProvider.KEY_RF_NATIVE_RESULT, "process-restart")
-                    put(ConfigProvider.KEY_RF_NATIVE_RESULT_TYPE, "lifecycle")
-                    put(ConfigProvider.KEY_RUNTIME_PID, currentPid)
-                    put(ConfigProvider.KEY_RF_STATUS, "RF_STOCK_RESTORED_BY_RESTART")
-                    put(ConfigProvider.KEY_RF_UID, "")
-                    put(ConfigProvider.KEY_RF_SOURCE, "process-restart")
-                    put(ConfigProvider.KEY_RF_RESULT, "0")
-                    put(ConfigProvider.KEY_RF_ERROR, "")
-                    put(ConfigProvider.KEY_RF_PID, currentPid)
-                    put(ConfigProvider.KEY_RF_GENERATION, generation)
-                    put(ConfigProvider.KEY_CONTROLLER_EPOCH, stockControllerEpoch)
-                    put(ConfigProvider.KEY_RF_CONTROLLER_EPOCH, stockControllerEpoch)
-                    put(ConfigProvider.KEY_RF_VERIFICATION, "PROCESS_RESTART")
-                    put(ConfigProvider.KEY_FULL_DIAG_STAGE, "RF_STOCK_RESTORED_BY_RESTART")
-                    put(ConfigProvider.KEY_FULL_DIAG_SUMMARY, "Simulation disabled before NFC restart; stock RF reloaded by lifecycle reset")
-                })
+                configClient.confirmStockRestart(generation, currentPid)
                 state = readRuntimeStatus(includeRootPid = true)
             }
 
@@ -346,38 +316,8 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun publishCommand(enabled: Boolean, card: CardModel?): Long {
-        val currentMap = readProviderMap()
-        val previous = currentMap[ConfigProvider.KEY_COMMAND_GENERATION]?.toLongOrNull() ?: 0L
-        val generation = maxOf(previous + 1L, System.currentTimeMillis())
-        val action = if (enabled) "APPLY" else "STOP"
-        contentResolver.insert(ConfigProvider.URI, ContentValues().apply {
-            put(ConfigProvider.KEY_APP_BUILD, ConfigProvider.APP_BUILD)
-            put(ConfigProvider.KEY_STATE_GENERATION, generation)
-            put(ConfigProvider.KEY_SIMULATION_ENABLED, enabled)
-            if (card != null) {
-                put(ConfigProvider.KEY_UID, card.uid); put(ConfigProvider.KEY_SAK, card.sak); put(ConfigProvider.KEY_ATQA, card.atqa)
-            }
-            put(ConfigProvider.KEY_COMMAND_GENERATION, generation)
-            put(ConfigProvider.KEY_COMMAND_ACTION, action)
-            put(ConfigProvider.KEY_COMMAND_STATUS, "PENDING")
-            put(ConfigProvider.KEY_COMMAND_DETAIL, "Waiting for LSPosed NFC process command engine")
-            put(ConfigProvider.KEY_COMMAND_PID, 0)
-            put(ConfigProvider.KEY_OPERATION_STATE, if (enabled) "APPLYING" else "STOPPING")
-            put(ConfigProvider.KEY_EFFECTIVE_STATE, "UNKNOWN")
-            put(ConfigProvider.KEY_VERIFICATION_CONFIDENCE, "PENDING")
-            put(ConfigProvider.KEY_RF_ACCEPTED, false)
-            put(ConfigProvider.KEY_RF_NATIVE_RESULT, "")
-            put(ConfigProvider.KEY_RF_NATIVE_RESULT_TYPE, "")
-            put(ConfigProvider.KEY_RF_STATUS, if (enabled) "WAITING" else "STOPPING")
-            put(ConfigProvider.KEY_RF_UID, ""); put(ConfigProvider.KEY_RF_SOURCE, ""); put(ConfigProvider.KEY_RF_RESULT, "")
-            put(ConfigProvider.KEY_RF_ERROR, ""); put(ConfigProvider.KEY_RF_PID, 0); put(ConfigProvider.KEY_RF_GENERATION, generation)
-            put(ConfigProvider.KEY_RF_VERIFICATION, "")
-            put(ConfigProvider.KEY_FULL_DIAG_STAGE, "COMMAND_PENDING")
-            put(ConfigProvider.KEY_FULL_DIAG_SUMMARY, "$action generation=$generation published by app")
-        })
-        return generation
-    }
+    private fun publishCommand(enabled: Boolean, card: CardModel?): Long =
+        configClient.publishCommand(enabled, card)
 
     private fun restartNfcProcessKeepingEnabled(reason: String): String =
         nfcSystemService.restartNfcProcessKeepingEnabled(reason)
