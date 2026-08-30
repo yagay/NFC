@@ -24,6 +24,7 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
       - name: Apply generalization patch
         run: |
+          sed -i "s/versionCode = 29/versionCode = 30/; s/versionCode = 30', 'versionCode = 30/versionCode = 30', 'versionCode = 31/" .github/scripts/generalize_hook.py
           python3 - <<'PY'
           from pathlib import Path
           p = Path('.github/scripts/generalize_hook.py')
