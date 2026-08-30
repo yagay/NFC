@@ -42,6 +42,9 @@ public class NfcInjectionModule extends XposedModule {
     private static final long LIFECYCLE_NATURAL_WAIT_MS = 1_200L;
     private static final long LIFECYCLE_TRIGGER_WAIT_MS = 1_600L;
     private static final long LIFECYCLE_TOTAL_TIMEOUT_MS = 9_000L;
+    private static final long LIFECYCLE_MIN_SETTLE_MS = 1_200L;
+    private static final long LIFECYCLE_RF_QUIET_MS = 700L;
+    private static final long LIFECYCLE_SETTLE_MAX_WAIT_MS = 3_500L;
     private static final int LIFECYCLE_MAX_TRIGGER_ATTEMPTS = 3;
     private static final long EARLY_CONFIG_WAIT_MS = 200L;
     private static final long EARLY_CONFIG_RETRY_MS = 20L;
@@ -67,6 +70,13 @@ public class NfcInjectionModule extends XposedModule {
     private volatile boolean lifecycleReapplyPending;
     private volatile long lifecycleRecoveryGeneration = Long.MIN_VALUE;
     private volatile long lifecycleRecoveryStartedAt;
+    private volatile boolean lifecycleWorkerRunning;
+    private volatile long lifecycleWorkerGeneration = Long.MIN_VALUE;
+    private volatile long rfWriteSequence;
+    private volatile long lastRfWriteAt;
+    private volatile boolean finalReapplyArmed;
+    private volatile long finalReapplyBaselineSequence;
+    private volatile long finalVerifiedSequence;
     private volatile String earlyHookFingerprint = "";
     private volatile long lastTriggeredGeneration = Long.MIN_VALUE;
     private volatile long completedGeneration = Long.MIN_VALUE;
@@ -267,6 +277,12 @@ public class NfcInjectionModule extends XposedModule {
                 }
             }
 
+            // Every active-owner RF write participates in lifecycle settling. A native-successful
+            // startup write is only provisional: later OEM/HAL initialization can still overwrite it.
+            // The lifecycle worker waits for a quiet period and then requires a strictly newer final
+            // RF write before publishing FINAL VERIFIED state.
+            long observedRfSequence = noteRfWriteObserved(cfg, target, pid);
+
             // A natural RF write in a new NFC process is the best lifecycle recovery trigger. Mark
             // it as a lifecycle reapply before mutating so a successful native result updates only
             // observed RF evidence; the original user APPLY command history remains untouched.
@@ -383,8 +399,12 @@ public class NfcInjectionModule extends XposedModule {
                 persistRestoreState();
                 clearEarlyRfInvocation(target.fingerprint());
                 if (lifecycleReapplyPending) {
-                    completeLifecycleReapply(cfg, uidHex, rewritten.codecId, outcome, target);
-                    finishLifecycleRecovery(cfg.generation);
+                    if (isFinalReapplyWrite(cfg.generation, observedRfSequence)) {
+                        completeLifecycleReapply(cfg, uidHex, rewritten.codecId, outcome, target, observedRfSequence);
+                        finishLifecycleRecovery(cfg.generation);
+                    } else {
+                        recordLifecycleProvisional(cfg, uidHex, rewritten.codecId, outcome, target, observedRfSequence);
+                    }
                 } else if (!isGenerationCompleted(cfg.generation, pid)) {
                     completeCommand(cfg, "RF_UID_APPLIED", uidHex, rewritten.codecId, outcome,
                             "UID applied by verified target " + target.className + "#" + target.methodName +
@@ -554,6 +574,11 @@ public class NfcInjectionModule extends XposedModule {
             lifecycleReapplyPending = false;
             lifecycleRecoveryGeneration = Long.MIN_VALUE;
             lifecycleRecoveryStartedAt = 0L;
+            lifecycleWorkerRunning = false;
+            lifecycleWorkerGeneration = Long.MIN_VALUE;
+            finalReapplyArmed = false;
+            finalReapplyBaselineSequence = rfWriteSequence;
+            finalVerifiedSequence = 0L;
         }
         clearTriggerWindow(cfg.generation);
         Log.i(TAG, "CONTROLLER EPOCH advanced reason=" + reason + " generation=" + cfg.generation +
@@ -578,23 +603,32 @@ public class NfcInjectionModule extends XposedModule {
         }
 
         synchronized (this) {
-            if (lifecycleReapplyPending && lifecycleRecoveryGeneration == cfg.generation) return;
+            // lifecycleReapplyPending can be set by an early natural RF write before this worker
+            // starts. It must NOT be used as a worker-deduplication flag, otherwise that early
+            // provisional write prevents the later final reapply from ever running.
+            if (lifecycleWorkerRunning && lifecycleWorkerGeneration == cfg.generation) return;
+            lifecycleWorkerRunning = true;
+            lifecycleWorkerGeneration = cfg.generation;
             lifecycleReapplyPending = true;
             lifecycleRecoveryGeneration = cfg.generation;
-            lifecycleRecoveryStartedAt = System.currentTimeMillis();
+            if (lifecycleRecoveryStartedAt == 0L) lifecycleRecoveryStartedAt = System.currentTimeMillis();
+            finalReapplyArmed = false;
+            finalReapplyBaselineSequence = rfWriteSequence;
         }
 
-        persistRefreshRuntime("LIFECYCLE_WAITING_NATURAL_RF", "", reason, cfg.generation, false);
+        persistRefreshRuntime("LIFECYCLE_SETTLING", "", reason, cfg.generation, false);
         Log.i(TAG, "LIFECYCLE RECOVERY start reason=" + reason + " generation=" + cfg.generation +
-                " uid=" + uidHex + " pid=" + pid);
+                " uid=" + uidHex + " pid=" + pid + " sequence=" + rfWriteSequence);
 
         try {
-            // Give the NFC stack a short chance to perform its own startup RF configuration. The
-            // early hook will mutate that current OEM payload if it occurs.
-            if (waitForLifecycleVerified(cfg.generation, pid, uidHex, LIFECYCLE_NATURAL_WAIT_MS)) return;
-
             long deadline = lifecycleRecoveryStartedAt + LIFECYCLE_TOTAL_TIMEOUT_MS;
-            String lastFailure = "No RF_CONFIG_WRITE observed";
+            long settleBudget = Math.min(LIFECYCLE_SETTLE_MAX_WAIT_MS,
+                    Math.max(0L, deadline - System.currentTimeMillis()));
+            boolean settled = waitForRfSettled(cfg.generation, settleBudget);
+            Log.i(TAG, "LIFECYCLE SETTLE result=" + settled + " generation=" + cfg.generation +
+                    " sequence=" + rfWriteSequence + " lastRfWriteAt=" + lastRfWriteAt);
+
+            String lastFailure = settled ? "No final RF_CONFIG_WRITE observed" : "RF startup did not become quiet before final trigger";
             for (int attempt = 1; attempt <= LIFECYCLE_MAX_TRIGGER_ATTEMPTS && System.currentTimeMillis() < deadline; attempt++) {
                 SimConfig latest = readConfig();
                 if (!latest.initialized || !latest.active || latest.generation != cfg.generation) {
@@ -602,31 +636,68 @@ public class NfcInjectionModule extends XposedModule {
                     break;
                 }
 
+                // Before every final trigger, allow any newly-arrived OEM initialization write to
+                // settle. This avoids racing a late stock CORE_SET_CONFIG with our final reapply.
+                long remainingBeforeTrigger = Math.max(0L, deadline - System.currentTimeMillis());
+                if (attempt > 1 && remainingBeforeTrigger > 0L) {
+                    waitForRfSettled(cfg.generation, Math.min(LIFECYCLE_SETTLE_MAX_WAIT_MS, remainingBeforeTrigger));
+                }
+
+                long baseline;
+                synchronized (this) {
+                    baseline = rfWriteSequence;
+                    finalReapplyBaselineSequence = baseline;
+                    finalReapplyArmed = true;
+                }
+                persistRfSequenceState("FINAL_TRIGGER_ARMED", cfg.generation, baseline, lastRfWriteAt);
+
                 NfcProcessVendorController.Result trigger = triggerRfRefresh(
-                        latest, true, "lifecycle:" + reason + ":attempt-" + attempt, LIFECYCLE_TRIGGER_RF_WINDOW_MS);
+                        latest, true, "lifecycle-final:" + reason + ":attempt-" + attempt, LIFECYCLE_TRIGGER_RF_WINDOW_MS);
                 lastFailure = trigger.stage + ": " + trigger.detail;
-                Log.i(TAG, "LIFECYCLE RECOVERY trigger attempt=" + attempt + " stage=" + trigger.stage +
-                        " success=" + trigger.success + " generation=" + cfg.generation + " pid=" + pid);
+                Log.i(TAG, "LIFECYCLE FINAL trigger attempt=" + attempt + " stage=" + trigger.stage +
+                        " success=" + trigger.success + " generation=" + cfg.generation + " pid=" + pid +
+                        " baselineSequence=" + baseline);
 
                 long remaining = Math.max(0L, deadline - System.currentTimeMillis());
                 long wait = Math.min(LIFECYCLE_TRIGGER_WAIT_MS, remaining);
                 if (wait > 0L && waitForLifecycleVerified(cfg.generation, pid, uidHex, wait)) return;
 
-                // A vendor fallback invocation itself passes through the hooked Java method and can
-                // populate RefreshTriggerEngine. The next iteration therefore prefers the verified
-                // in-process instance automatically instead of repeatedly using Binder fallback.
-                if (confirmedTriggerGeneration == cfg.generation &&
-                        waitForLifecycleVerified(cfg.generation, pid, uidHex, Math.min(500L, remaining))) return;
+                synchronized (this) {
+                    // If no strictly newer accepted RF write completed final verification, disarm
+                    // before the next settling/trigger attempt.
+                    if (finalReapplyBaselineSequence == baseline) finalReapplyArmed = false;
+                }
             }
 
             if (!isLifecycleVerified(cfg.generation, pid, uidHex)) {
                 publishLifecycleFailure(cfg, uidHex,
-                        "No verified RF_CONFIG_WRITE in new NFC process within lifecycle recovery window; lastTrigger=" + lastFailure,
+                        "No FINAL verified RF_CONFIG_WRITE after startup settling; lastTrigger=" + lastFailure +
+                                "; sequence=" + rfWriteSequence + "; finalSequence=" + finalVerifiedSequence,
                         NativeOutcome.notInvoked());
             }
         } finally {
             if (!isLifecycleVerified(cfg.generation, pid, uidHex)) finishLifecycleRecovery(cfg.generation);
         }
+    }
+
+    private boolean waitForRfSettled(long generation, long timeoutMs) {
+        long end = System.currentTimeMillis() + Math.max(0L, timeoutMs);
+        while (System.currentTimeMillis() < end) {
+            SimConfig latest = readConfig();
+            if (!latest.initialized || !latest.active || latest.generation != generation) return false;
+            long now = System.currentTimeMillis();
+            long started;
+            long last;
+            synchronized (this) {
+                started = lifecycleRecoveryStartedAt;
+                last = lastRfWriteAt;
+            }
+            if (RfSettlingPolicy.isSettled(now, started, last, LIFECYCLE_MIN_SETTLE_MS, LIFECYCLE_RF_QUIET_MS)) {
+                return true;
+            }
+            sleep(100L);
+        }
+        return false;
     }
 
     private boolean waitForLifecycleVerified(long generation, int pid, String uid, long timeoutMs) {
@@ -671,6 +742,10 @@ public class NfcInjectionModule extends XposedModule {
         lifecycleReapplyPending = false;
         lifecycleRecoveryGeneration = Long.MIN_VALUE;
         lifecycleRecoveryStartedAt = 0L;
+        lifecycleWorkerRunning = false;
+        lifecycleWorkerGeneration = Long.MIN_VALUE;
+        finalReapplyArmed = false;
+        finalReapplyBaselineSequence = rfWriteSequence;
         if (generation > 0L) clearTriggerWindow(generation);
     }
 
@@ -1052,7 +1127,8 @@ public class NfcInjectionModule extends XposedModule {
     }
 
     private void completeLifecycleReapply(SimConfig cfg, String uid, String source,
-                                          NativeOutcome outcome, HookTarget target) {
+                                          NativeOutcome outcome, HookTarget target, long sequence) {
+        finalVerifiedSequence = sequence;
         ContentValues v = baseHookState();
         v.put("state_generation", cfg.generation);
         v.put("rf_status", "RF_UID_APPLIED");
@@ -1067,17 +1143,75 @@ public class NfcInjectionModule extends XposedModule {
         v.put("rf_generation", cfg.generation);
         v.put("rf_controller_epoch", cfg.controllerEpoch);
         v.put("rf_verification", confirmedTriggerGeneration == cfg.generation ?
-                "LIFECYCLE_REAPPLY_TRIGGER_CONFIRMED" : "LIFECYCLE_REAPPLY_NATIVE_RESULT");
+                "LIFECYCLE_FINAL_TRIGGER_CONFIRMED" : "LIFECYCLE_FINAL_NATIVE_RESULT");
+        v.put("rf_write_sequence", sequence);
+        v.put("rf_final_sequence", sequence);
+        v.put("rf_final_baseline_sequence", finalReapplyBaselineSequence);
+        v.put("rf_last_write_at", lastRfWriteAt);
+        v.put("rf_lifecycle_phase", "FINAL_VERIFIED");
         v.put("operation_state", "IDLE");
         v.put("effective_state", "ACTIVE");
         v.put("verification_confidence", "VERIFIED");
-        v.put("full_diag_stage", "LIFECYCLE_REAPPLY_SUCCESS");
-        v.put("full_diag_summary", "Saved UID automatically reapplied after NFC process/controller lifecycle via " +
-                target.className + "#" + target.methodName);
+        v.put("full_diag_stage", "LIFECYCLE_FINAL_REAPPLY_SUCCESS");
+        v.put("full_diag_summary", "Saved UID final-reapplied after RF startup quiet period via " +
+                target.className + "#" + target.methodName + "; sequence=" + sequence);
         writeValuesWithRetry(v, 20, 100L);
         clearTriggerWindow(cfg.generation);
-        Log.i(TAG, "LIFECYCLE REAPPLY success generation=" + cfg.generation + " uid=" + uid +
-                " target=" + target.fingerprint() + " pid=" + Process.myPid());
+        Log.i(TAG, "LIFECYCLE FINAL REAPPLY success generation=" + cfg.generation + " uid=" + uid +
+                " target=" + target.fingerprint() + " pid=" + Process.myPid() + " sequence=" + sequence +
+                " baseline=" + finalReapplyBaselineSequence);
+    }
+
+    private long noteRfWriteObserved(SimConfig cfg, HookTarget target, int pid) {
+        long sequence;
+        long now = System.currentTimeMillis();
+        synchronized (this) {
+            sequence = ++rfWriteSequence;
+            lastRfWriteAt = now;
+        }
+        persistRfSequenceState("RF_WRITE_OBSERVED", cfg.generation, sequence, now);
+        if (cfg.diagnostics) {
+            Log.i(TAG, "RF_SEQUENCE observed sequence=" + sequence + " generation=" + cfg.generation +
+                    " target=" + target.fingerprint() + " pid=" + pid + " finalArmed=" + finalReapplyArmed +
+                    " finalBaseline=" + finalReapplyBaselineSequence);
+        }
+        return sequence;
+    }
+
+    private synchronized boolean isFinalReapplyWrite(long generation, long sequence) {
+        return lifecycleReapplyPending && lifecycleRecoveryGeneration == generation && finalReapplyArmed &&
+                RfSettlingPolicy.isStrictlyNewer(sequence, finalReapplyBaselineSequence);
+    }
+
+    private void recordLifecycleProvisional(SimConfig cfg, String uid, String source, NativeOutcome outcome,
+                                            HookTarget target, long sequence) {
+        ContentValues v = new ContentValues();
+        v.put("state_generation", cfg.generation);
+        v.put("rf_write_sequence", sequence);
+        v.put("rf_provisional_sequence", sequence);
+        v.put("rf_provisional_uid", uid == null ? "" : uid);
+        v.put("rf_provisional_source", source == null ? "" : source);
+        v.put("rf_provisional_native_result", outcome == null ? "" : outcome.rawValue);
+        v.put("rf_provisional_target", target == null ? "" : target.fingerprint());
+        v.put("rf_last_write_at", lastRfWriteAt);
+        v.put("rf_lifecycle_phase", "PROVISIONAL_STARTUP");
+        writeValuesWithRetry(v, 8, 75L);
+        persistRefreshRuntime("LIFECYCLE_PROVISIONAL", target == null ? "" : target.fingerprint(),
+                "natural-rf", cfg.generation, false);
+        Log.i(TAG, "LIFECYCLE PROVISIONAL generation=" + cfg.generation + " uid=" + uid +
+                " sequence=" + sequence + " target=" + (target == null ? "" : target.fingerprint()) +
+                " native=" + (outcome == null ? "" : outcome.rawValue));
+    }
+
+    private void persistRfSequenceState(String phase, long generation, long sequence, long writeAt) {
+        ContentValues v = new ContentValues();
+        if (generation > 0L) v.put("state_generation", generation);
+        v.put("rf_write_sequence", sequence);
+        v.put("rf_last_write_at", writeAt);
+        v.put("rf_lifecycle_phase", phase == null ? "" : phase);
+        v.put("rf_final_sequence", finalVerifiedSequence);
+        v.put("rf_final_baseline_sequence", finalReapplyBaselineSequence);
+        writeValuesWithRetry(v, 8, 75L);
     }
 
     private void completeControllerReinit(SimConfig cfg, String detail) {
