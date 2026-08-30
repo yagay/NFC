@@ -1,0 +1,311 @@
+from pathlib import Path
+
+
+def replace_once(text, old, new, label):
+    count = text.count(old)
+    if count != 1:
+        raise SystemExit(f"{label}: expected exactly one match, got {count}")
+    return text.replace(old, new, 1)
+
+
+# Version bump: state protocol changed.
+p = Path("app/build.gradle.kts")
+s = p.read_text()
+s = replace_once(s, "versionCode = 26", "versionCode = 27", "versionCode")
+s = replace_once(s, 'versionName = "1.0.25"', 'versionName = "1.0.26"', "versionName")
+s = replace_once(s, 'buildConfigField("int", "HOOK_BUILD", "20")', 'buildConfigField("int", "HOOK_BUILD", "21")', "HOOK_BUILD")
+p.write_text(s)
+
+# Provider schema + consumed-generation protocol field.
+p = Path("app/src/main/java/com/example/nfcdoorcard/ConfigProvider.kt")
+s = p.read_text()
+s = replace_once(s, "const val STATE_SCHEMA_VERSION = 4", "const val STATE_SCHEMA_VERSION = 5", "state schema")
+s = replace_once(
+    s,
+    'const val KEY_COMMAND_GENERATION = "command_generation"\n        const val KEY_COMMAND_HANDLED_GENERATION = "command_handled_generation"',
+    'const val KEY_COMMAND_GENERATION = "command_generation"\n        const val KEY_COMMAND_CONSUMED_GENERATION = "command_consumed_generation"\n        const val KEY_COMMAND_HANDLED_GENERATION = "command_handled_generation"',
+    "provider consumed key",
+)
+s = replace_once(
+    s,
+    "KEY_COMMAND_GENERATION, KEY_COMMAND_HANDLED_GENERATION, KEY_COMMAND_ACTION,",
+    "KEY_COMMAND_GENERATION, KEY_COMMAND_CONSUMED_GENERATION, KEY_COMMAND_HANDLED_GENERATION, KEY_COMMAND_ACTION,",
+    "runtime keys",
+)
+p.write_text(s)
+
+# Hook: RESTART_REQUIRED is a handoff, not a failure/completion.
+p = Path("app/src/main/java/com/example/nfcdoorcard/xposed/NfcInjectionModule.java")
+s = p.read_text()
+start = s.index("        if (!cfg.active && controllerReinitRequired) {")
+end = s.index("        NfcProcessVendorController.Result trigger = vendorController.setShareMode(cfg.active);", start)
+new_branch = """        if (!cfg.active && controllerReinitRequired) {
+            NfcProcessVendorController.Result stopTrigger = vendorController.setShareMode(false);
+            String detail = stopTrigger.detail + "; appended LA_NFCID1 requires NFC process/controller restart";
+            requestControllerRestart(cfg, detail);
+            return;
+        }
+
+"""
+s = s[:start] + new_branch + s[end:]
+
+needle = """        cachedConfig = cfg;
+        int pid = Process.myPid();
+        if (isGenerationCompleted(cfg.generation, pid) || cfg.generation == lastTriggeredGeneration) return;
+"""
+repl = """        cachedConfig = cfg;
+        int pid = Process.myPid();
+        if ("RESTART_REQUIRED".equals(cfg.commandStatus) &&
+                cfg.consumedGeneration == cfg.generation && cfg.handledGeneration != cfg.generation) {
+            return;
+        }
+        if (isGenerationCompleted(cfg.generation, pid) || cfg.generation == lastTriggeredGeneration) return;
+"""
+s = replace_once(s, needle, repl, "restart handoff guard")
+
+# Terminal success = consumed + completed.
+s = replace_once(
+    s,
+    'v.put("command_handled_generation", cfg.generation);\n        v.put("command_action", cfg.active ? "APPLY" : "STOP");',
+    'v.put("command_consumed_generation", cfg.generation);\n        v.put("command_handled_generation", cfg.generation);\n        v.put("command_action", cfg.active ? "APPLY" : "STOP");',
+    "complete consumed",
+)
+
+marker = "    private void failCommand(SimConfig cfg, String rfState, String uid, String detail, NativeOutcome outcome) {"
+if s.count(marker) != 1:
+    raise SystemExit("failCommand marker mismatch")
+handoff = """    private void requestControllerRestart(SimConfig cfg, String detail) {
+        int pid = Process.myPid();
+        ContentValues v = baseHookState();
+        v.put("state_generation", cfg.generation);
+        v.put("command_consumed_generation", cfg.generation);
+        v.put("command_action", "STOP");
+        v.put("command_status", "RESTART_REQUIRED");
+        v.put("command_detail", detail == null ? "Controller restart required" : detail);
+        v.put("command_pid", pid);
+        v.put("rf_status", "RF_CONTROLLER_RESTART_REQUIRED");
+        v.put("rf_uid", "");
+        v.put("rf_source", activeCodec == null ? "" : activeCodec);
+        v.put("rf_result", "");
+        v.put("rf_native_result", "");
+        v.put("rf_native_result_type", "not-invoked");
+        v.put("rf_accepted", false);
+        v.put("rf_error", "");
+        v.put("rf_pid", pid);
+        v.put("rf_generation", cfg.generation);
+        v.put("rf_verification", "LIFECYCLE_PENDING");
+        v.put("operation_state", "RESETTING_CONTROLLER");
+        v.put("effective_state", "UNKNOWN");
+        v.put("verification_confidence", "LIFECYCLE_PENDING");
+        v.put("full_diag_stage", "RF_CONTROLLER_RESTART_REQUIRED");
+        v.put("full_diag_summary", detail == null ? "Controller restart required" : detail);
+        writeValuesWithRetry(v, 20, 100L);
+    }
+
+"""
+s = s.replace(marker, handoff + marker, 1)
+
+# True terminal failure = consumed + completed.
+s = replace_once(
+    s,
+    'v.put("command_handled_generation", cfg.generation);\n        v.put("command_action", cfg.active ? "APPLY" : "STOP");',
+    'v.put("command_consumed_generation", cfg.generation);\n        v.put("command_handled_generation", cfg.generation);\n        v.put("command_action", cfg.active ? "APPLY" : "STOP");',
+    "fail consumed",
+)
+
+old = """        if ("RUNNING".equals(status) || "TRIGGERED".equals(status)) {
+            v.put("operation_state", "APPLY".equals(action) ? "APPLYING" : "STOPPING");
+            v.put("verification_confidence", "PENDING");
+        }
+        if (handled) v.put("command_handled_generation", generation);
+"""
+new = """        if ("RUNNING".equals(status) || "TRIGGERED".equals(status)) {
+            v.put("command_consumed_generation", generation);
+            v.put("operation_state", "APPLY".equals(action) ? "APPLYING" : "STOPPING");
+            v.put("verification_confidence", "PENDING");
+        }
+        if (handled) {
+            v.put("command_consumed_generation", generation);
+            v.put("command_handled_generation", generation);
+        }
+"""
+s = replace_once(s, old, new, "simple command consumed")
+
+s = replace_once(s, "long generation = 0L, handled = Long.MIN_VALUE;", "long generation = 0L, consumed = Long.MIN_VALUE, handled = Long.MIN_VALUE;", "readConfig longs")
+s = replace_once(
+    s,
+    'else if ("command_generation".equals(key)) generation = parseLong(value, 0L);\n                else if ("command_handled_generation".equals(key)) handled = parseLong(value, Long.MIN_VALUE);',
+    'else if ("command_generation".equals(key)) generation = parseLong(value, 0L);\n                else if ("command_consumed_generation".equals(key)) consumed = parseLong(value, Long.MIN_VALUE);\n                else if ("command_handled_generation".equals(key)) handled = parseLong(value, Long.MIN_VALUE);',
+    "readConfig consumed parse",
+)
+s = replace_once(
+    s,
+    "return new SimConfig(true, active, uid, diagnostics, generation, handled, action, status, commandPid);",
+    "return new SimConfig(true, active, uid, diagnostics, generation, consumed, handled, action, status, commandPid);",
+    "SimConfig creation",
+)
+old = """        final long generation, handledGeneration;
+        final int commandPid;
+        SimConfig(boolean initialized, boolean active, String uid, boolean diagnostics, long generation,
+                  long handledGeneration, String commandAction, String commandStatus, int commandPid) {
+            this.initialized = initialized; this.active = active; this.uid = uid; this.diagnostics = diagnostics;
+            this.generation = generation; this.handledGeneration = handledGeneration; this.commandAction = commandAction;
+            this.commandStatus = commandStatus; this.commandPid = commandPid;
+        }
+        static SimConfig uninitialized() { return new SimConfig(false, false, null, false, 0L, Long.MIN_VALUE, "", "", 0); }
+"""
+new = """        final long generation, consumedGeneration, handledGeneration;
+        final int commandPid;
+        SimConfig(boolean initialized, boolean active, String uid, boolean diagnostics, long generation,
+                  long consumedGeneration, long handledGeneration, String commandAction, String commandStatus, int commandPid) {
+            this.initialized = initialized; this.active = active; this.uid = uid; this.diagnostics = diagnostics;
+            this.generation = generation; this.consumedGeneration = consumedGeneration; this.handledGeneration = handledGeneration;
+            this.commandAction = commandAction; this.commandStatus = commandStatus; this.commandPid = commandPid;
+        }
+        static SimConfig uninitialized() { return new SimConfig(false, false, null, false, 0L, Long.MIN_VALUE, Long.MIN_VALUE, "", "", 0); }
+"""
+s = replace_once(s, old, new, "SimConfig fields")
+p.write_text(s)
+
+# App: consumed vs completed semantics + frozen diagnostic snapshot.
+p = Path("app/src/main/java/com/example/nfcdoorcard/MainActivity.kt")
+s = p.read_text()
+s = replace_once(
+    s,
+    "val commandGeneration: Long = 0,\n    val handledGeneration: Long = Long.MIN_VALUE,",
+    "val commandGeneration: Long = 0,\n    val consumedGeneration: Long = Long.MIN_VALUE,\n    val handledGeneration: Long = Long.MIN_VALUE,",
+    "RuntimeStatus consumed",
+)
+s = replace_once(
+    s,
+    'val commandInFlight = status.commandStatus in setOf("PENDING", "RUNNING", "TRIGGERED") &&\n            status.commandGeneration != status.handledGeneration',
+    'val commandInFlight = status.commandStatus in setOf("PENDING", "RUNNING", "TRIGGERED", "RESTART_REQUIRED") &&\n            status.commandGeneration != status.handledGeneration',
+    "commandInFlight",
+)
+s = replace_once(
+    s,
+    '"执行中 · ${status.operationState} · gen=${status.commandGeneration}/${status.handledGeneration} · ${status.commandAction.ifBlank { "UNKNOWN" }} · pid=${status.commandPid}"',
+    '"执行中 · ${status.operationState} · gen=${status.commandGeneration} consumed=${status.consumedGeneration} completed=${status.handledGeneration} · ${status.commandAction.ifBlank { "UNKNOWN" }} · pid=${status.commandPid}"',
+    "command display",
+)
+s = replace_once(
+    s,
+    "put(ConfigProvider.KEY_STATE_GENERATION, generation)\n                    put(ConfigProvider.KEY_COMMAND_HANDLED_GENERATION, generation)",
+    "put(ConfigProvider.KEY_STATE_GENERATION, generation)\n                    put(ConfigProvider.KEY_COMMAND_CONSUMED_GENERATION, generation)\n                    put(ConfigProvider.KEY_COMMAND_HANDLED_GENERATION, generation)",
+    "fallback generations",
+)
+s = replace_once(
+    s,
+    'if (state.commandGeneration == generation && state.handledGeneration == generation && state.commandStatus == "FAILED") return state',
+    'if (state.commandGeneration == generation && state.commandStatus == "RESTART_REQUIRED" && state.consumedGeneration == generation) return state\n            if (state.commandGeneration == generation && state.handledGeneration == generation && state.commandStatus == "FAILED") return state',
+    "wait restart required",
+)
+s = replace_once(
+    s,
+    'AppLogger.i("SIMULATION: STOP timeout snapshot before fallback generation=$generation\\n${buildStatusSummary(state)}\\nPROVIDER=${readProviderMap().toSortedMap()}")',
+    'AppLogger.i("SIMULATION: STOP handoff snapshot before fallback generation=$generation\\n${buildStatusSummary(state)}\\nPROVIDER=${readProviderMap().toSortedMap()}")',
+    "stop handoff log",
+)
+
+start = s.index("    private fun readRuntimeStatus(includeRootPid: Boolean = false): RuntimeStatus {")
+end = s.index("    private fun buildStatusSummary", start)
+decoder = '''    private fun readRuntimeStatus(includeRootPid: Boolean = false): RuntimeStatus {
+        val map = readProviderMap()
+        val rootPid = if (includeRootPid) currentNfcPid().toIntOrNull() else null
+        return decodeRuntimeStatus(map, rootPid)
+    }
+
+    private fun decodeRuntimeStatus(map: Map<String, String>, rootPid: Int?): RuntimeStatus {
+        val scopePid = map[ConfigProvider.KEY_SCOPE_PID]?.toIntOrNull() ?: 0
+        val hookPid = map[ConfigProvider.KEY_HOOK_PID]?.toIntOrNull() ?: 0
+        val runtimePid = map[ConfigProvider.KEY_RUNTIME_PID]?.toIntOrNull() ?: 0
+        val rfPid = map[ConfigProvider.KEY_RF_PID]?.toIntOrNull() ?: 0
+        val commandPid = map[ConfigProvider.KEY_COMMAND_PID]?.toIntOrNull() ?: 0
+        val currentPid = rootPid ?: runtimePid.takeIf { it > 0 }
+            ?: hookPid.takeIf { it > 0 } ?: commandPid.takeIf { it > 0 } ?: scopePid.takeIf { it > 0 } ?: rfPid
+        val hookBuild = map[ConfigProvider.KEY_HOOK_BUILD]?.toIntOrNull() ?: 0
+        val rawRfStatus = map[ConfigProvider.KEY_RF_STATUS] ?: "IDLE"
+        val rfFresh = currentPid > 0 && rfPid > 0 && rfPid == currentPid && (runtimePid == 0 || runtimePid == currentPid)
+        val restartTransition = map[ConfigProvider.KEY_COMMAND_STATUS] == "RESTART_REQUIRED" &&
+            map[ConfigProvider.KEY_COMMAND_GENERATION]?.toLongOrNull() == map[ConfigProvider.KEY_RF_GENERATION]?.toLongOrNull()
+        val visibleRfStatus = when {
+            rawRfStatus == "IDLE" -> "IDLE"
+            rfFresh -> rawRfStatus
+            restartTransition -> "RESETTING($rawRfStatus)"
+            rfPid == 0 && rawRfStatus in setOf("WAITING", "APPLYING", "STOPPING") -> rawRfStatus
+            else -> "STALE($rawRfStatus)"
+        }
+        val semanticVisible = rfFresh || rfPid == 0 || restartTransition
+        return RuntimeStatus(
+            appBuild = map[ConfigProvider.KEY_APP_BUILD]?.toIntOrNull() ?: 0,
+            hookBuild = hookBuild,
+            currentPid = currentPid,
+            runtimePid = runtimePid,
+            scopePid = scopePid,
+            hookPid = hookPid,
+            scopeOk = currentPid > 0 && scopePid == currentPid && map[ConfigProvider.KEY_SCOPE_OK].toBoolean(),
+            hookInstalled = currentPid > 0 && hookPid == currentPid && map[ConfigProvider.KEY_HOOK_INSTALLED].toBoolean(),
+            simulationEnabled = map[ConfigProvider.KEY_SIMULATION_ENABLED].toBoolean(),
+            selectedUid = map[ConfigProvider.KEY_UID]?.takeIf { it.isNotBlank() },
+            commandGeneration = map[ConfigProvider.KEY_COMMAND_GENERATION]?.toLongOrNull() ?: 0L,
+            consumedGeneration = map[ConfigProvider.KEY_COMMAND_CONSUMED_GENERATION]?.toLongOrNull() ?: Long.MIN_VALUE,
+            handledGeneration = map[ConfigProvider.KEY_COMMAND_HANDLED_GENERATION]?.toLongOrNull() ?: Long.MIN_VALUE,
+            commandAction = map[ConfigProvider.KEY_COMMAND_ACTION].orEmpty(),
+            commandStatus = map[ConfigProvider.KEY_COMMAND_STATUS] ?: "IDLE",
+            commandDetail = map[ConfigProvider.KEY_COMMAND_DETAIL]?.takeIf { it.isNotBlank() },
+            commandPid = commandPid,
+            operationState = if (semanticVisible) map[ConfigProvider.KEY_OPERATION_STATE] ?: "IDLE" else "STALE",
+            effectiveState = if (semanticVisible) map[ConfigProvider.KEY_EFFECTIVE_STATE] ?: "UNKNOWN" else "UNKNOWN",
+            verificationConfidence = if (semanticVisible) map[ConfigProvider.KEY_VERIFICATION_CONFIDENCE] ?: "NONE" else "NONE",
+            rfAccepted = rfFresh && map[ConfigProvider.KEY_RF_ACCEPTED].toBoolean(),
+            rfStatus = visibleRfStatus,
+            rfUid = if (rfFresh) map[ConfigProvider.KEY_RF_UID]?.takeIf { it.isNotBlank() } else null,
+            rfSource = if (rfFresh) map[ConfigProvider.KEY_RF_SOURCE]?.takeIf { it.isNotBlank() } else null,
+            rfResult = if (rfFresh) map[ConfigProvider.KEY_RF_RESULT]?.takeIf { it.isNotBlank() } else null,
+            rfNativeResult = if (rfFresh) map[ConfigProvider.KEY_RF_NATIVE_RESULT]?.takeIf { it.isNotBlank() } else null,
+            rfNativeResultType = if (rfFresh) map[ConfigProvider.KEY_RF_NATIVE_RESULT_TYPE]?.takeIf { it.isNotBlank() } else null,
+            rfError = if (rfFresh) map[ConfigProvider.KEY_RF_ERROR]?.takeIf { it.isNotBlank() } else null,
+            rfPid = rfPid,
+            rfGeneration = map[ConfigProvider.KEY_RF_GENERATION]?.toLongOrNull() ?: 0L,
+            rfVerification = if (rfFresh) map[ConfigProvider.KEY_RF_VERIFICATION]?.takeIf { it.isNotBlank() } else if (restartTransition) "LIFECYCLE_PENDING" else null,
+            fullDiagStage = map[ConfigProvider.KEY_FULL_DIAG_STAGE]?.takeIf { it.isNotBlank() },
+            fullDiagSummary = map[ConfigProvider.KEY_FULL_DIAG_SUMMARY]?.takeIf { it.isNotBlank() }
+        )
+    }
+
+'''
+s = s[:start] + decoder + s[end:]
+s = replace_once(
+    s,
+    'appendLine("COMMAND: generation=${s.commandGeneration} handled=${s.handledGeneration} action=${s.commandAction} status=${s.commandStatus} detail=${s.commandDetail}")',
+    'appendLine("COMMAND: generation=${s.commandGeneration} consumed=${s.consumedGeneration} completed=${s.handledGeneration} action=${s.commandAction} status=${s.commandStatus} detail=${s.commandDetail}")',
+    "summary generations",
+)
+old = '''    private fun buildFullDiagnosticReport(): String = buildString {
+        val s = readRuntimeStatus(includeRootPid = true)
+        appendLine("=== NFC FULL CHECK ${BuildConfig.VERSION_NAME} ===")
+        appendLine("Generated: ${System.currentTimeMillis()}")
+'''
+new = '''    private fun buildFullDiagnosticReport(): String = buildString {
+        val snapshotAt = System.currentTimeMillis()
+        val snapshotMap = readProviderMap().toMap()
+        val snapshotPid = currentNfcPid().toIntOrNull()
+        val s = decodeRuntimeStatus(snapshotMap, snapshotPid)
+        appendLine("=== NFC FULL CHECK ${BuildConfig.VERSION_NAME} ===")
+        appendLine("Generated: $snapshotAt")
+        appendLine("Snapshot: frozen provider + NFC PID; generation=${s.commandGeneration} pid=${s.currentPid}")
+'''
+s = replace_once(s, old, new, "diagnostic snapshot start")
+old = '        LogSource.entries.forEach { source -> appendLine(); appendLine("=== LOG SOURCE: ${source.name} / ${source.label} ==="); appendLine(fetchLogsSync(source)) }'
+new = '''        LogSource.entries.forEach { source ->
+            appendLine(); appendLine("=== LOG SOURCE: ${source.name} / ${source.label} ===")
+            if (source == LogSource.PROVIDER) {
+                appendLine("=== PROVIDER STATE (FROZEN SNAPSHOT) ===")
+                snapshotMap.toSortedMap().forEach { (k, v) -> appendLine("$k=$v") }
+                appendLine("current_nfc_pid=${snapshotPid ?: 0}")
+            } else {
+                appendLine(fetchLogsSync(source))
+            }
+        }'''
+s = replace_once(s, old, new, "diagnostic provider snapshot")
+p.write_text(s)
