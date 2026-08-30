@@ -51,6 +51,7 @@ public class NfcInjectionModule extends XposedModule {
     private final ExecutorService stateSyncExecutor = Executors.newSingleThreadExecutor(r -> daemon(r, "NfcUIDSim-StateSync"));
     private final ExecutorService commandExecutor = Executors.newSingleThreadExecutor(r -> daemon(r, "NfcUIDSim-Command"));
     private final ExecutorService lifecycleExecutor = Executors.newSingleThreadExecutor(r -> daemon(r, "NfcUIDSim-Lifecycle"));
+    private final ExecutorService earlyReplayExecutor = Executors.newSingleThreadExecutor(r -> daemon(r, "NfcUIDSim-EarlyReplay"));
     private final HookDiscoveryEngine discoveryEngine = new HookDiscoveryEngine();
     private final RfPayloadEngine payloadEngine = new RfPayloadEngine();
     private final HookProfileStore profileStore = new HookProfileStore();
@@ -781,22 +782,33 @@ public class NfcInjectionModule extends XposedModule {
         }
         Log.i(TAG, "EARLY RF REPLAY captured target=" + target.fingerprint() + " pid=" + pid +
                 " payloadArg=" + payloadArg);
-        lifecycleExecutor.execute(this::runEarlyRfReplayWorker);
+        earlyReplayExecutor.execute(this::runEarlyRfReplayWorker);
     }
 
     private void runEarlyRfReplayWorker() {
         long deadline = System.currentTimeMillis() + EARLY_REPLAY_TIMEOUT_MS;
+        EarlyRfInvocation snapshot = null;
+        boolean shouldFallback = false;
         try {
             while (System.currentTimeMillis() < deadline) {
-                EarlyRfInvocation snapshot = pendingEarlyRfInvocation;
+                snapshot = pendingEarlyRfInvocation;
                 if (snapshot == null) return;
+                if (snapshot.capturedPid != Process.myPid()) {
+                    clearEarlyRfInvocation(snapshot.targetFingerprint);
+                    return;
+                }
                 SimConfig cfg = readConfig();
                 if (!cfg.initialized) {
                     sleep(EARLY_REPLAY_RETRY_MS);
                     continue;
                 }
                 cachedConfig = cfg;
-                if (!cfg.active || cfg.uid == null || cfg.generation <= 0L) {
+                // Early replay is lifecycle recovery, not a second command executor. Only replay a
+                // durable successful APPLY whose RF proof is stale. Pending/failed generations are
+                // left to the normal command bridge so replay cannot silently change command semantics.
+                boolean terminalDesiredApply = cfg.active && cfg.uid != null && cfg.generation > 0L &&
+                        cfg.handledGeneration == cfg.generation && "SUCCESS".equals(cfg.commandStatus);
+                if (!terminalDesiredApply) {
                     clearEarlyRfInvocation(snapshot.targetFingerprint);
                     return;
                 }
@@ -813,28 +825,34 @@ public class NfcInjectionModule extends XposedModule {
                     snapshot.method.setAccessible(true);
                     Log.i(TAG, "EARLY RF REPLAY invoke target=" + snapshot.targetFingerprint +
                             " generation=" + cfg.generation + " uid=" + uidHex + " pid=" + Process.myPid());
+                    // Exactly one replay attempt. The reflected call re-enters the installed RF hook,
+                    // which applies the current UID and records native/controller-epoch proof.
                     snapshot.method.invoke(snapshot.receiver, cloneInvocationArgs(snapshot.args));
                 } catch (Throwable t) {
                     Throwable cause = t.getCause() == null ? t : t.getCause();
                     Log.w(TAG, "EARLY RF REPLAY failed target=" + snapshot.targetFingerprint + " " +
                             cause.getClass().getSimpleName() + ": " + cause.getMessage());
                 }
-                // A replayed invocation re-enters the installed RF hook. Require the same closed-loop
-                // native-accepted controller-epoch proof used by every other lifecycle path.
-                if (waitForLifecycleVerified(cfg.generation, Process.myPid(), uidHex, 800L)) {
+                if (waitForLifecycleVerified(cfg.generation, Process.myPid(), uidHex, LIFECYCLE_NATURAL_WAIT_MS)) {
                     clearEarlyRfInvocation(snapshot.targetFingerprint);
                     return;
                 }
-                sleep(EARLY_REPLAY_RETRY_MS);
+                clearEarlyRfInvocation(snapshot.targetFingerprint);
+                shouldFallback = true;
+                break;
             }
-            EarlyRfInvocation snapshot = pendingEarlyRfInvocation;
-            if (snapshot != null) {
-                Log.w(TAG, "EARLY RF REPLAY timeout target=" + snapshot.targetFingerprint +
+            if (pendingEarlyRfInvocation != null) {
+                snapshot = pendingEarlyRfInvocation;
+                Log.w(TAG, "EARLY RF REPLAY config timeout target=" + snapshot.targetFingerprint +
                         " ageMs=" + (System.currentTimeMillis() - snapshot.capturedAt));
+                clearEarlyRfInvocation(snapshot.targetFingerprint);
             }
         } finally {
             synchronized (this) { earlyReplayWorkerScheduled = false; }
         }
+        // Never monopolize the lifecycle executor. If the exact OEM invocation could not produce
+        // fresh native proof, fall back to the existing natural-wait -> Java trigger -> vendor path.
+        if (shouldFallback) scheduleLifecycleRecovery("early_rf_replay_fallback");
     }
 
     private synchronized void clearEarlyRfInvocation(String targetFingerprint) {
