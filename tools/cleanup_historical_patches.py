@@ -24,9 +24,6 @@ def remove_between(text: str, start: str, end: str, label: str) -> str:
 def main():
     text = MODULE.read_text()
 
-    # 1.0.46 settling/final-sequence machinery was built around the later-disproved assumption
-    # that recovery only needed a sufficiently late share-mode-triggered RF write. 1.0.49 proved
-    # the reliable primitive is exact invocation replay after a real controller READY edge.
     text = replace_once(text,
         "    private static final long LIFECYCLE_MIN_SETTLE_MS = 1_200L;\n"
         "    private static final long LIFECYCLE_RF_QUIET_MS = 700L;\n"
@@ -41,18 +38,17 @@ def main():
         "    private volatile long finalReapplyBaselineSequence;\n"
         "    private volatile long finalVerifiedSequence;\n",
         "    // Only an explicitly armed recovery write may publish lifecycle VERIFIED state.\n"
-        "    // Natural startup writes are still rewritten, but the controller-ready replay remains\n"
-        "    // the deterministic proof point that fixed OFF -> ON on the target device.\n"
+        "    // Natural startup writes are still rewritten, while controller-ready exact replay is\n"
+        "    // the deterministic proof point for OFF -> ON recovery.\n"
         "    private volatile boolean recoveryWriteArmed;\n",
         "replace final sequence fields")
 
-    # Use one snapshot type for both startup bridge and verified exact replay.
     text = text.replace("EarlyRfInvocation", "RfInvocationSnapshot")
 
-    # Remove the 1.0.46 per-write sequence observation block from the RF hot path.
-    start = "            // Every active-owner RF write participates in lifecycle settling."
-    end = "            // A natural RF write in a new NFC process is the best lifecycle recovery trigger."
-    text = remove_between(text, start, end, "remove hot-path settling observation")
+    text = remove_between(text,
+        "            // Every active-owner RF write participates in lifecycle settling.",
+        "            // A natural RF write in a new NFC process is the best lifecycle recovery trigger.",
+        "remove hot-path settling observation")
 
     old_accept = '''                if (lifecycleReapplyPending) {
                     if (isFinalReapplyWrite(cfg.generation, observedRfSequence)) {
@@ -73,7 +69,6 @@ def main():
                 } else if (!isGenerationCompleted(cfg.generation, pid)) {'''
     text = replace_once(text, old_accept, new_accept, "replace lifecycle accepted gate")
 
-    # Controller invalidation no longer maintains historical final-sequence state.
     text = replace_once(text,
         "            finalReapplyArmed = false;\n"
         "            finalReapplyBaselineSequence = rfWriteSequence;\n"
@@ -81,7 +76,6 @@ def main():
         "            recoveryWriteArmed = false;\n",
         "simplify invalidation state")
 
-    # Replace the entire lifecycle worker with controller-ready debounce -> exact replay -> fallback.
     start = "    private void runLifecycleRecovery(String reason) {"
     end = "    private boolean waitForRfSettled(long generation, long timeoutMs) {"
     a = text.find(start)
@@ -169,7 +163,6 @@ def main():
 '''
     text = text[:a] + replacement + text[b:]
 
-    # Remove waitForRfSettled entirely.
     text = remove_between(text,
         "    private boolean waitForRfSettled(long generation, long timeoutMs) {",
         "    private boolean waitForLifecycleVerified(long generation, int pid, String uid, long timeoutMs) {",
@@ -181,8 +174,6 @@ def main():
         "        recoveryWriteArmed = false;\n",
         "simplify finishLifecycleRecovery")
 
-    # Arm the startup replay itself so a successful early replay can finish lifecycle verification
-    # without falling through a second recovery worker.
     old_early_invoke = '''                try {
                     snapshot.method.setAccessible(true);
                     Log.i(TAG, "EARLY RF REPLAY invoke target=" + snapshot.targetFingerprint +
@@ -201,19 +192,19 @@ def main():
                     snapshot.method.invoke(snapshot.receiver, cloneInvocationArgs(snapshot.args));
                 } catch (Throwable t) {'''
     text = replace_once(text, old_early_invoke, new_early_invoke, "arm startup replay")
-    text = replace_once(text,
-        "                if (waitForLifecycleVerified(cfg.generation, Process.myPid(), uidHex, LIFECYCLE_NATURAL_WAIT_MS)) {\n",
-        "                if (waitForLifecycleVerified(cfg.generation, Process.myPid(), uidHex, LIFECYCLE_NATURAL_WAIT_MS)) {\n"
-        "                    synchronized (this) { recoveryWriteArmed = false; }\n",
-        "disarm successful startup replay")
-    text = replace_once(text,
-        "                clearEarlyRfInvocation(snapshot.targetFingerprint);\n                shouldFallback = true;\n",
-        "                synchronized (this) { recoveryWriteArmed = false; }\n"
-        "                clearEarlyRfInvocation(snapshot.targetFingerprint);\n"
-        "                shouldFallback = true;\n",
-        "disarm failed startup replay")
 
-    # Exact replay no longer needs historical sequence baselines.
+    # The startup worker always disarms in finally; this covers success, failure and timeout paths
+    # without duplicating state cleanup in several historical branches.
+    text = replace_once(text,
+        "        } finally {\n            synchronized (this) { earlyReplayWorkerScheduled = false; }\n        }\n",
+        "        } finally {\n"
+        "            synchronized (this) {\n"
+        "                earlyReplayWorkerScheduled = false;\n"
+        "                recoveryWriteArmed = false;\n"
+        "            }\n"
+        "        }\n",
+        "centralize startup replay disarm")
+
     text = replace_once(text,
         "    private boolean replayVerifiedRfInvocation(SimConfig cfg, String uidHex, long baseline) {",
         "    private boolean replayVerifiedRfInvocation(SimConfig cfg, String uidHex) {",
@@ -225,7 +216,6 @@ def main():
         "                    \" pid=\" + Process.myPid());",
         "simplify replay log")
 
-    # Replace lifecycle completion and remove all 1.0.46 provisional/final-sequence helpers.
     start = "    private void completeLifecycleReapply(SimConfig cfg, String uid, String source,"
     end = "    private void completeControllerReinit(SimConfig cfg, String detail) {"
     a = text.find(start)
@@ -263,7 +253,6 @@ def main():
 '''
     text = text[:a] + replacement + text[b:]
 
-    # Updated comment: startup replay and verified replay now share one snapshot representation.
     text = replace_once(text,
         "    // Cold-start bridge: if the first natural OEM RF write arrives before ConfigProvider is\n"
         "    // readable, capture that exact in-process invocation and replay it once durable desired\n"
@@ -272,13 +261,9 @@ def main():
         "    // Share-mode/Binder triggering remains compatibility fallback only.\n",
         "update snapshot comment")
 
-    # Rename exact replay telemetry wording; keep fields because they are useful diagnostics.
     text = text.replace("RF EXACT REPLAY", "RF REPLAY")
-
     MODULE.write_text(text)
 
-    # Delete unused experimental reflected controller reinitializer. Production STOP uses the
-    # process-restart barrier and lifecycle recovery uses exact replay instead.
     vendor = VENDOR.read_text()
     vendor = remove_between(vendor,
         "    /** Experimental lifecycle capability; normal STOP currently uses process restart. */",
@@ -287,17 +272,20 @@ def main():
     VENDOR.write_text(vendor)
 
     gradle = GRADLE.read_text()
-    gradle = replace_once(gradle, '        versionCode = 50\n        versionName = "1.0.49"\n',
-                          '        versionCode = 51\n        versionName = "1.0.50"\n', 'bump version')
+    gradle = replace_once(gradle,
+        '        versionCode = 50\n        versionName = "1.0.49"\n',
+        '        versionCode = 51\n        versionName = "1.0.50"\n',
+        'bump version')
     gradle = replace_once(gradle,
         '        // Runtime protocol v7; hook build 36; 1.0.49 replays the exact previously native-accepted RF invocation after controller READY, with share-mode only as fallback and same-epoch failure-loop suppression.\n',
         '        // Runtime protocol v7; hook build 37; 1.0.50 removes obsolete RF settling/final-sequence machinery and keeps controller-ready exact replay as the primary recovery path, with share-mode only as compatibility fallback.\n',
         'update build comment')
-    gradle = replace_once(gradle, '        buildConfigField("int", "HOOK_BUILD", "36")\n',
-                          '        buildConfigField("int", "HOOK_BUILD", "37")\n', 'bump hook build')
+    gradle = replace_once(gradle,
+        '        buildConfigField("int", "HOOK_BUILD", "36")\n',
+        '        buildConfigField("int", "HOOK_BUILD", "37")\n',
+        'bump hook build')
     GRADLE.write_text(gradle)
 
-    # Guard that historical settling symbols are truly gone.
     final = MODULE.read_text()
     retired = [
         "RfSettlingPolicy", "finalReapplyArmed", "finalReapplyBaselineSequence",
