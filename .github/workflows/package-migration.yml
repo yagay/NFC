@@ -1,0 +1,112 @@
+name: One-time package namespace migration
+
+on:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: write
+
+jobs:
+  migrate:
+    if: github.event.head_commit.message == 'chore: start complete package namespace migration'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Migrate package namespace completely
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          OLD_DOT='com.example.nfcdoorcard'
+          NEW_DOT='com.yagay.nfcdoorcard'
+          OLD_PATH='com/example/nfcdoorcard'
+          NEW_PATH='com/yagay/nfcdoorcard'
+
+          # Replace every textual reference: source packages/imports, namespace, Provider authority,
+          # Xposed java_init entry, ProGuard keep rules, CI assertions and documentation.
+          while IFS= read -r -d '' file; do
+            sed -i "s/${OLD_DOT//./\\.}/${NEW_DOT}/g; s#${OLD_PATH}#${NEW_PATH}#g" "$file"
+          done < <(grep -RIlZ --exclude-dir=.git -e "$OLD_DOT" -e "$OLD_PATH" . || true)
+
+          # Move source and test trees so physical paths match the new Java/Kotlin namespace.
+          if [ -d app/src/main/java/com/example/nfcdoorcard ]; then
+            mkdir -p app/src/main/java/com/yagay
+            git mv app/src/main/java/com/example/nfcdoorcard app/src/main/java/com/yagay/nfcdoorcard
+          fi
+          if [ -d app/src/test/java/com/example/nfcdoorcard ]; then
+            mkdir -p app/src/test/java/com/yagay
+            git mv app/src/test/java/com/example/nfcdoorcard app/src/test/java/com/yagay/nfcdoorcard
+          fi
+
+          # Package/Provider/Xposed identity changed, so publish a new app + hook build.
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('app/build.gradle.kts')
+          s = p.read_text()
+          s = s.replace('versionCode = 38', 'versionCode = 39')
+          s = s.replace('versionName = "1.0.37"', 'versionName = "1.0.38"')
+          s = s.replace('buildConfigField("int", "HOOK_BUILD", "26")', 'buildConfigField("int", "HOOK_BUILD", "27")')
+          s = s.replace('closed-loop startup lifecycle recovery hook build 26 is verified with this app build.',
+                        'runtime protocol v6; complete com.yagay.nfcdoorcard namespace migration; hook build 27.')
+          s = s.replace('The Android applicationId is com.yagay.nfcdoorcard; internal source namespace remains stable for Hook compatibility.',
+                        'Application ID, source namespace, Provider authority and LSPosed entry all use com.yagay.nfcdoorcard.')
+          p.write_text(s)
+          PY
+
+          # Replace obsolete README with current architecture/package identity summary.
+          cat > README.md <<'EOF'
+          # NFC Expert Pro
+
+          Android / LSPosed NFC UID simulation and diagnostics project for rooted devices.
+
+          ## Package identity
+
+          - Android applicationId / namespace: `com.yagay.nfcdoorcard`
+          - ConfigProvider authority: `com.yagay.nfcdoorcard.config`
+          - LSPosed entry: `com.yagay.nfcdoorcard.xposed.NfcInjectionModule`
+          - LSPosed scope: `com.android.nfc`
+
+          The legacy `com.example.nfcdoorcard` identity is intentionally not retained.
+
+          ## Runtime architecture
+
+          The app publishes desired APPLY/STOP state through ConfigProvider. The LSPosed module runs
+          inside `com.android.nfc`, discovers/verifies the OEM RF configuration writer, rewrites only
+          the observed NFCID1 field, and treats a simulation as verified only after a current-process
+          RF write is accepted by native code. Lifecycle recovery keeps old command history separate
+          from fresh RF evidence and never treats an old NFC process result as current success.
+
+          ## Build
+
+          GitHub Actions runs unit tests, Debug/Release builds, lint, APK signing/alignment checks,
+          Xposed metadata verification, package-name verification, and a hard check that the legacy
+          package identity is absent from the current source tree.
+          EOF
+
+          # Hard guarantee: no legacy package string or legacy package directory may survive.
+          if grep -RIn --exclude-dir=.git -E 'com\.example\.nfcdoorcard|com/example/nfcdoorcard' .; then
+            echo 'Legacy package reference remains' >&2
+            exit 1
+          fi
+          if find app/src -type d -path '*com/example/nfcdoorcard*' -print -quit | grep -q .; then
+            echo 'Legacy package directory remains' >&2
+            exit 1
+          fi
+
+          git status --short
+
+      - name: Commit migration
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'refactor: migrate all package identities to com.yagay.nfcdoorcard'
+          git push origin HEAD:main
