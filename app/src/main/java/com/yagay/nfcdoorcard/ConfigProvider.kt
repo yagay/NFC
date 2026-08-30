@@ -275,6 +275,13 @@ class ConfigProvider : ContentProvider() {
             announcedRuntimePid != currentRfPid && announcedHookPid == announcedRuntimePid &&
             announcedScopePid == announcedRuntimePid && announcedHookReady && announcedScopeOk
         if (stockLifecycleAdoption) {
+            // A new NFC process implies a fresh controller lifecycle. Advance the controller epoch
+            // and bind the STOCK proof to that same epoch so stale pre-restart RF evidence cannot
+            // be reused.
+            val previousControllerEpoch = (prefs.all[KEY_CONTROLLER_EPOCH] as? Number)?.toLong() ?: 0L
+            val stockControllerEpoch = maxOf(previousControllerEpoch + 1L, System.currentTimeMillis())
+            incoming.put(KEY_CONTROLLER_EPOCH, stockControllerEpoch)
+            incoming.put(KEY_RF_CONTROLLER_EPOCH, stockControllerEpoch)
             incoming.put(KEY_STATE_GENERATION, currentGeneration)
             incoming.put(KEY_OPERATION_STATE, "IDLE")
             incoming.put(KEY_EFFECTIVE_STATE, "STOCK")

@@ -325,6 +325,9 @@ class MainActivity : ComponentActivity() {
 
             if (!isStopSuccess(state, generation) && isCurrentCommandGeneration(generation)) {
                 val currentPid = currentNfcPid().toIntOrNull() ?: state.currentPid
+                val providerBeforeStockConfirm = readProviderMap()
+                val previousControllerEpoch = providerBeforeStockConfirm[ConfigProvider.KEY_CONTROLLER_EPOCH]?.toLongOrNull() ?: 0L
+                val stockControllerEpoch = maxOf(previousControllerEpoch + 1L, System.currentTimeMillis())
                 contentResolver.insert(ConfigProvider.URI, ContentValues().apply {
                     put(ConfigProvider.KEY_STATE_GENERATION, generation)
                     put(ConfigProvider.KEY_COMMAND_CONSUMED_GENERATION, generation)
@@ -347,6 +350,8 @@ class MainActivity : ComponentActivity() {
                     put(ConfigProvider.KEY_RF_ERROR, "")
                     put(ConfigProvider.KEY_RF_PID, currentPid)
                     put(ConfigProvider.KEY_RF_GENERATION, generation)
+                    put(ConfigProvider.KEY_CONTROLLER_EPOCH, stockControllerEpoch)
+                    put(ConfigProvider.KEY_RF_CONTROLLER_EPOCH, stockControllerEpoch)
                     put(ConfigProvider.KEY_RF_VERIFICATION, "PROCESS_RESTART")
                     put(ConfigProvider.KEY_FULL_DIAG_STAGE, "RF_STOCK_RESTORED_BY_RESTART")
                     put(ConfigProvider.KEY_FULL_DIAG_SUMMARY, "Simulation disabled before NFC restart; stock RF reloaded by lifecycle reset")
