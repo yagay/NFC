@@ -1,4 +1,4 @@
-name=NFC 门禁诊断
+name=NFC门禁卡X
 author=Developer
 description=NFC / LSPosed 诊断与 UID 测试配置
 minApiVersion=102
