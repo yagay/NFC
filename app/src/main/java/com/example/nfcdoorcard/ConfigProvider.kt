@@ -40,6 +40,16 @@ class ConfigProvider : ContentProvider() {
         const val KEY_HOOK_COUNT = "hook_count"
         const val KEY_HOOK_PID = "hook_pid"
 
+        const val KEY_PROFILE_STATUS = "profile_status"
+        const val KEY_PROFILE_SYSTEM_FINGERPRINT = "profile_system_fingerprint"
+        const val KEY_PROFILE_NFC_VERSION = "profile_nfc_version"
+        const val KEY_RF_HOOK_CLASS = "rf_hook_class"
+        const val KEY_RF_HOOK_METHOD = "rf_hook_method"
+        const val KEY_RF_HOOK_SIGNATURE = "rf_hook_signature"
+        const val KEY_RF_HOOK_SCORE = "rf_hook_score"
+        const val KEY_RF_HOOK_SOURCE = "rf_hook_source"
+        const val KEY_RF_HOOK_FINGERPRINT = "rf_hook_fingerprint"
+
         const val KEY_RF_STATUS = "rf_status"
         const val KEY_RF_UID = "rf_uid"
         const val KEY_RF_SOURCE = "rf_source"
@@ -57,9 +67,6 @@ class ConfigProvider : ContentProvider() {
     override fun onCreate(): Boolean {
         val base = context!!
         val deviceContext = base.createDeviceProtectedStorageContext()
-        // Existing installs stored this state in credential-protected storage. Migrate it
-        // when possible, then always use device-protected storage so com.android.nfc can
-        // read desired state during direct boot before the user unlocks the phone.
         runCatching { deviceContext.moveSharedPreferencesFrom(base, PREFS_NAME) }
         deviceContext.getSharedPreferences(PREFS_NAME, 0)
             .edit()
