@@ -23,6 +23,17 @@ class ConfigProvider : ContentProvider() {
         const val KEY_SAK = "sak"
         const val KEY_ATQA = "atqa"
 
+        // Command protocol. The UI publishes desired state with a monotonically increasing
+        // generation. The Hook handles that exact generation inside com.android.nfc and
+        // writes the result back. This prevents stale async results from a previous command
+        // or previous NFC process from being accepted as current state.
+        const val KEY_COMMAND_GENERATION = "command_generation"
+        const val KEY_COMMAND_HANDLED_GENERATION = "command_handled_generation"
+        const val KEY_COMMAND_ACTION = "command_action"
+        const val KEY_COMMAND_STATUS = "command_status"
+        const val KEY_COMMAND_DETAIL = "command_detail"
+        const val KEY_COMMAND_PID = "command_pid"
+
         const val KEY_SCOPE_OK = "scope_ok"
         const val KEY_SCOPE_PROCESS = "scope_process"
         const val KEY_SCOPE_PID = "scope_pid"
@@ -30,11 +41,6 @@ class ConfigProvider : ContentProvider() {
         const val KEY_HOOK_CLASS = "hook_class"
         const val KEY_HOOK_COUNT = "hook_count"
         const val KEY_HOOK_PID = "hook_pid"
-        const val KEY_HIJACK_STATUS = "hijack_status"
-        const val KEY_HIJACK_RESULT = "hijack_result"
-        const val KEY_HIJACK_UID = "hijack_uid"
-        const val KEY_HIJACK_ERROR = "hijack_error"
-        const val KEY_HIJACK_PID = "hijack_pid"
 
         const val KEY_RF_STATUS = "rf_status"
         const val KEY_RF_UID = "rf_uid"
@@ -42,19 +48,8 @@ class ConfigProvider : ContentProvider() {
         const val KEY_RF_RESULT = "rf_result"
         const val KEY_RF_ERROR = "rf_error"
         const val KEY_RF_PID = "rf_pid"
-        const val KEY_TRACE_STAGE = "trace_stage"
-        const val KEY_TRACE_SOURCE = "trace_source"
-        const val KEY_TRACE_PID = "trace_pid"
+        const val KEY_RF_GENERATION = "rf_generation"
 
-        const val KEY_TEXT_CONFIG_SEEN = "text_config_seen"
-        const val KEY_TEXT_CONFIG_SOURCE = "text_config_source"
-        const val KEY_TEXT_CONFIG_LENGTH = "text_config_length"
-        const val KEY_CONFIG_BLOCK_COUNT = "config_block_count"
-        const val KEY_NCI_FRAME_COUNT = "nci_frame_count"
-        const val KEY_NFCID1_COUNT = "nfcid1_count"
-        const val KEY_HCE_GET_UID = "hce_get_uid"
-        const val KEY_RF_FIELD_COUNT = "rf_field_count"
-        const val KEY_LAST_NATIVE_RESULT = "last_native_result"
         const val KEY_FULL_DIAG_STAGE = "full_diag_stage"
         const val KEY_FULL_DIAG_SUMMARY = "full_diag_summary"
 
