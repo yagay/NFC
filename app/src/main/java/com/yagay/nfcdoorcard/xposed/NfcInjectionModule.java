@@ -441,6 +441,10 @@ public class NfcInjectionModule extends XposedModule {
                 if (state == 3) {
                     scheduleLifecycleRecovery("adapter_state_on");
                 } else if (state == 1 || state == 4) {
+                    // Turning NFC off resets controller RF state even when com.android.nfc keeps
+                    // the same PID. Invalidate prior RF verification so the following ON event
+                    // cannot mistake stale evidence for a successful lifecycle reapply.
+                    invalidateRfEvidenceForAdapterReset(state == 4 ? "adapter_turning_off" : "adapter_off");
                     finishLifecycleRecovery(lifecycleRecoveryGeneration);
                 }
             }
@@ -457,6 +461,46 @@ public class NfcInjectionModule extends XposedModule {
     }
 
     /**
+     * NFC adapter OFF / TURNING_OFF resets the controller RF configuration but may leave the
+     * com.android.nfc Java process alive. PID-based verification therefore cannot prove that the
+     * previously applied NFCID1 is still present. Preserve the durable desired APPLY command and
+     * selected UID, but explicitly invalidate only observed RF evidence. The next adapter ON event
+     * will then run the closed-loop lifecycle recovery and require a fresh native-accepted RF write.
+     */
+    private void invalidateRfEvidenceForAdapterReset(String reason) {
+        SimConfig cfg = readConfig();
+        if (!cfg.initialized || !cfg.active || cfg.generation <= 0L) return;
+        ContentValues v = baseHookState();
+        v.put("state_generation", cfg.generation);
+        v.put("operation_state", "LIFECYCLE_REAPPLY");
+        v.put("effective_state", "UNKNOWN");
+        v.put("verification_confidence", "LIFECYCLE_PENDING");
+        v.put("rf_accepted", false);
+        v.put("rf_status", "RF_INVALIDATED_BY_ADAPTER_RESET");
+        v.put("rf_uid", "");
+        v.put("rf_source", reason == null ? "adapter-reset" : reason);
+        v.put("rf_result", "");
+        v.put("rf_native_result", "");
+        v.put("rf_native_result_type", "lifecycle");
+        v.put("rf_error", "");
+        v.put("rf_pid", 0);
+        v.put("rf_generation", cfg.generation);
+        v.put("rf_verification", "ADAPTER_RESET_INVALIDATED");
+        v.put("full_diag_stage", "ADAPTER_RESET_WAITING_REAPPLY");
+        v.put("full_diag_summary", "NFC adapter reset invalidated prior RF evidence; waiting for fresh lifecycle reapply");
+        persistRefreshRuntime("LIFECYCLE_INVALIDATED", "", reason, cfg.generation, false);
+        writeValuesWithRetry(v, 8, 75L);
+        synchronized (this) {
+            lifecycleReapplyPending = false;
+            lifecycleRecoveryGeneration = Long.MIN_VALUE;
+            lifecycleRecoveryStartedAt = 0L;
+        }
+        clearTriggerWindow(cfg.generation);
+        Log.i(TAG, "ADAPTER RESET invalidated RF evidence reason=" + reason +
+                " generation=" + cfg.generation + " uid=" + cfg.uid + " pid=" + Process.myPid());
+    }
+
+    /**
      * Closed-loop lifecycle APPLY recovery. A trigger returning true is never treated as success;
      * only a rewritten RF_CONFIG_WRITE accepted by native code can move observed state to ACTIVE.
      */
@@ -466,7 +510,7 @@ public class NfcInjectionModule extends XposedModule {
         if (!cfg.initialized || !cfg.active || cfg.uid == null || cfg.generation <= 0L ||
                 cfg.handledGeneration != cfg.generation || !"SUCCESS".equals(cfg.commandStatus)) return;
         String uidHex = normalizeUid(cfg.uid);
-        if (uidHex.length() != 8) return;
+        if (uidHex.length() != 8 && uidHex.length() != 14 && uidHex.length() != 20) return;
         if (isLifecycleVerified(cfg.generation, pid, uidHex)) {
             finishLifecycleRecovery(cfg.generation);
             return;
