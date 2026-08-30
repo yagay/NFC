@@ -34,11 +34,12 @@ public final class HookProfileStore {
         try { app.getContentResolver().insert(CONFIG_URI, v); } catch (Throwable ignored) { }
     }
 
-    /** Returns only a VERIFIED target from the exact same system/NFC build and resolvable signature. */
+    /** Returns only a verified target from the exact same system/NFC build and resolvable signature. */
     public HookTarget loadValid(Application app, ClassLoader classLoader) {
         if (app == null || classLoader == null) return null;
         Map<String, String> state = read(app);
-        if (!"VERIFIED".equals(state.get("profile_status"))) return null;
+        String status = state.get("profile_status");
+        if (!("VERIFIED".equals(status) || "CACHED_VERIFIED".equals(status))) return null;
         if (!systemIdentityMatches(app,
                 state.get("profile_system_fingerprint"), state.get("profile_nfc_version"))) return null;
 
@@ -69,9 +70,7 @@ public final class HookProfileStore {
     private Map<String, String> read(Application app) {
         Map<String, String> out = new HashMap<>();
         try (Cursor c = app.getContentResolver().query(CONFIG_URI, null, null, null, null)) {
-            if (c != null) {
-                while (c.moveToNext()) out.put(c.getString(0), c.getString(1));
-            }
+            if (c != null) while (c.moveToNext()) out.put(c.getString(0), c.getString(1));
         } catch (Throwable ignored) { }
         return out;
     }
