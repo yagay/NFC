@@ -35,10 +35,10 @@ class MainActivity : ComponentActivity() {
 
     private lateinit var nfcReader: NfcReaderController
     private lateinit var cardRepository: CardRepository
-    private lateinit var rootShell: RootShell
     private lateinit var nfcSystemService: NfcSystemService
     private lateinit var runtimeRepository: RuntimeStatusRepository
     private lateinit var configClient: ConfigClient
+    private lateinit var diagnosticsCollector: DiagnosticsCollector
     private val operationExecutor = Executors.newSingleThreadExecutor()
     private val diagnosticExecutor = Executors.newSingleThreadExecutor()
     private var scannedCardState by mutableStateOf<CardModel?>(null)
@@ -49,10 +49,11 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         nfcReader = NfcReaderController(this)
         cardRepository = CardRepository(this)
-        rootShell = RootShell(this)
+        val rootShell = RootShell(this)
         nfcSystemService = NfcSystemService(rootShell)
         runtimeRepository = RuntimeStatusRepository(this, nfcSystemService)
         configClient = ConfigClient(contentResolver)
+        diagnosticsCollector = DiagnosticsCollector(this, rootShell, nfcSystemService, runtimeRepository, cardRepository)
         savedCardsState = cardRepository.load()
         AppLogger.i("NFC controller started; LSPosed in-process command engine enabled")
         setContent { MaterialTheme { Surface(Modifier.fillMaxSize()) { NfcAppContent() } } }
@@ -130,7 +131,7 @@ class MainActivity : ComponentActivity() {
             while (true) {
                 val incoming = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
                     val logStatus = readRuntimeStatus(includeRootPid = false)
-                    val raw = fetchLogsSync(selectedSource)
+                    val raw = diagnosticsCollector.fetchLogs(selectedSource)
                     val text = if (selectedSource == LogSource.STATUS) buildStatusSummary(logStatus) + "\n\n" + raw else raw
                     boundedLogLines(text)
                 }
@@ -372,9 +373,6 @@ class MainActivity : ComponentActivity() {
     private fun readRuntimeStatus(includeRootPid: Boolean = false): RuntimeStatus =
         runtimeRepository.read(includeRootPid)
 
-    private fun decodeRuntimeStatus(map: Map<String, String>, rootPid: Int?): RuntimeStatus =
-        runtimeRepository.decode(map, rootPid)
-
     private fun buildStatusSummary(s: RuntimeStatus): String = buildString {
         appendLine("=== CURRENT STATUS ===")
         appendLine("BUILD: app=${s.appBuild} hook=${s.hookBuild} expectedHook=$EXPECTED_HOOK_BUILD")
@@ -387,34 +385,6 @@ class MainActivity : ComponentActivity() {
         appendLine("READ_MODE: ${if (readModeEnabled) "ENABLED" else "IDLE"}")
         appendLine("RF: generation=${s.rfGeneration} ${s.rfStatus} uid=${s.rfUid} source=${s.rfSource} result=${s.rfResult} raw=${s.rfNativeResult}/${s.rfNativeResultType} verification=${s.rfVerification} error=${s.rfError}")
         append("FINAL: stage=${s.fullDiagStage} summary=${s.fullDiagSummary}")
-    }
-
-    private fun fetchLogsSync(source: LogSource): String {
-        val pid = currentNfcPid()
-        val output = when (source) {
-            LogSource.STATUS -> runRootCmd("logcat -d -t 350 -v threadtime -s NfcDoorCard NfcUIDSim 2>/dev/null")
-            LogSource.LSPOSED -> runRootCmd("""
-                { grep -R -h -E 'NfcUIDSim|com.yagay.nfcdoorcard|PROD MODULE|PROD HOOK|RFPROBE|NFCID1|COMMAND|LSPosed' /data/adb/lspd/log 2>/dev/null || true
-                  logcat -b all -d -v threadtime 2>/dev/null | grep -E 'NfcUIDSim|PROD MODULE|PROD HOOK|RFPROBE|NFCID1|COMMAND' || true; } | tail -n 1500
-            """.trimIndent())
-            LogSource.KERNEL_SU -> runRootCmd("for f in ${'$'}(ls -t /data/adb/ksu/log/sulog* 2>/dev/null | head -n 3); do echo === ${'$'}f ===; tail -n 300 ${'$'}f; done")
-            LogSource.SYSTEM -> runRootCmd("logcat -b all -d -v threadtime 2>/dev/null | tail -n 1800")
-            LogSource.NFC -> {
-                val filter = "NfcUIDSim|NfcService|NxpNfcService|NfcChipDeviceImpl|NFCID1|COMMAND|changeRfParamsByConfig|setRfConfig|VendorNfcService|enableNfcShareMode|NfcSwitchCardDispatcher|RealTimeSwitchCardManager|HceAccessCard|LxDebugProfileCompare|StrProfileMatch|TapToShareEvent|NfcRfEventStateMachine|RoutingTableParser|NxpNciX|NxpNciR|NfcAdaptation"
-                val pidFilter = if (pid.isNotBlank()) "${'$'}0 ~ / $pid / || ${'$'}0 ~ /$filter/" else "${'$'}0 ~ /$filter/"
-                runRootCmd("logcat -b all -d -v threadtime 2>/dev/null | awk '$pidFilter' | tail -n 1800")
-            }
-            LogSource.HAL -> runRootCmd("""
-                echo '--- NFC PROCESSES ---'; ps -A | grep -E 'android.hardware.nfc|vendor.oplus.hardware.nfc|com.android.nfc' || true
-                echo '--- NFC PROPERTIES ---'; getprop | grep -i -E 'nfc|nxp|st21|st54|sn100|sn220|oplus' | head -n 300 || true
-                echo '--- HAL LOGCAT ---'; logcat -b all -d -v threadtime 2>/dev/null | grep -i -E 'android.hardware.nfc|vendor.oplus.hardware.nfc|NxpNfc|NfcHal|NxpNciX|NxpNciR|NfcAdaptation|oplus_nfc|libnfc|nfc-service|NFC HAL|STNfc|sn100|sn220' | tail -n 5000 || true
-            """.trimIndent())
-            LogSource.PROVIDER -> buildString {
-                appendLine("=== PROVIDER STATE ==="); readProviderMap().toSortedMap().forEach { (k, v) -> appendLine("$k=$v") }; appendLine("current_nfc_pid=${currentNfcPid()}")
-            }
-            LogSource.APP -> AppLogger.readAll().ifBlank { "No app logs" }
-        }
-        return output.ifBlank { "No matching logs found for ${source.label}" }
     }
 
     private fun currentNfcPid(): String = nfcSystemService.currentNfcPid()
@@ -458,7 +428,9 @@ class MainActivity : ComponentActivity() {
                     put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS); put(MediaStore.MediaColumns.IS_PENDING, 1)
                 }
                 createdUri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values) ?: error("无法在 Download 创建日志文件")
-                contentResolver.openOutputStream(createdUri, "w")?.bufferedWriter()?.use { it.write(buildFullDiagnosticReport()) } ?: error("无法写入日志文件")
+                contentResolver.openOutputStream(createdUri, "w")?.bufferedWriter()?.use {
+                    it.write(diagnosticsCollector.buildFullReport(::buildStatusSummary))
+                } ?: error("无法写入日志文件")
                 contentResolver.update(createdUri, ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }, null, null)
                 AppLogger.i("Diagnostics saved to public Downloads: $fileName uri=$createdUri")
                 runOnUiThread { onDone(); Toast.makeText(this@MainActivity, "日志已保存到 Download/$fileName", Toast.LENGTH_LONG).show() }
@@ -469,92 +441,5 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
-
-    private fun buildFullDiagnosticReport(): String = buildString {
-        val snapshotAt = System.currentTimeMillis()
-        val snapshotMap = readProviderMap().toMap()
-        val snapshotPid = currentNfcPid().toIntOrNull()
-        val s = decodeRuntimeStatus(snapshotMap, snapshotPid)
-        appendLine("=== NFC FULL CHECK ${BuildConfig.VERSION_NAME} ===")
-        appendLine("Generated: $snapshotAt")
-        appendLine("Snapshot: frozen provider + NFC PID; generation=${s.commandGeneration} pid=${s.currentPid}")
-        appendLine("Trigger: LSPosed in-process NFC command engine; AIDL transaction IDs are reflected with compatibility fallbacks")
-        appendLine("--- FINAL SUMMARY ---"); appendLine(buildStatusSummary(s)); appendLine()
-        appendLine("--- SAVED CARDS ---")
-        val cards = cardRepository.load(); appendLine("count=${cards.size}"); cards.forEach { appendLine("card uid=${it.uid} sak=${it.sak} atqa=${it.atqa}") }
-        appendLine("--- APP / APK ---"); appendLine(runRootCmd("dumpsys package $packageName 2>/dev/null | grep -E 'versionName=|versionCode=|path:'"))
-        appendLine("--- ROOT ---"); appendLine(runRootCmd("id; su -v 2>/dev/null || true"))
-        appendLine("--- NFC PROCESS / HAL ---"); appendLine(runRootCmd("pm path com.android.nfc; pidof com.android.nfc; ps -A | grep -E 'android.hardware.nfc|vendor.oplus.hardware.nfc|com.android.nfc|$packageName'"))
-        appendLine("--- NFC CONFIG SNAPSHOT ---")
-        appendLine(collectNfcConfigSnapshot())
-        appendLine("--- NFC SERVICE FULL ---")
-        appendLine(runRootCmd("dumpsys nfc 2>/dev/null", 25, 300_000))
-        appendLine("--- NFC OVERWRITE TRACE / CORRELATED TIMELINE ---")
-        appendLine(collectNfcOverwriteTrace())
-        LogSource.entries.forEach { source ->
-            appendLine(); appendLine("=== LOG SOURCE: ${source.name} / ${source.label} ===")
-            if (source == LogSource.PROVIDER) {
-                appendLine("=== PROVIDER STATE (FROZEN SNAPSHOT) ===")
-                snapshotMap.toSortedMap().forEach { (k, v) -> appendLine("$k=$v") }
-                appendLine("current_nfc_pid=${snapshotPid ?: 0}")
-            } else {
-                appendLine(fetchLogsSync(source))
-            }
-        }
-    }
-
-    private fun collectNfcConfigSnapshot(): String = nfcSystemService.collectNfcConfigSnapshot()
-
-    /**
-     * High-retention trace used to correlate a known-good simulated UID with the first later
-     * OEM/NXP runtime reconfiguration that can restore stock/random NFCID1. This intentionally
-     * does not change NFC behaviour; it only preserves evidence that the normal UI log windows
-     * can otherwise tail away.
-     */
-    private fun collectNfcOverwriteTrace(): String = buildString {
-        appendLine("TRACE_CAPTURE_EPOCH_MS=${System.currentTimeMillis()}")
-        appendLine("TRACE_CURRENT_NFC_PID=${currentNfcPid()}")
-        appendLine("TRACE_PROVIDER_BEGIN")
-        readProviderMap().toSortedMap().forEach { (k, v) -> appendLine("$k=$v") }
-        appendLine("TRACE_PROVIDER_END")
-
-        appendLine("--- LOGCAT BUFFER INFO ---")
-        appendLine(runRootCmd("logcat -g 2>/dev/null || true", 15, 300_000))
-
-        appendLine("--- NCI TX/RX FULL TIMELINE (epoch) ---")
-        appendLine(runRootCmd("""
-            logcat -b all -d -v epoch 2>/dev/null | \
-              grep -E 'NxpNciX|NxpNciR|NfcAdaptation::HalWrite|android\.hardware\.nfc-service\.nxp: write|NxpHal|phNxp|nfc_ncif_send|CORE_SET_CONFIG' || true
-        """.trimIndent(), 35, 4_000_000))
-
-        appendLine("--- NCI SET-CONFIG / NFCID1 CANDIDATES ---")
-        appendLine(runRootCmd("""
-            logcat -b all -d -v epoch 2>/dev/null | \
-              grep -E 'NxpNciX|NxpNciR' | \
-              grep -E -i '20[ :_-]*02|2002|33[ :_-]*00|3300|C1[ :_-]*B0[ :_-]*BC[ :_-]*1B|NFCID1' || true
-        """.trimIndent(), 25, 2_000_000))
-
-        appendLine("--- OPLUS RUNTIME CARD / SUPER-CARD TIMELINE (epoch) ---")
-        appendLine(runRootCmd("""
-            logcat -b all -d -v epoch 2>/dev/null | \
-              grep -E 'NfcSwitchCardDispatcher|RealTimeSwitchCardManager|HceAccessCard|StrProfileMatch|LxDebugProfileCompare|TapToShareEvent|NfcRfEventStateMachine|VendorNfcService|loadListenTechMask|RESTORE_SUPERCARD|SUPER.?CARD|RF_FIELD|onRfFieldDetected|onLxDebugConfigData' || true
-        """.trimIndent(), 30, 3_000_000))
-
-        appendLine("--- BOOT / ROUTING / TAP-SHARE NFC TIMELINE (epoch) ---")
-        appendLine(runRootCmd("""
-            logcat -b all -d -v epoch 2>/dev/null | \
-              grep -E 'ACTION_OPLUS_BOOT_COMPLETED|BOOT_COMPLETED|RoutingTableParser|NfcServiceRegister|accept-tap_share|startAdvertise|NfcChipDeviceImpl|setRfConfig|changeRfParamsByConfig|enableNfcShareMode|NfcUIDSim' || true
-        """.trimIndent(), 30, 3_000_000))
-
-        appendLine("--- NFC PROCESS / HAL STATE AT EXPORT ---")
-        appendLine(runRootCmd("""
-            echo '[processes]'; ps -A | grep -E 'com.android.nfc|android.hardware.nfc|vendor.oplus.hardware.nfc' || true
-            echo '[properties]'; getprop | grep -i -E 'nfc|nxp|nfcuidsim|initialized' || true
-            echo '[dumpsys summary]'; dumpsys nfc 2>/dev/null | grep -E -i 'state|screen|routing|discovery|reader|secure|listen|poll|host|aid' | head -n 600 || true
-        """.trimIndent(), 25, 1_500_000))
-    }
-
-    private fun runRootCmd(command: String, timeoutSeconds: Long = 20, maxChars: Int = 1_000_000): String =
-        rootShell.run(command, timeoutSeconds, maxChars)
 
 }
