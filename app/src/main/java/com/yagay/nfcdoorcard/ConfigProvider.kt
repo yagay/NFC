@@ -15,7 +15,7 @@ class ConfigProvider : ContentProvider() {
         const val AUTHORITY = "com.yagay.nfcdoorcard.config"
         const val PATH_SETTINGS = "settings"
         private const val PREFS_NAME = "nfc_config"
-        const val STATE_SCHEMA_VERSION = 6
+        const val STATE_SCHEMA_VERSION = 7
         const val PROFILE_SCHEMA_VERSION = 3
         val APP_BUILD: Int = BuildConfig.VERSION_CODE
 
@@ -84,6 +84,8 @@ class ConfigProvider : ContentProvider() {
         const val KEY_RF_PID = "rf_pid"
         const val KEY_RF_GENERATION = "rf_generation"
         const val KEY_RF_VERIFICATION = "rf_verification"
+        const val KEY_CONTROLLER_EPOCH = "controller_epoch"
+        const val KEY_RF_CONTROLLER_EPOCH = "rf_controller_epoch"
 
         const val KEY_FULL_DIAG_STAGE = "full_diag_stage"
         const val KEY_FULL_DIAG_SUMMARY = "full_diag_summary"
@@ -105,7 +107,7 @@ class ConfigProvider : ContentProvider() {
             KEY_OPERATION_STATE, KEY_EFFECTIVE_STATE, KEY_VERIFICATION_CONFIDENCE,
             KEY_RF_ACCEPTED, KEY_RF_NATIVE_RESULT, KEY_RF_NATIVE_RESULT_TYPE, KEY_RUNTIME_PID,
             KEY_RF_STATUS, KEY_RF_UID, KEY_RF_SOURCE, KEY_RF_RESULT, KEY_RF_ERROR,
-            KEY_RF_PID, KEY_RF_GENERATION, KEY_RF_VERIFICATION,
+            KEY_RF_PID, KEY_RF_GENERATION, KEY_RF_VERIFICATION, KEY_CONTROLLER_EPOCH, KEY_RF_CONTROLLER_EPOCH,
             KEY_REFRESH_TRIGGER_STATUS, KEY_REFRESH_TRIGGER_TARGET, KEY_REFRESH_TRIGGER_SOURCE,
             KEY_REFRESH_TRIGGER_GENERATION, KEY_REFRESH_TRIGGER_RF_CONFIRMED,
             KEY_FULL_DIAG_STAGE, KEY_FULL_DIAG_SUMMARY
@@ -117,7 +119,7 @@ class ConfigProvider : ContentProvider() {
             KEY_OPERATION_STATE, KEY_EFFECTIVE_STATE, KEY_VERIFICATION_CONFIDENCE,
             KEY_RF_ACCEPTED, KEY_RF_NATIVE_RESULT, KEY_RF_NATIVE_RESULT_TYPE,
             KEY_RF_STATUS, KEY_RF_UID, KEY_RF_SOURCE, KEY_RF_RESULT, KEY_RF_ERROR,
-            KEY_RF_PID, KEY_RF_GENERATION, KEY_RF_VERIFICATION,
+            KEY_RF_PID, KEY_RF_GENERATION, KEY_RF_VERIFICATION, KEY_RF_CONTROLLER_EPOCH,
             KEY_FULL_DIAG_STAGE, KEY_FULL_DIAG_SUMMARY
         )
     }

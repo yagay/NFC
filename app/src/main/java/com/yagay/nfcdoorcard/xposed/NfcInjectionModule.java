@@ -470,24 +470,13 @@ public class NfcInjectionModule extends XposedModule {
     private void invalidateRfEvidenceForAdapterReset(String reason) {
         SimConfig cfg = readConfig();
         if (!cfg.initialized || !cfg.active || cfg.generation <= 0L) return;
+        long nextEpoch = Math.max(cfg.controllerEpoch + 1L, System.currentTimeMillis());
         ContentValues v = baseHookState();
         v.put("state_generation", cfg.generation);
-        v.put("operation_state", "LIFECYCLE_REAPPLY");
-        v.put("effective_state", "UNKNOWN");
-        v.put("verification_confidence", "LIFECYCLE_PENDING");
-        v.put("rf_accepted", false);
-        v.put("rf_status", "RF_INVALIDATED_BY_ADAPTER_RESET");
-        v.put("rf_uid", "");
-        v.put("rf_source", reason == null ? "adapter-reset" : reason);
-        v.put("rf_result", "");
-        v.put("rf_native_result", "");
-        v.put("rf_native_result_type", "lifecycle");
-        v.put("rf_error", "");
-        v.put("rf_pid", 0);
-        v.put("rf_generation", cfg.generation);
-        v.put("rf_verification", "ADAPTER_RESET_INVALIDATED");
-        v.put("full_diag_stage", "ADAPTER_RESET_WAITING_REAPPLY");
-        v.put("full_diag_summary", "NFC adapter reset invalidated prior RF evidence; waiting for fresh lifecycle reapply");
+        // controller_epoch is lifecycle metadata, not terminal command/RF evidence. ConfigProvider
+        // intentionally permits it to advance after a successful APPLY. Existing RF evidence is
+        // then stale because rf_controller_epoch no longer matches.
+        v.put("controller_epoch", nextEpoch);
         persistRefreshRuntime("LIFECYCLE_INVALIDATED", "", reason, cfg.generation, false);
         writeValuesWithRetry(v, 8, 75L);
         synchronized (this) {
@@ -496,8 +485,10 @@ public class NfcInjectionModule extends XposedModule {
             lifecycleRecoveryStartedAt = 0L;
         }
         clearTriggerWindow(cfg.generation);
-        Log.i(TAG, "ADAPTER RESET invalidated RF evidence reason=" + reason +
-                " generation=" + cfg.generation + " uid=" + cfg.uid + " pid=" + Process.myPid());
+        cachedConfig = cfg.withControllerEpoch(nextEpoch);
+        Log.i(TAG, "CONTROLLER EPOCH advanced reason=" + reason + " generation=" + cfg.generation +
+                " oldEpoch=" + cfg.controllerEpoch + " newEpoch=" + nextEpoch + " uid=" + cfg.uid +
+                " pid=" + Process.myPid());
     }
 
     /**
@@ -581,6 +572,7 @@ public class NfcInjectionModule extends XposedModule {
         Context ctx = currentContext();
         if (ctx == null) return false;
         long rfGeneration = Long.MIN_VALUE;
+        long controllerEpoch = 0L, rfControllerEpoch = Long.MIN_VALUE;
         int rfPid = 0;
         boolean accepted = false;
         String effective = "", confidence = "", rfUid = "";
@@ -594,9 +586,12 @@ public class NfcInjectionModule extends XposedModule {
                 else if ("effective_state".equals(key)) effective = value == null ? "" : value;
                 else if ("verification_confidence".equals(key)) confidence = value == null ? "" : value;
                 else if ("rf_uid".equals(key)) rfUid = normalizeUid(value);
+                else if ("controller_epoch".equals(key)) controllerEpoch = parseLong(value, 0L);
+                else if ("rf_controller_epoch".equals(key)) rfControllerEpoch = parseLong(value, Long.MIN_VALUE);
             }
         } catch (Throwable ignored) { return false; }
-        return rfGeneration == generation && rfPid == pid && accepted && "ACTIVE".equals(effective) &&
+        return rfGeneration == generation && rfPid == pid && accepted && controllerEpoch > 0L &&
+                rfControllerEpoch == controllerEpoch && "ACTIVE".equals(effective) &&
                 "VERIFIED".equals(confidence) && normalizeUid(uid).equals(rfUid);
     }
 
@@ -623,6 +618,7 @@ public class NfcInjectionModule extends XposedModule {
         v.put("rf_error", detail == null ? "" : detail);
         v.put("rf_pid", Process.myPid());
         v.put("rf_generation", cfg.generation);
+        v.put("rf_controller_epoch", cfg.controllerEpoch);
         v.put("rf_verification", "LIFECYCLE_REAPPLY_FAILED");
         v.put("full_diag_stage", "LIFECYCLE_REAPPLY_FAILED");
         v.put("full_diag_summary", detail == null ? "" : detail);
@@ -837,6 +833,7 @@ public class NfcInjectionModule extends XposedModule {
         v.put("rf_error", state.contains("FAILED") ? detail : "");
         v.put("rf_pid", Process.myPid());
         v.put("rf_generation", cfg.generation);
+        v.put("rf_controller_epoch", cfg.controllerEpoch);
         v.put("rf_verification", state.equals("APPLYING") ? "CONFIG_WRITE_PENDING" : "LIFECYCLE_PENDING");
         v.put("operation_state", operationForRfState(state));
         v.put("effective_state", "UNKNOWN");
@@ -867,6 +864,7 @@ public class NfcInjectionModule extends XposedModule {
         v.put("rf_error", "");
         v.put("rf_pid", Process.myPid());
         v.put("rf_generation", cfg.generation);
+        v.put("rf_controller_epoch", cfg.controllerEpoch);
         v.put("rf_verification", confirmedTriggerGeneration == cfg.generation ?
                 "LIFECYCLE_REAPPLY_TRIGGER_CONFIRMED" : "LIFECYCLE_REAPPLY_NATIVE_RESULT");
         v.put("operation_state", "IDLE");
@@ -904,6 +902,7 @@ public class NfcInjectionModule extends XposedModule {
         v.put("rf_error", "");
         v.put("rf_pid", pid);
         v.put("rf_generation", cfg.generation);
+        v.put("rf_controller_epoch", cfg.controllerEpoch);
         v.put("rf_verification", verification);
         v.put("operation_state", "IDLE");
         v.put("effective_state", cfg.active ? "ACTIVE" : "STOCK");
@@ -991,6 +990,8 @@ public class NfcInjectionModule extends XposedModule {
         v.put("hook_pid", pid);
         v.put("runtime_pid", pid);
         if (activeTarget != null) putTarget(v, activeTarget);
+        SimConfig cfg = cachedConfig;
+        if (cfg.initialized) v.put("controller_epoch", cfg.controllerEpoch);
         v.put("rf_restore_mode", restoreMode);
         v.put("rf_controller_reinit_required", controllerReinitRequired);
         v.put("stock_snapshot_available", reversibleStockPayload != null);
@@ -1060,7 +1061,7 @@ public class NfcInjectionModule extends XposedModule {
         if (ctx == null) return SimConfig.uninitialized();
         boolean active = false, diagnostics = false;
         String uid = null, action = "", status = "";
-        long generation = 0L, consumed = Long.MIN_VALUE, handled = Long.MIN_VALUE;
+        long generation = 0L, consumed = Long.MIN_VALUE, handled = Long.MIN_VALUE, controllerEpoch = 0L;
         int commandPid = 0;
         try (Cursor c = ctx.getContentResolver().query(CONFIG_URI, null, null, null, null)) {
             if (c == null) return SimConfig.uninitialized();
@@ -1075,9 +1076,13 @@ public class NfcInjectionModule extends XposedModule {
                 else if ("command_action".equals(key)) action = value == null ? "" : value;
                 else if ("command_status".equals(key)) status = value == null ? "" : value;
                 else if ("command_pid".equals(key)) commandPid = (int) parseLong(value, 0L);
+                else if ("controller_epoch".equals(key)) controllerEpoch = parseLong(value, 0L);
             }
             if (action.isEmpty()) action = active ? "APPLY" : "STOP";
-            return new SimConfig(true, active, uid, diagnostics, generation, consumed, handled, action, status, commandPid);
+            // Schema migration or first install may not have an epoch yet. Seed it without
+            // declaring RF success; subsequent verified writes will record this epoch.
+            if (controllerEpoch <= 0L) controllerEpoch = 1L;
+            return new SimConfig(true, active, uid, diagnostics, generation, consumed, handled, action, status, commandPid, controllerEpoch);
         } catch (Throwable t) {
             return SimConfig.uninitialized();
         }
@@ -1174,14 +1179,19 @@ public class NfcInjectionModule extends XposedModule {
     private static final class SimConfig {
         final boolean initialized, active, diagnostics;
         final String uid, commandAction, commandStatus;
-        final long generation, consumedGeneration, handledGeneration;
+        final long generation, consumedGeneration, handledGeneration, controllerEpoch;
         final int commandPid;
         SimConfig(boolean initialized, boolean active, String uid, boolean diagnostics, long generation,
-                  long consumedGeneration, long handledGeneration, String commandAction, String commandStatus, int commandPid) {
+                  long consumedGeneration, long handledGeneration, String commandAction, String commandStatus, int commandPid, long controllerEpoch) {
             this.initialized = initialized; this.active = active; this.uid = uid; this.diagnostics = diagnostics;
             this.generation = generation; this.consumedGeneration = consumedGeneration; this.handledGeneration = handledGeneration;
             this.commandAction = commandAction; this.commandStatus = commandStatus; this.commandPid = commandPid;
+            this.controllerEpoch = controllerEpoch;
         }
-        static SimConfig uninitialized() { return new SimConfig(false, false, null, false, 0L, Long.MIN_VALUE, Long.MIN_VALUE, "", "", 0); }
+        SimConfig withControllerEpoch(long epoch) {
+            return new SimConfig(initialized, active, uid, diagnostics, generation, consumedGeneration, handledGeneration,
+                    commandAction, commandStatus, commandPid, epoch);
+        }
+        static SimConfig uninitialized() { return new SimConfig(false, false, null, false, 0L, Long.MIN_VALUE, Long.MIN_VALUE, "", "", 0, 0L); }
     }
 }

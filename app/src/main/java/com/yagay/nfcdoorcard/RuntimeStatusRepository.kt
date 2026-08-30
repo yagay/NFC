@@ -54,7 +54,10 @@ class RuntimeStatusRepository(context: Context, private val nfcSystemService: Nf
             ?: hookPid.takeIf { it > 0 } ?: commandPid.takeIf { it > 0 } ?: scopePid.takeIf { it > 0 } ?: rfPid
         val hookBuild = map[ConfigProvider.KEY_HOOK_BUILD]?.toIntOrNull() ?: 0
         val rawRfStatus = map[ConfigProvider.KEY_RF_STATUS] ?: "IDLE"
-        val rfFresh = currentPid > 0 && rfPid > 0 && rfPid == currentPid && (runtimePid == 0 || runtimePid == currentPid)
+        val controllerEpoch = map[ConfigProvider.KEY_CONTROLLER_EPOCH]?.toLongOrNull() ?: 0L
+        val rfControllerEpoch = map[ConfigProvider.KEY_RF_CONTROLLER_EPOCH]?.toLongOrNull() ?: Long.MIN_VALUE
+        val controllerFresh = controllerEpoch > 0L && rfControllerEpoch == controllerEpoch
+        val rfFresh = controllerFresh && currentPid > 0 && rfPid > 0 && rfPid == currentPid && (runtimePid == 0 || runtimePid == currentPid)
         val restartTransition = map[ConfigProvider.KEY_COMMAND_STATUS] == "RESTART_REQUIRED" &&
             map[ConfigProvider.KEY_COMMAND_GENERATION]?.toLongOrNull() == map[ConfigProvider.KEY_RF_GENERATION]?.toLongOrNull()
         val visibleRfStatus = when {
