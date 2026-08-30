@@ -1,7 +1,6 @@
 package com.yagay.nfcdoorcard
 
 import android.content.ContentValues
-import android.content.Intent
 import android.os.Bundle
 import android.os.Environment
 import android.provider.MediaStore
@@ -25,22 +24,20 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
-import com.yagay.nfcdoorcard.nfc.NfcForegroundDispatcher
+import com.yagay.nfcdoorcard.nfc.NfcReaderController
 import com.yagay.nfcdoorcard.system.NfcSystemService
 import com.yagay.nfcdoorcard.system.RootShell
 import com.yagay.nfcdoorcard.ui.*
-import com.google.gson.Gson
-import com.google.gson.reflect.TypeToken
 import java.util.concurrent.Executors
 
 class MainActivity : ComponentActivity() {
     companion object { private const val EXPECTED_HOOK_BUILD = BuildConfig.HOOK_BUILD }
 
-    private lateinit var nfcDispatcher: NfcForegroundDispatcher
+    private lateinit var nfcReader: NfcReaderController
+    private lateinit var cardRepository: CardRepository
     private lateinit var rootShell: RootShell
     private lateinit var nfcSystemService: NfcSystemService
     private lateinit var runtimeRepository: RuntimeStatusRepository
-    private val gson = Gson()
     private val operationExecutor = Executors.newSingleThreadExecutor()
     private val diagnosticExecutor = Executors.newSingleThreadExecutor()
     private var scannedCardState by mutableStateOf<CardModel?>(null)
@@ -49,25 +46,14 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        nfcDispatcher = NfcForegroundDispatcher(this)
+        nfcReader = NfcReaderController(this)
+        cardRepository = CardRepository(this)
         rootShell = RootShell(this)
         nfcSystemService = NfcSystemService(rootShell)
         runtimeRepository = RuntimeStatusRepository(this, nfcSystemService)
-        savedCardsState = loadCards()
+        savedCardsState = cardRepository.load()
         AppLogger.i("NFC controller started; LSPosed in-process command engine enabled")
         setContent { MaterialTheme { Surface(Modifier.fillMaxSize()) { NfcAppContent() } } }
-    }
-
-    override fun onNewIntent(intent: Intent) {
-        super.onNewIntent(intent)
-        setIntent(intent)
-        if (readModeEnabled && !getSimulationEnabled()) {
-            nfcDispatcher.parse(intent)?.let { card ->
-                scannedCardState = card
-                AppLogger.i("CARD: READ uid=${card.uid} sak=${card.sak} atqa=${card.atqa}")
-                stopReadMode("card_read_complete")
-            }
-        }
     }
 
     override fun onResume() { super.onResume(); if (readModeEnabled) enableReadDispatch() }
@@ -81,12 +67,17 @@ class MainActivity : ComponentActivity() {
 
     private fun enableReadDispatch() {
         if (!readModeEnabled) return
-        nfcDispatcher.enable()
-            .onSuccess { AppLogger.i("READ_MODE: foreground dispatch enabled") }
-            .onFailure { AppLogger.i("READ_MODE: enable dispatch failed ${it.javaClass.simpleName}: ${it.message}") }
+        nfcReader.enable { card ->
+            if (!readModeEnabled || getSimulationEnabled()) return@enable
+            scannedCardState = card
+            AppLogger.i("CARD: READ uid=${card.uid} sak=${card.sak} atqa=${card.atqa}")
+            stopReadMode("card_read_complete")
+        }
+            .onSuccess { AppLogger.i("READ_MODE: reader mode enabled") }
+            .onFailure { AppLogger.i("READ_MODE: enable reader mode failed ${it.javaClass.simpleName}: ${it.message}") }
     }
 
-    private fun disableReadDispatch() { nfcDispatcher.disable() }
+    private fun disableReadDispatch() { nfcReader.disable() }
 
     private fun startReadMode() {
         if (getSimulationEnabled()) {
@@ -111,7 +102,7 @@ class MainActivity : ComponentActivity() {
             return
         }
         savedCardsState = savedCardsState + card
-        saveCards(savedCardsState)
+        cardRepository.save(savedCardsState)
         AppLogger.i("CARD: SAVED uid=${card.uid} sak=${card.sak} atqa=${card.atqa}")
         Toast.makeText(this, "卡片已保存", Toast.LENGTH_SHORT).show()
     }
@@ -135,14 +126,13 @@ class MainActivity : ComponentActivity() {
             logLines.clear()
             if (!logsEnabled) return@LaunchedEffect
             while (true) {
-                val snapshot = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-                    val newStatus = readRuntimeStatus(includeRootPid = false)
+                val incoming = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                    val logStatus = readRuntimeStatus(includeRootPid = false)
                     val raw = fetchLogsSync(selectedSource)
-                    val text = if (selectedSource == LogSource.STATUS) buildStatusSummary(newStatus) + "\n\n" + raw else raw
-                    newStatus to boundedLogLines(text)
+                    val text = if (selectedSource == LogSource.STATUS) buildStatusSummary(logStatus) + "\n\n" + raw else raw
+                    boundedLogLines(text)
                 }
-                runtimeViewModel.update(snapshot.first)
-                updateLogWindow(logLines, snapshot.second)
+                updateLogWindow(logLines, incoming)
                 kotlinx.coroutines.delay(2000)
             }
         }
@@ -170,25 +160,17 @@ class MainActivity : ComponentActivity() {
                             { expandedUid = if (expandedUid?.equals(card.uid, true) == true) null else card.uid },
                             {
                                 operationMessage = "正在通过 NFC 进程应用 UID ${card.uid}..."
-                                simulateCard(card) { newStatus, message -> runOnUiThread { runtimeViewModel.update(newStatus); operationMessage = message } }
-                                runtimeViewModel.update(status.copy(
-                                    simulationEnabled = true, selectedUid = card.uid, rfStatus = "WAITING",
-                                    operationState = "APPLYING", effectiveState = "UNKNOWN", verificationConfidence = "PENDING", rfAccepted = false
-                                ))
+                                simulateCard(card) { _, message -> runOnUiThread { operationMessage = message } }
                             },
                             {
                                 operationMessage = "正在恢复原厂 RF..."
-                                stopSimulation { newStatus, message -> runOnUiThread { runtimeViewModel.update(newStatus); operationMessage = message } }
-                                runtimeViewModel.update(status.copy(
-                                    simulationEnabled = false, rfStatus = "STOPPING",
-                                    operationState = "STOPPING", effectiveState = "UNKNOWN", verificationConfidence = "PENDING", rfAccepted = false
-                                ))
+                                stopSimulation { _, message -> runOnUiThread { operationMessage = message } }
                             },
                             {
                                 if (active) stopSimulation { _, _ -> }
                                 savedCardsState = savedCardsState.filterNot { it.uid.equals(card.uid, true) }
                                 if (expandedUid?.equals(card.uid, true) == true) expandedUid = null
-                                saveCards(savedCardsState)
+                                cardRepository.save(savedCardsState)
                             }
                         )
                     }
@@ -525,18 +507,6 @@ class MainActivity : ComponentActivity() {
         if (prefix < addUntil) target.addAll(prefix, incoming.subList(prefix, addUntil))
     }
 
-    private fun loadCards(): List<CardModel> {
-        val prefs = getSharedPreferences("cards", 0)
-        var json = prefs.getString("list", null)
-        if (json == null) {
-            val old = getSharedPreferences("saved_cards", 0).getString("cards_list", null)
-            if (!old.isNullOrBlank()) { json = old; prefs.edit().putString("list", old).apply() }
-        }
-        return if (json.isNullOrBlank()) emptyList() else runCatching { gson.fromJson<List<CardModel>>(json, object : TypeToken<List<CardModel>>() {}.type) ?: emptyList() }.getOrDefault(emptyList())
-    }
-
-    private fun saveCards(cards: List<CardModel>) { getSharedPreferences("cards", 0).edit().putString("list", gson.toJson(cards)).apply() }
-
     private fun saveDiagnosticWithoutSharing(onDone: () -> Unit) {
         stopReadMode("diagnostic_save")
         diagnosticExecutor.execute {
@@ -571,7 +541,7 @@ class MainActivity : ComponentActivity() {
         appendLine("Trigger: LSPosed in-process NFC command engine; AIDL transaction IDs are reflected with compatibility fallbacks")
         appendLine("--- FINAL SUMMARY ---"); appendLine(buildStatusSummary(s)); appendLine()
         appendLine("--- SAVED CARDS ---")
-        val cards = loadCards(); appendLine("count=${cards.size}"); cards.forEach { appendLine("card uid=${it.uid} sak=${it.sak} atqa=${it.atqa}") }
+        val cards = cardRepository.load(); appendLine("count=${cards.size}"); cards.forEach { appendLine("card uid=${it.uid} sak=${it.sak} atqa=${it.atqa}") }
         appendLine("--- APP / APK ---"); appendLine(runRootCmd("dumpsys package $packageName 2>/dev/null | grep -E 'versionName=|versionCode=|path:'"))
         appendLine("--- ROOT ---"); appendLine(runRootCmd("id; su -v 2>/dev/null || true"))
         appendLine("--- NFC PROCESS / HAL ---"); appendLine(runRootCmd("pm path com.android.nfc; pidof com.android.nfc; ps -A | grep -E 'android.hardware.nfc|vendor.oplus.hardware.nfc|com.android.nfc|$packageName'"))
