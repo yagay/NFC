@@ -15,7 +15,7 @@ android {
         versionCode = 49
         versionName = "1.0.48"
 
-        // Runtime protocol v7; hook build 35; 1.0.48 makes real controller initialize/deinitialize + NfcService enable/disable lifecycle the primary recovery signal, with adapter broadcasts as fallback.
+        // Runtime protocol v7; hook build 35; 1.0.48 uses controller initialize/deinitialize and NfcService enable/disable as primary lifecycle recovery signals, with adapter broadcasts as fallback.
         // Application ID, source namespace, Provider authority and LSPosed entry all use com.yagay.nfcdoorcard.
         buildConfigField("int", "HOOK_BUILD", "35")
     }
