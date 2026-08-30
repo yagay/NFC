@@ -15,8 +15,8 @@ class ConfigProvider : ContentProvider() {
         const val AUTHORITY = "com.example.nfcdoorcard.config"
         const val PATH_SETTINGS = "settings"
         private const val PREFS_NAME = "nfc_config"
-        const val STATE_SCHEMA_VERSION = 2
-        const val PROFILE_SCHEMA_VERSION = 2
+        const val STATE_SCHEMA_VERSION = 3
+        const val PROFILE_SCHEMA_VERSION = 3
         val APP_BUILD: Int = BuildConfig.VERSION_CODE
 
         const val KEY_STATE_SCHEMA = "state_schema"
@@ -34,6 +34,14 @@ class ConfigProvider : ContentProvider() {
         const val KEY_COMMAND_STATUS = "command_status"
         const val KEY_COMMAND_DETAIL = "command_detail"
         const val KEY_COMMAND_PID = "command_pid"
+
+        const val KEY_OPERATION_STATE = "operation_state"
+        const val KEY_EFFECTIVE_STATE = "effective_state"
+        const val KEY_VERIFICATION_CONFIDENCE = "verification_confidence"
+        const val KEY_RF_ACCEPTED = "rf_accepted"
+        const val KEY_RF_NATIVE_RESULT = "rf_native_result"
+        const val KEY_RF_NATIVE_RESULT_TYPE = "rf_native_result_type"
+        const val KEY_RUNTIME_PID = "runtime_pid"
 
         const val KEY_SCOPE_OK = "scope_ok"
         const val KEY_SCOPE_PROCESS = "scope_process"
@@ -121,6 +129,13 @@ class ConfigProvider : ContentProvider() {
             .remove(KEY_REFRESH_PROBE_CANDIDATES)
             .remove(KEY_REFRESH_PROBE_COUNT)
             .remove(KEY_REFRESH_PROBE_PID)
+            .remove(KEY_OPERATION_STATE)
+            .remove(KEY_EFFECTIVE_STATE)
+            .remove(KEY_VERIFICATION_CONFIDENCE)
+            .remove(KEY_RF_ACCEPTED)
+            .remove(KEY_RF_NATIVE_RESULT)
+            .remove(KEY_RF_NATIVE_RESULT_TYPE)
+            .remove(KEY_RUNTIME_PID)
             .putInt(KEY_STATE_SCHEMA, STATE_SCHEMA_VERSION)
             .apply()
     }
