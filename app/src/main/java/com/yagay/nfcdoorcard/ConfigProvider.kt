@@ -241,6 +241,14 @@ class ConfigProvider : ContentProvider() {
 
         val incoming = ContentValues(values)
         val prefs = prefs()
+        val currentControllerEpoch = (prefs.all[KEY_CONTROLLER_EPOCH] as? Number)?.toLong() ?: 0L
+        val incomingControllerEpoch = incoming.getAsLong(KEY_CONTROLLER_EPOCH)
+        if (incomingControllerEpoch != null && incomingControllerEpoch < currentControllerEpoch) {
+            // Controller lifecycle epochs are monotonic. Generic/diagnostic writes can arrive late,
+            // but must never resurrect RF proof from an older controller lifecycle.
+            Log.i("NfcConfigProvider", "Ignored stale controller_epoch=$incomingControllerEpoch current=$currentControllerEpoch uid=${Binder.getCallingUid()}")
+            incoming.remove(KEY_CONTROLLER_EPOCH)
+        }
         val currentGeneration = (prefs.all[KEY_COMMAND_GENERATION] as? Number)?.toLong() ?: 0L
         val currentHandledGeneration = (prefs.all[KEY_COMMAND_HANDLED_GENERATION] as? Number)?.toLong() ?: Long.MIN_VALUE
         val currentCommandStatus = prefs.getString(KEY_COMMAND_STATUS, "IDLE") ?: "IDLE"

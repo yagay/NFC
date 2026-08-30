@@ -488,6 +488,7 @@ public class NfcInjectionModule extends XposedModule {
             Log.w(TAG, "CONTROLLER EPOCH synchronous write failed reason=" + reason +
                     " generation=" + cfg.generation + " nextEpoch=" + nextEpoch);
         }
+        cachedConfig = cfg.withControllerEpoch(nextEpoch);
         persistRefreshRuntime("LIFECYCLE_INVALIDATED", "", reason, cfg.generation, false);
         synchronized (this) {
             lifecycleReapplyPending = false;
@@ -495,7 +496,6 @@ public class NfcInjectionModule extends XposedModule {
             lifecycleRecoveryStartedAt = 0L;
         }
         clearTriggerWindow(cfg.generation);
-        cachedConfig = cfg.withControllerEpoch(nextEpoch);
         Log.i(TAG, "CONTROLLER EPOCH advanced reason=" + reason + " generation=" + cfg.generation +
                 " oldEpoch=" + cfg.controllerEpoch + " newEpoch=" + nextEpoch + " uid=" + cfg.uid +
                 " pid=" + Process.myPid());
@@ -1002,8 +1002,9 @@ public class NfcInjectionModule extends XposedModule {
         v.put("hook_pid", pid);
         v.put("runtime_pid", pid);
         if (activeTarget != null) putTarget(v, activeTarget);
-        SimConfig cfg = cachedConfig;
-        if (cfg.initialized) v.put("controller_epoch", cfg.controllerEpoch);
+        // controller_epoch is authoritative lifecycle metadata. Never copy it from cachedConfig
+        // into generic asynchronous status writes, because a late status write must not roll back
+        // a newer adapter-reset epoch. Lifecycle/RF paths write epochs explicitly.
         v.put("rf_restore_mode", restoreMode);
         v.put("rf_controller_reinit_required", controllerReinitRequired);
         v.put("stock_snapshot_available", reversibleStockPayload != null);
@@ -1105,7 +1106,6 @@ public class NfcInjectionModule extends XposedModule {
                 else if ("command_action".equals(key)) action = value == null ? "" : value;
                 else if ("command_status".equals(key)) status = value == null ? "" : value;
                 else if ("command_pid".equals(key)) commandPid = (int) parseLong(value, 0L);
-                else if ("controller_epoch".equals(key)) controllerEpoch = parseLong(value, 0L);
                 else if ("controller_epoch".equals(key)) controllerEpoch = parseLong(value, 0L);
             }
             if (action.isEmpty()) action = active ? "APPLY" : "STOP";
