@@ -140,7 +140,17 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        Scaffold(topBar = { TopAppBar(title = { Text("NFC Expert Pro ${BuildConfig.VERSION_NAME}") }) }) { padding ->
+        Scaffold(
+            contentWindowInsets = WindowInsets.safeDrawing,
+            topBar = {
+                TopAppBar(
+                    title = { Text("NFC Expert Pro ${BuildConfig.VERSION_NAME}") },
+                    windowInsets = WindowInsets.safeDrawing.only(
+                        WindowInsetsSides.Top + WindowInsetsSides.Horizontal
+                    )
+                )
+            }
+        ) { padding ->
             LazyColumn(
                 modifier = Modifier.padding(padding).fillMaxSize(),
                 contentPadding = PaddingValues(bottom = 12.dp)
