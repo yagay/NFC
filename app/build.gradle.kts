@@ -15,6 +15,7 @@ android {
         versionCode = 27
         versionName = "1.0.26"
 
+        // Hook/runtime state protocol v5 is validated together with this app build.
         buildConfigField("int", "HOOK_BUILD", "21")
     }
 
