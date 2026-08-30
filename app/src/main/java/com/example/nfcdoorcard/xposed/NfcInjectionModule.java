@@ -53,9 +53,6 @@ public class NfcInjectionModule extends XposedModule {
     private volatile String disabledFailureUid;
     private volatile long disabledFailureGeneration = Long.MIN_VALUE;
 
-    // Restoration state. If APPLY replaced an existing LA_NFCID1, its exact pre-APPLY
-    // payload is reversible. If APPLY appended LA_NFCID1 to a payload where 0x33 was absent,
-    // CORE_SET_CONFIG replay cannot delete it; the NFC controller must be reinitialized.
     private volatile byte[] reversibleStockPayload;
     private volatile String reversibleTargetFingerprint;
     private volatile long reversibleCapturedGeneration = Long.MIN_VALUE;
@@ -103,9 +100,6 @@ public class NfcInjectionModule extends XposedModule {
             }
             int hookCount = Math.min(MAX_LEARNING_HOOKS, candidates.size());
             installTargets.addAll(candidates.subList(0, hookCount));
-            // The highest static/runtime-family score owns mutation during learning. Lower
-            // wrapper candidates are observation-only so they cannot pollute the payload
-            // before the deeper Native target receives it.
             activeTarget = installTargets.get(0);
             profileStore.save(app, activeTarget, "LEARNING");
             Log.i(TAG, "LEARNING installCount=" + hookCount + " mutationOwner=" + activeTarget + " pid=" + pid);
@@ -159,31 +153,28 @@ public class NfcInjectionModule extends XposedModule {
             }
 
             if (!cfg.active) {
-                // Reversible case only: APPLY replaced an existing 0x33, so replaying the
-                // exact pre-APPLY payload really writes the previous LA_NFCID1 value back.
                 if (cfg.initialized && "STOP".equals(cfg.commandAction) && !isGenerationCompleted(cfg.generation, pid)) {
                     byte[] stock = reversibleStockPayload;
                     if (stock != null && target.fingerprint().equals(reversibleTargetFingerprint)) {
                         Object result = chain.proceed(new Object[]{stock.clone()});
-                        if (nativeOk(result)) {
+                        NativeOutcome outcome = interpretNativeResult(method, result);
+                        if (outcome.accepted) {
                             clearRestoreState();
                             completeCommand(cfg, "RF_STOCK_RESTORED", "", "explicit-stock-nfcid1|" + target.fingerprint(),
-                                    String.valueOf(result), "Original LA_NFCID1 explicitly restored by verified RF_CONFIG_WRITE target");
+                                    outcome, "Original LA_NFCID1 explicitly restored by verified RF_CONFIG_WRITE target");
                         } else {
-                            failCommand(cfg, "RF_STOCK_FAILED", "", "Native rejected explicit stock LA_NFCID1 restore", String.valueOf(result));
+                            failCommand(cfg, "RF_STOCK_FAILED", "", "Native rejected explicit stock LA_NFCID1 restore", outcome);
                         }
                         return result;
                     }
                 }
-                // APPENDED_LA_NFCID1 cannot be undone by replaying a payload that omits 0x33.
-                // The command thread performs a controller close/init lifecycle instead.
                 return chain.proceed();
             }
 
             if (cfg.uid == null) return chain.proceed();
             String uidHex = normalizeUid(cfg.uid);
             if (uidHex.length() != 8) {
-                failCommand(cfg, "UID_INVALID", uidHex, "UID must be 4 bytes", "");
+                failCommand(cfg, "UID_INVALID", uidHex, "UID must be 4 bytes", NativeOutcome.notInvoked());
                 return chain.proceed();
             }
 
@@ -197,17 +188,18 @@ public class NfcInjectionModule extends XposedModule {
 
             RewriteResult rewritten = payloadEngine.rewrite(original, hexToBytes(uidHex));
             if (!rewritten.changed) {
-                writeRfProgress(cfg, "WAITING", uidHex, target.methodName + ": " + rewritten.reason, "", rewritten.codecId);
+                writeRfProgress(cfg, "WAITING", uidHex, target.methodName + ": " + rewritten.reason, rewritten.codecId);
                 return chain.proceed();
             }
 
             activeCodec = rewritten.codecId;
-            writeRfProgress(cfg, "APPLYING", uidHex, rewritten.reason, "pending", rewritten.codecId);
+            writeRfProgress(cfg, "APPLYING", uidHex, rewritten.reason, rewritten.codecId);
             Log.i(TAG, "NFCID1 APPLY target=" + target.fingerprint() + " codec=" + rewritten.codecId +
                     " reason=" + rewritten.reason + " pid=" + pid + " generation=" + cfg.generation + " uid=" + uidHex);
 
             Object result = chain.proceed(new Object[]{rewritten.data});
-            if (nativeOk(result)) {
+            NativeOutcome outcome = interpretNativeResult(method, result);
+            if (outcome.accepted) {
                 disabledAfterFailure = false;
                 disabledFailureUid = null;
                 disabledFailureGeneration = Long.MIN_VALUE;
@@ -234,7 +226,7 @@ public class NfcInjectionModule extends XposedModule {
                 }
                 persistRestoreState();
                 if (!isGenerationCompleted(cfg.generation, pid)) {
-                    completeCommand(cfg, "RF_UID_APPLIED", uidHex, rewritten.codecId, String.valueOf(result),
+                    completeCommand(cfg, "RF_UID_APPLIED", uidHex, rewritten.codecId, outcome,
                             "UID applied by verified target " + target.className + "#" + target.methodName +
                                     "; stopMode=" + restoreMode);
                 }
@@ -243,8 +235,7 @@ public class NfcInjectionModule extends XposedModule {
                 disabledFailureUid = uidHex;
                 disabledFailureGeneration = cfg.generation;
                 failCommand(cfg, "RF_UID_FAILED", uidHex,
-                        "native rejected payload from " + rewritten.codecId + "; retry allowed on next generation",
-                        String.valueOf(result));
+                        "native rejected payload from " + rewritten.codecId + "; retry allowed on next generation", outcome);
             }
             return result;
         });
@@ -283,18 +274,16 @@ public class NfcInjectionModule extends XposedModule {
                 " restoreMode=" + restoreMode);
 
         if (!cfg.active && controllerReinitRequired) {
-            // First tell the OEM stack that share mode is off. Its callback is allowed to run,
-            // but it is not considered restoration proof. Then force an actual controller
-            // close/init so the previously appended LA_NFCID1 disappears from controller state.
             NfcProcessVendorController.Result stopTrigger = vendorController.setShareMode(false);
-            writeRfProgress(cfg, "RESETTING_CONTROLLER", "",
-                    stopTrigger.detail + "; reinitializing NFC controller because LA_NFCID1 was appended", "", "controller-lifecycle");
+            writeRfProgress(cfg, "STOPPING", "",
+                    stopTrigger.detail + "; reinitializing NFC controller because LA_NFCID1 was appended", "controller-lifecycle");
+            writeSemanticState("RESETTING_CONTROLLER", "UNKNOWN", "LIFECYCLE_PENDING", false, null);
             NfcProcessVendorController.Result reset = vendorController.reinitializeController();
             if (reset.success) {
                 clearRestoreState();
                 completeControllerReinit(cfg, reset.detail);
             } else {
-                failCommand(cfg, "RF_CONTROLLER_RESET_FAILED", "", reset.stage + ": " + reset.detail, "");
+                failCommand(cfg, "RF_CONTROLLER_RESET_FAILED", "", reset.stage + ": " + reset.detail, NativeOutcome.notInvoked());
             }
             return;
         }
@@ -305,6 +294,7 @@ public class NfcInjectionModule extends XposedModule {
             writeSimpleCommandState("TRIGGERED", trigger.detail + "; waiting for RF confirmation", cfg.generation, action, false);
         } else {
             writeSimpleCommandState("TRIGGER_FAILED", trigger.stage + ": " + trigger.detail, cfg.generation, action, false);
+            writeSemanticState("FAILED", "UNKNOWN", "TRIGGER_FAILED", false, null);
         }
     }
 
@@ -431,38 +421,46 @@ public class NfcInjectionModule extends XposedModule {
         v.put("hook_class", "NfcInjectionModule");
         v.put("hook_count", count);
         v.put("hook_pid", pid);
+        v.put("runtime_pid", pid);
         v.put("full_diag_stage", stage);
         v.put("full_diag_summary", summary);
         if (targetId != null) v.put("rf_hook_fingerprint", targetId);
         writeValuesWithRetry(v, 20, 150L);
     }
 
-    private void writeRfProgress(SimConfig cfg, String state, String uid, String detail, String result, String codecId) {
+    private void writeRfProgress(SimConfig cfg, String state, String uid, String detail, String codecId) {
         ContentValues v = baseHookState();
         v.put("rf_status", state);
         v.put("rf_uid", uid == null ? "" : uid);
         v.put("rf_source", codecId == null ? "" : codecId);
-        v.put("rf_result", result == null ? "" : result);
+        v.put("rf_result", "");
+        v.put("rf_native_result", "");
+        v.put("rf_native_result_type", "");
+        v.put("rf_accepted", false);
         v.put("rf_error", state.contains("FAILED") ? detail : "");
         v.put("rf_pid", Process.myPid());
         v.put("rf_generation", cfg.generation);
         v.put("rf_verification", state.equals("APPLYING") ? "CONFIG_WRITE_PENDING" : "LIFECYCLE_PENDING");
+        v.put("operation_state", operationForRfState(state));
+        v.put("effective_state", "UNKNOWN");
+        v.put("verification_confidence", state.equals("APPLYING") ? "CONFIG_PENDING" : "LIFECYCLE_PENDING");
         v.put("full_diag_stage", state);
         v.put("full_diag_summary", detail == null ? "" : detail);
         writeValuesWithRetry(v, 20, 100L);
     }
 
-    private void completeCommand(SimConfig cfg, String rfState, String uid, String source, String result, String detail) {
-        completeCommandWithVerification(cfg, rfState, uid, source, result, detail, "NATIVE_RESULT");
+    private void completeCommand(SimConfig cfg, String rfState, String uid, String source, NativeOutcome outcome, String detail) {
+        completeCommandWithVerification(cfg, rfState, uid, source, outcome, detail, "NATIVE_RESULT");
     }
 
     private void completeControllerReinit(SimConfig cfg, String detail) {
-        completeCommandWithVerification(cfg, "RF_STOCK_RESTORED_BY_RESTART", "", "controller-reinit", "",
+        completeCommandWithVerification(cfg, "RF_STOCK_RESTORED_BY_RESTART", "", "controller-reinit",
+                NativeOutcome.lifecycleAccepted("controller-reinit"),
                 detail + "; appended LA_NFCID1 cleared by NFC controller close/init", "PROCESS_RESTART");
     }
 
     private void completeCommandWithVerification(SimConfig cfg, String rfState, String uid, String source,
-                                                 String result, String detail, String verification) {
+                                                 NativeOutcome outcome, String detail, String verification) {
         int pid = Process.myPid();
         completedGeneration = cfg.generation;
         completedPid = pid;
@@ -470,11 +468,17 @@ public class NfcInjectionModule extends XposedModule {
         v.put("rf_status", rfState);
         v.put("rf_uid", uid == null ? "" : uid);
         v.put("rf_source", source == null ? "" : source);
-        v.put("rf_result", result == null ? "" : result);
+        v.put("rf_result", outcome.accepted ? "0" : "");
+        v.put("rf_native_result", outcome.rawValue);
+        v.put("rf_native_result_type", outcome.resultType);
+        v.put("rf_accepted", outcome.accepted);
         v.put("rf_error", "");
         v.put("rf_pid", pid);
         v.put("rf_generation", cfg.generation);
         v.put("rf_verification", verification);
+        v.put("operation_state", "IDLE");
+        v.put("effective_state", cfg.active ? "ACTIVE" : "STOCK");
+        v.put("verification_confidence", "VERIFIED");
         v.put("command_handled_generation", cfg.generation);
         v.put("command_action", cfg.active ? "APPLY" : "STOP");
         v.put("command_status", "SUCCESS");
@@ -485,7 +489,7 @@ public class NfcInjectionModule extends XposedModule {
         writeValuesWithRetry(v, 20, 100L);
     }
 
-    private void failCommand(SimConfig cfg, String rfState, String uid, String detail, String result) {
+    private void failCommand(SimConfig cfg, String rfState, String uid, String detail, NativeOutcome outcome) {
         int pid = Process.myPid();
         completedGeneration = cfg.generation;
         completedPid = pid;
@@ -493,11 +497,17 @@ public class NfcInjectionModule extends XposedModule {
         v.put("rf_status", rfState);
         v.put("rf_uid", uid == null ? "" : uid);
         v.put("rf_source", activeCodec == null ? "" : activeCodec);
-        v.put("rf_result", result == null ? "" : result);
+        v.put("rf_result", "");
+        v.put("rf_native_result", outcome.rawValue);
+        v.put("rf_native_result_type", outcome.resultType);
+        v.put("rf_accepted", false);
         v.put("rf_error", detail == null ? "" : detail);
         v.put("rf_pid", pid);
         v.put("rf_generation", cfg.generation);
         v.put("rf_verification", "FAILED");
+        v.put("operation_state", "FAILED");
+        v.put("effective_state", "UNKNOWN");
+        v.put("verification_confidence", "FAILED");
         v.put("command_handled_generation", cfg.generation);
         v.put("command_action", cfg.active ? "APPLY" : "STOP");
         v.put("command_status", "FAILED");
@@ -519,6 +529,7 @@ public class NfcInjectionModule extends XposedModule {
         v.put("hook_class", "NfcInjectionModule");
         v.put("hook_count", installedHookCount);
         v.put("hook_pid", pid);
+        v.put("runtime_pid", pid);
         if (activeTarget != null) putTarget(v, activeTarget);
         v.put("rf_restore_mode", restoreMode);
         v.put("rf_controller_reinit_required", controllerReinitRequired);
@@ -534,8 +545,33 @@ public class NfcInjectionModule extends XposedModule {
         v.put("command_detail", detail == null ? "" : detail);
         v.put("command_pid", Process.myPid());
         v.put("command_action", action == null ? "" : action);
+        if ("RUNNING".equals(status) || "TRIGGERED".equals(status)) {
+            v.put("operation_state", "APPLY".equals(action) ? "APPLYING" : "STOPPING");
+            v.put("verification_confidence", "PENDING");
+        }
         if (handled) v.put("command_handled_generation", generation);
         writeValuesWithRetry(v, 20, 100L);
+    }
+
+    private void writeSemanticState(String operation, String effective, String confidence,
+                                    boolean accepted, NativeOutcome outcome) {
+        ContentValues v = baseHookState();
+        v.put("operation_state", operation);
+        v.put("effective_state", effective);
+        v.put("verification_confidence", confidence);
+        v.put("rf_accepted", accepted);
+        if (outcome != null) {
+            v.put("rf_native_result", outcome.rawValue);
+            v.put("rf_native_result_type", outcome.resultType);
+        }
+        writeValuesWithRetry(v, 8, 75L);
+    }
+
+    private static String operationForRfState(String state) {
+        if ("APPLYING".equals(state) || "WAITING".equals(state)) return "APPLYING";
+        if ("STOPPING".equals(state)) return "STOPPING";
+        if (state != null && state.contains("FAILED")) return "FAILED";
+        return "IDLE";
     }
 
     private void writeValuesWithRetry(ContentValues values, int attempts, long delayMs) {
@@ -591,22 +627,52 @@ public class NfcInjectionModule extends XposedModule {
     private static Thread daemon(Runnable r, String name) {
         Thread t = new Thread(r, name); t.setDaemon(true); return t;
     }
+
     private static String normalizeUid(String uid) {
         return uid == null ? "" : uid.replaceAll("[^0-9A-Fa-f]", "").toUpperCase(Locale.ROOT);
     }
-    private static boolean nativeOk(Object result) {
-        return result instanceof Number && ((Number) result).intValue() == 0;
+
+    private static NativeOutcome interpretNativeResult(Method method, Object result) {
+        Class<?> type = method == null ? null : method.getReturnType();
+        if (type == Void.TYPE) return new NativeOutcome(true, "null", "void");
+        if (type == Boolean.TYPE || type == Boolean.class) {
+            boolean ok = Boolean.TRUE.equals(result);
+            return new NativeOutcome(ok, String.valueOf(result), "boolean");
+        }
+        if (result instanceof Number) {
+            boolean ok = ((Number) result).intValue() == 0;
+            return new NativeOutcome(ok, String.valueOf(result), type == null ? result.getClass().getName() : type.getName());
+        }
+        return new NativeOutcome(false, String.valueOf(result), type == null ? "unknown" : type.getName());
     }
+
     private static byte[] hexToBytes(String hex) {
         byte[] out = new byte[hex.length() / 2];
         for (int i = 0; i < out.length; i++) out[i] = (byte) Integer.parseInt(hex.substring(i * 2, i * 2 + 2), 16);
         return out;
     }
+
     private static long parseLong(String value, long fallback) {
         try { return Long.parseLong(value); } catch (Throwable ignored) { return fallback; }
     }
+
     private static void sleep(long millis) {
         try { Thread.sleep(millis); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+    }
+
+    private static final class NativeOutcome {
+        final boolean accepted;
+        final String rawValue;
+        final String resultType;
+
+        NativeOutcome(boolean accepted, String rawValue, String resultType) {
+            this.accepted = accepted;
+            this.rawValue = rawValue == null ? "" : rawValue;
+            this.resultType = resultType == null ? "unknown" : resultType;
+        }
+
+        static NativeOutcome notInvoked() { return new NativeOutcome(false, "", "not-invoked"); }
+        static NativeOutcome lifecycleAccepted(String source) { return new NativeOutcome(true, source, "lifecycle"); }
     }
 
     private static final class SimConfig {
