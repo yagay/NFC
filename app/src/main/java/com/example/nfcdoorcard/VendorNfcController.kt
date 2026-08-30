@@ -1,5 +1,6 @@
 package com.example.nfcdoorcard
 
+import android.app.Application
 import android.nfc.NfcAdapter
 import android.os.IBinder
 import android.os.Parcel
@@ -13,6 +14,10 @@ import android.os.Parcel
  * The NFC process can be restarted while this app stays alive. NfcAdapter.sService may
  * then still point at the dead pre-restart Binder proxy, so always prefer a fresh
  * ServiceManager lookup and retry once if the first Binder becomes stale.
+ *
+ * Binder is only the active trigger. The authoritative success signal is the Hook's
+ * RF_UID_APPLIED state, because the OEM NFC stack may refresh RF config on its own even
+ * when the app-side Binder trigger races a service restart.
  */
 class VendorNfcController {
     companion object {
@@ -22,6 +27,8 @@ class VendorNfcController {
         private const val VENDOR_NAME = "vendor"
         private const val VENDOR_DESCRIPTOR = "com.vendor.nfc.IVendorNfcAdapter"
         private const val TX_ENABLE_SHARE_MODE = 15
+        private const val RF_FALLBACK_TIMEOUT_MS = 10_000L
+        private const val RF_FALLBACK_POLL_MS = 100L
     }
 
     data class Result(
@@ -46,6 +53,16 @@ class VendorNfcController {
             }
             if (attempt == 0) Thread.sleep(120L)
         }
+
+        // Enabling share mode is just a trigger for RF config refresh. If that Binder
+        // trigger races an NFC process restart, the OEM stack can still refresh RF on
+        // its own. In that case the Hook's RF_UID_APPLIED + result=0 is stronger proof
+        // than the failed Binder return, so wait briefly for the authoritative state.
+        if (enabled) {
+            val rfFallback = waitForConfirmedRfApply(RF_FALLBACK_TIMEOUT_MS)
+            if (rfFallback != null) return rfFallback
+        }
+
         return lastFailure ?: Result(false, enabled, "UNKNOWN", "Vendor Binder call failed")
     }
 
@@ -84,6 +101,60 @@ class VendorNfcController {
             )
         } catch (t: Throwable) {
             Result(false, enabled, "EXCEPTION", "${t.javaClass.name}: ${t.message ?: "<no message>"}")
+        }
+    }
+
+    private fun waitForConfirmedRfApply(timeoutMs: Long): Result? {
+        val app = currentApplication() ?: return null
+        val end = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < end) {
+            val state = readProviderState(app)
+            val simulationEnabled = state[ConfigProvider.KEY_SIMULATION_ENABLED].toBoolean()
+            val selectedUid = state[ConfigProvider.KEY_UID].orEmpty()
+            val rfUid = state[ConfigProvider.KEY_RF_UID].orEmpty()
+            val rfStatus = state[ConfigProvider.KEY_RF_STATUS].orEmpty()
+            val rfResult = state[ConfigProvider.KEY_RF_RESULT].orEmpty()
+
+            if (
+                simulationEnabled &&
+                selectedUid.isNotBlank() &&
+                rfStatus == "RF_UID_APPLIED" &&
+                rfResult == "0" &&
+                rfUid.equals(selectedUid, ignoreCase = true)
+            ) {
+                return Result(
+                    success = true,
+                    enabled = true,
+                    stage = "RF_FALLBACK",
+                    detail = "Binder trigger failed, but RF_UID_APPLIED confirmed uid=$rfUid result=0",
+                    vendorDescriptor = state["vendor_binder_descriptor"]?.takeIf { it.isNotBlank() }
+                )
+            }
+            Thread.sleep(RF_FALLBACK_POLL_MS)
+        }
+        return null
+    }
+
+    private fun readProviderState(app: Application): Map<String, String> {
+        val out = mutableMapOf<String, String>()
+        runCatching {
+            app.contentResolver.query(ConfigProvider.URI, null, null, null, null)?.use { cursor ->
+                while (cursor.moveToNext()) {
+                    out[cursor.getString(0)] = cursor.getString(1)
+                }
+            }
+        }
+        return out
+    }
+
+    private fun currentApplication(): Application? {
+        return try {
+            val activityThread = Class.forName("android.app.ActivityThread")
+            val method = activityThread.getDeclaredMethod("currentApplication")
+            method.isAccessible = true
+            method.invoke(null) as? Application
+        } catch (_: Throwable) {
+            null
         }
     }
 
