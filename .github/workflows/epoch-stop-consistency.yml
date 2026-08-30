@@ -1,0 +1,23 @@
+name: Epoch STOP consistency
+
+on: [push]
+
+permissions:
+  contents: write
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Apply consistency fix
+        run: python3 scripts/epoch_stop_consistency.py
+      - name: Commit consistency fix
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app/src/main/java/com/yagay/nfcdoorcard/ConfigProvider.kt app/src/main/java/com/yagay/nfcdoorcard/MainActivity.kt
+          git commit -m "fix: keep STOP verification consistent with controller epochs" || exit 0
+          git push
