@@ -2,6 +2,7 @@ package com.example.nfcdoorcard
 
 import android.content.ContentProvider
 import android.content.ContentValues
+import android.content.SharedPreferences
 import android.database.Cursor
 import android.database.MatrixCursor
 import android.net.Uri
@@ -13,6 +14,7 @@ class ConfigProvider : ContentProvider() {
     companion object {
         const val AUTHORITY = "com.example.nfcdoorcard.config"
         const val PATH_SETTINGS = "settings"
+        private const val PREFS_NAME = "nfc_config"
         val APP_BUILD: Int = BuildConfig.VERSION_CODE
 
         const val KEY_APP_BUILD = "app_build"
@@ -23,10 +25,6 @@ class ConfigProvider : ContentProvider() {
         const val KEY_SAK = "sak"
         const val KEY_ATQA = "atqa"
 
-        // Command protocol. The UI publishes desired state with a monotonically increasing
-        // generation. The Hook handles that exact generation inside com.android.nfc and
-        // writes the result back. This prevents stale async results from a previous command
-        // or previous NFC process from being accepted as current state.
         const val KEY_COMMAND_GENERATION = "command_generation"
         const val KEY_COMMAND_HANDLED_GENERATION = "command_handled_generation"
         const val KEY_COMMAND_ACTION = "command_action"
@@ -57,7 +55,13 @@ class ConfigProvider : ContentProvider() {
     }
 
     override fun onCreate(): Boolean {
-        context!!.getSharedPreferences("nfc_config", 0)
+        val base = context!!
+        val deviceContext = base.createDeviceProtectedStorageContext()
+        // Existing installs stored this state in credential-protected storage. Migrate it
+        // when possible, then always use device-protected storage so com.android.nfc can
+        // read desired state during direct boot before the user unlocks the phone.
+        runCatching { deviceContext.moveSharedPreferencesFrom(base, PREFS_NAME) }
+        deviceContext.getSharedPreferences(PREFS_NAME, 0)
             .edit()
             .putInt(KEY_APP_BUILD, APP_BUILD)
             .apply()
@@ -75,11 +79,8 @@ class ConfigProvider : ContentProvider() {
             Log.w("NfcConfigProvider", "Rejected config read from uid=${Binder.getCallingUid()}")
             return MatrixCursor(arrayOf("key", "value"))
         }
-        val prefs = context!!.getSharedPreferences("nfc_config", 0)
         val cursor = MatrixCursor(arrayOf("key", "value"))
-        prefs.all.forEach { (key, value) ->
-            cursor.addRow(arrayOf(key, value?.toString() ?: ""))
-        }
+        prefs().all.forEach { (key, value) -> cursor.addRow(arrayOf(key, value?.toString() ?: "")) }
         return cursor
     }
 
@@ -89,8 +90,7 @@ class ConfigProvider : ContentProvider() {
             Log.w("NfcConfigProvider", "Rejected config write from uid=${Binder.getCallingUid()}")
             return uri
         }
-        val prefs = context!!.getSharedPreferences("nfc_config", 0)
-        val editor = prefs.edit()
+        val editor = prefs().edit()
         values.keySet().forEach { key ->
             when (val value = values.get(key)) {
                 is Boolean -> editor.putBoolean(key, value)
@@ -119,14 +119,14 @@ class ConfigProvider : ContentProvider() {
 
     override fun delete(uri: Uri, selection: String?, selectionArgs: Array<out String>?): Int {
         if (!isTrustedCaller()) return 0
-        context!!.getSharedPreferences("nfc_config", 0)
-            .edit()
-            .clear()
-            .putInt(KEY_APP_BUILD, APP_BUILD)
-            .apply()
+        prefs().edit().clear().putInt(KEY_APP_BUILD, APP_BUILD).apply()
         context?.contentResolver?.notifyChange(uri, null)
         return 1
     }
+
+    private fun prefs(): SharedPreferences = context!!
+        .createDeviceProtectedStorageContext()
+        .getSharedPreferences(PREFS_NAME, 0)
 
     private fun isTrustedCaller(): Boolean {
         val callingUid = Binder.getCallingUid()
