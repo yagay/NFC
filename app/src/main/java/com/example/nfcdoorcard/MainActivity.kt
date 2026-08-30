@@ -34,14 +34,8 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
 enum class LogSource(val label: String) {
-    STATUS("状态"),
-    LSPOSED("LSPosed"),
-    KERNEL_SU("KernelSU"),
-    SYSTEM("系统"),
-    NFC("NFC"),
-    HAL("HAL"),
-    PROVIDER("Provider"),
-    APP("App")
+    STATUS("状态"), LSPOSED("LSPosed"), KERNEL_SU("KernelSU"), SYSTEM("系统"),
+    NFC("NFC"), HAL("HAL"), PROVIDER("Provider"), APP("App")
 }
 
 data class RuntimeStatus(
@@ -67,6 +61,7 @@ data class RuntimeStatus(
     val rfError: String? = null,
     val rfPid: Int = 0,
     val rfGeneration: Long = 0,
+    val rfVerification: String? = null,
     val fullDiagStage: String? = null,
     val fullDiagSummary: String? = null
 )
@@ -89,8 +84,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         nfcAdapter = NfcAdapter.getDefaultAdapter(this)
         pendingIntent = PendingIntent.getActivity(
-            this, 0,
-            Intent(this, javaClass).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
+            this, 0, Intent(this, javaClass).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
             PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
         savedCardsState = loadCards()
@@ -198,16 +192,12 @@ class MainActivity : ComponentActivity() {
                 status = snapshot.first
                 logText = if (logsEnabled) {
                     if (selectedSource == LogSource.STATUS) buildStatusSummary(snapshot.first) + "\n\n" + snapshot.second else snapshot.second
-                } else {
-                    ""
-                }
+                } else ""
                 kotlinx.coroutines.delay(if (logsEnabled) 2000 else 4000)
             }
         }
 
-        Scaffold(topBar = {
-            TopAppBar(title = { Text("NFC Expert Pro ${BuildConfig.VERSION_NAME}") })
-        }) { padding ->
+        Scaffold(topBar = { TopAppBar(title = { Text("NFC Expert Pro ${BuildConfig.VERSION_NAME}") }) }) { padding ->
             LazyColumn(
                 modifier = Modifier.padding(padding).fillMaxSize(),
                 contentPadding = PaddingValues(bottom = 12.dp)
@@ -255,11 +245,7 @@ class MainActivity : ComponentActivity() {
                         ) {
                             Column(Modifier.weight(1f)) {
                                 Text("日志显示", fontWeight = FontWeight.Bold, fontSize = 13.sp)
-                                Text(
-                                    if (logsEnabled) "已开启 · 正在抓取日志" else "已关闭 · 不抓取日志，减少性能影响",
-                                    fontSize = 11.sp,
-                                    color = Color.Gray
-                                )
+                                Text(if (logsEnabled) "已开启 · 正在抓取日志" else "已关闭 · 不抓取日志，减少性能影响", fontSize = 11.sp, color = Color.Gray)
                             }
                             Switch(
                                 checked = logsEnabled,
@@ -324,10 +310,7 @@ class MainActivity : ComponentActivity() {
                                 enabled = !diagnosticRunning,
                                 modifier = Modifier.weight(1f)
                             ) { Text(if (diagnosticRunning) "保存中" else "导出日志") }
-                            OutlinedButton(
-                                onClick = { AppLogger.clear(); logText = "" },
-                                modifier = Modifier.weight(1f)
-                            ) { Text("清空日志") }
+                            OutlinedButton(onClick = { AppLogger.clear(); logText = "" }, modifier = Modifier.weight(1f)) { Text("清空日志") }
                         }
                     }
                 }
@@ -342,15 +325,11 @@ class MainActivity : ComponentActivity() {
                 Text("运行状态", fontWeight = FontWeight.Bold)
                 StatusRow("NFC / Hook", status.currentPid > 0 && status.hookInstalled, "pid=${status.currentPid} · hookBuild=${status.hookBuild} · hookPid=${status.hookPid}")
                 StatusRow("模拟配置", status.simulationEnabled, if (status.simulationEnabled) "UID=${status.selectedUid ?: "-"}" else "IDLE")
-                StatusRow(
-                    "命令",
-                    status.commandStatus == "SUCCESS",
-                    "gen=${status.commandGeneration}/${status.handledGeneration} · ${status.commandAction} · ${status.commandStatus} · pid=${status.commandPid}"
-                )
+                StatusRow("命令", status.commandStatus == "SUCCESS", "gen=${status.commandGeneration}/${status.handledGeneration} · ${status.commandAction} · ${status.commandStatus} · pid=${status.commandPid}")
                 StatusRow(
                     "RF UID",
                     status.rfStatus == "RF_UID_APPLIED" && status.rfResult == "0" || status.rfStatus.startsWith("RF_STOCK_RESTORED"),
-                    "${status.rfStatus} · gen=${status.rfGeneration} · uid=${status.rfUid ?: "-"} · result=${status.rfResult ?: "-"}"
+                    "${status.rfStatus} · gen=${status.rfGeneration} · uid=${status.rfUid ?: "-"} · result=${status.rfResult ?: "-"} · verify=${status.rfVerification ?: "-"}"
                 )
                 Text("触发方式: LSPosed · com.android.nfc 进程内控制", fontSize = 11.sp)
                 Text("读卡模式: ${if (readModeEnabled) "开启" else "关闭"}", fontSize = 11.sp)
@@ -367,18 +346,9 @@ class MainActivity : ComponentActivity() {
             Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Text("读卡模式", fontWeight = FontWeight.Bold)
                 when {
-                    simulationActive -> {
-                        Text("当前正在模拟。读卡功能保持关闭。", fontSize = 12.sp)
-                        Button({}, enabled = false, modifier = Modifier.fillMaxWidth()) { Text("模拟中 · 读卡已关闭") }
-                    }
-                    readMode -> {
-                        Text("读卡已开启，请把门禁卡贴到手机背部。", fontSize = 12.sp)
-                        OutlinedButton(onStopRead, Modifier.fillMaxWidth()) { Text("退出读卡模式") }
-                    }
-                    card == null -> {
-                        Text("默认不读取卡片。需要添加新卡时再进入读卡模式。", fontSize = 12.sp)
-                        Button(onStartRead, Modifier.fillMaxWidth()) { Text("进入读卡模式") }
-                    }
+                    simulationActive -> { Text("当前正在模拟。读卡功能保持关闭。", fontSize = 12.sp); Button({}, enabled = false, modifier = Modifier.fillMaxWidth()) { Text("模拟中 · 读卡已关闭") } }
+                    readMode -> { Text("读卡已开启，请把门禁卡贴到手机背部。", fontSize = 12.sp); OutlinedButton(onStopRead, Modifier.fillMaxWidth()) { Text("退出读卡模式") } }
+                    card == null -> { Text("默认不读取卡片。需要添加新卡时再进入读卡模式。", fontSize = 12.sp); Button(onStartRead, Modifier.fillMaxWidth()) { Text("进入读卡模式") } }
                     else -> {
                         Text("读取成功", color = Color(0xFF2E7D32), fontWeight = FontWeight.Bold)
                         CardDetails(card)
@@ -438,7 +408,6 @@ class MainActivity : ComponentActivity() {
         stopReadMode("simulation_start")
         val generation = publishCommand(enabled = true, card = card)
         AppLogger.i("SIMULATION: COMMAND APPLY published generation=$generation uid=${card.uid} sak=${card.sak} atqa=${card.atqa}")
-
         operationExecutor.execute {
             var state = readRuntimeStatus(includeRootPid = true)
             if (!state.hookInstalled || state.hookBuild != EXPECTED_HOOK_BUILD) {
@@ -446,15 +415,13 @@ class MainActivity : ComponentActivity() {
                 AppLogger.i("SIMULATION: restarting stale/unavailable hook for command generation=$generation\n$restart")
                 state = waitForHookOnly(12_000)
             }
-
             state = waitForCommandCompletion(generation, card.uid, apply = true, timeoutMs = 12_000)
             val applied = isApplySuccess(state, generation, card.uid)
             val message = when {
                 applied -> "模拟成功 · UID=${card.uid} · NFC进程内确认"
                 !state.hookInstalled -> "模拟请求已保存，但 Hook 未就绪"
                 state.commandGeneration != generation -> "模拟请求被更新的命令替代"
-                state.commandStatus == "FAILED" || state.commandStatus == "TRIGGER_FAILED" ->
-                    "模拟失败 · ${state.commandStatus}: ${state.commandDetail ?: state.rfError ?: "unknown"}"
+                state.commandStatus == "FAILED" || state.commandStatus == "TRIGGER_FAILED" -> "模拟失败 · ${state.commandStatus}: ${state.commandDetail ?: state.rfError ?: "unknown"}"
                 else -> "模拟请求已发送 · 等待 RF UID 确认"
             }
             AppLogger.i("SIMULATION: COMMAND result generation=$generation message=$message\n${buildStatusSummary(state)}")
@@ -466,19 +433,15 @@ class MainActivity : ComponentActivity() {
         stopReadMode("simulation_stop")
         val generation = publishCommand(enabled = false, card = null)
         AppLogger.i("SIMULATION: COMMAND STOP published generation=$generation")
-
         operationExecutor.execute {
             var state = waitForCommandCompletion(generation, null, apply = false, timeoutMs = 6_000)
             if (isStopSuccess(state, generation)) {
-                val message = "模拟已停止 · 原厂 RF 已由 NFC 进程恢复"
                 AppLogger.i("SIMULATION: STOP success without restart generation=$generation\n${buildStatusSummary(state)}")
-                onDone(state, message)
+                onDone(state, "模拟已停止 · 原厂 RF 已由 NFC 进程恢复")
                 return@execute
             }
 
-            // Last-resort recovery only. Normal STOP should complete through the in-process
-            // share-mode trigger. A restart while simulation_enabled=false guarantees that
-            // the new NFC process cannot inject the previous UID.
+            AppLogger.i("SIMULATION: STOP timeout snapshot before fallback generation=$generation\n${buildStatusSummary(state)}\nPROVIDER=${readProviderMap().toSortedMap()}")
             val restart = restartNfcProcessKeepingEnabled("stop_command_fallback_generation_$generation")
             AppLogger.i("SIMULATION: STOP fallback NFC restart generation=$generation\n$restart")
             waitForHookOnly(12_000)
@@ -495,21 +458,18 @@ class MainActivity : ComponentActivity() {
                     put(ConfigProvider.KEY_RF_STATUS, "RF_STOCK_RESTORED_BY_RESTART")
                     put(ConfigProvider.KEY_RF_UID, "")
                     put(ConfigProvider.KEY_RF_SOURCE, "process-restart")
-                    put(ConfigProvider.KEY_RF_RESULT, "0")
+                    put(ConfigProvider.KEY_RF_RESULT, "")
                     put(ConfigProvider.KEY_RF_ERROR, "")
                     put(ConfigProvider.KEY_RF_PID, currentPid)
                     put(ConfigProvider.KEY_RF_GENERATION, generation)
+                    put(ConfigProvider.KEY_RF_VERIFICATION, "PROCESS_RESTART")
                     put(ConfigProvider.KEY_FULL_DIAG_STAGE, "RF_STOCK_RESTORED_BY_RESTART")
-                    put(ConfigProvider.KEY_FULL_DIAG_SUMMARY, "Simulation disabled before NFC restart; stock RF reloaded")
+                    put(ConfigProvider.KEY_FULL_DIAG_SUMMARY, "Simulation disabled before NFC restart; stock RF reloaded without native result claim")
                 })
                 state = readRuntimeStatus(includeRootPid = true)
             }
 
-            val message = if (isStopSuccess(state, generation)) {
-                "模拟已停止 · 已恢复原厂 RF"
-            } else {
-                "模拟已停止 · NFC 已重启，但状态确认未完成"
-            }
+            val message = if (isStopSuccess(state, generation)) "模拟已停止 · 已恢复原厂 RF" else "模拟已停止 · NFC 已重启，但状态确认未完成"
             onDone(state, message)
         }
     }
@@ -519,14 +479,11 @@ class MainActivity : ComponentActivity() {
         val previous = currentMap[ConfigProvider.KEY_COMMAND_GENERATION]?.toLongOrNull() ?: 0L
         val generation = maxOf(previous + 1L, System.currentTimeMillis())
         val action = if (enabled) "APPLY" else "STOP"
-
         contentResolver.insert(ConfigProvider.URI, ContentValues().apply {
             put(ConfigProvider.KEY_APP_BUILD, ConfigProvider.APP_BUILD)
             put(ConfigProvider.KEY_SIMULATION_ENABLED, enabled)
             if (card != null) {
-                put(ConfigProvider.KEY_UID, card.uid)
-                put(ConfigProvider.KEY_SAK, card.sak)
-                put(ConfigProvider.KEY_ATQA, card.atqa)
+                put(ConfigProvider.KEY_UID, card.uid); put(ConfigProvider.KEY_SAK, card.sak); put(ConfigProvider.KEY_ATQA, card.atqa)
             }
             put(ConfigProvider.KEY_COMMAND_GENERATION, generation)
             put(ConfigProvider.KEY_COMMAND_ACTION, action)
@@ -534,12 +491,9 @@ class MainActivity : ComponentActivity() {
             put(ConfigProvider.KEY_COMMAND_DETAIL, "Waiting for LSPosed NFC process command engine")
             put(ConfigProvider.KEY_COMMAND_PID, 0)
             put(ConfigProvider.KEY_RF_STATUS, if (enabled) "WAITING" else "STOPPING")
-            put(ConfigProvider.KEY_RF_UID, "")
-            put(ConfigProvider.KEY_RF_SOURCE, "")
-            put(ConfigProvider.KEY_RF_RESULT, "")
-            put(ConfigProvider.KEY_RF_ERROR, "")
-            put(ConfigProvider.KEY_RF_PID, 0)
-            put(ConfigProvider.KEY_RF_GENERATION, generation)
+            put(ConfigProvider.KEY_RF_UID, ""); put(ConfigProvider.KEY_RF_SOURCE, ""); put(ConfigProvider.KEY_RF_RESULT, "")
+            put(ConfigProvider.KEY_RF_ERROR, ""); put(ConfigProvider.KEY_RF_PID, 0); put(ConfigProvider.KEY_RF_GENERATION, generation)
+            put(ConfigProvider.KEY_RF_VERIFICATION, "")
             put(ConfigProvider.KEY_FULL_DIAG_STAGE, "COMMAND_PENDING")
             put(ConfigProvider.KEY_FULL_DIAG_SUMMARY, "$action generation=$generation published by app")
         })
@@ -558,13 +512,11 @@ class MainActivity : ComponentActivity() {
               sleep 0.5
               kill -0 "${'$'}old" 2>/dev/null && kill -KILL "${'$'}old" 2>/dev/null || true
             fi
-            i=0
-            new=""
+            i=0; new=""
             while [ ${'$'}i -lt 60 ]; do
               new=${'$'}(pidof com.android.nfc 2>/dev/null | awk '{print ${'$'}1}')
               if [ -n "${'$'}new" ] && [ "${'$'}new" != "${'$'}old" ]; then break; fi
-              sleep 0.2
-              i=${'$'}((i+1))
+              sleep 0.2; i=${'$'}((i+1))
             done
             state=${'$'}(dumpsys nfc 2>/dev/null | grep -m1 -E 'mState=|state=' || true)
             if ! echo "${'$'}state" | grep -Eqi 'mState=on|state=on|STATE_ON|mState=3'; then svc nfc enable 2>/dev/null || true; fi
@@ -573,14 +525,13 @@ class MainActivity : ComponentActivity() {
               state=${'$'}(dumpsys nfc 2>/dev/null | grep -m1 -E 'mState=|state=' || true)
               echo "${'$'}state" | grep -Eqi 'mState=on|state=on|STATE_ON|mState=3' && break
               if [ ${'$'}((j % 10)) -eq 0 ]; then svc nfc enable 2>/dev/null || true; fi
-              sleep 0.25
-              j=${'$'}((j+1))
+              sleep 0.25; j=${'$'}((j+1))
             done
             new=${'$'}(pidof com.android.nfc 2>/dev/null | awk '{print ${'$'}1}')
             echo "NEW_PID=${'$'}new"
             echo "NFC_STATE=${'$'}state"
         """.trimIndent()
-        return runRootCmd(script)
+        return runRootCmd(script, 35)
     }
 
     private fun waitForCommandCompletion(generation: Long, uid: String?, apply: Boolean, timeoutMs: Long): RuntimeStatus {
@@ -595,25 +546,22 @@ class MainActivity : ComponentActivity() {
         return state
     }
 
-    private fun isApplySuccess(state: RuntimeStatus, generation: Long, uid: String): Boolean {
-        return state.commandGeneration == generation &&
-            state.handledGeneration == generation &&
-            state.commandStatus == "SUCCESS" &&
-            state.commandPid > 0 && state.commandPid == state.currentPid &&
-            state.rfGeneration == generation &&
-            state.rfPid > 0 && state.rfPid == state.currentPid &&
-            state.rfStatus == "RF_UID_APPLIED" &&
-            state.rfUid.equals(uid, ignoreCase = true) &&
-            state.rfResult == "0"
-    }
+    private fun isApplySuccess(state: RuntimeStatus, generation: Long, uid: String): Boolean =
+        state.commandGeneration == generation && state.handledGeneration == generation && state.commandStatus == "SUCCESS" &&
+            state.currentPid > 0 && state.commandPid == state.currentPid && state.rfGeneration == generation &&
+            state.rfPid == state.currentPid && state.rfStatus == "RF_UID_APPLIED" && state.rfUid.equals(uid, ignoreCase = true) &&
+            state.rfResult == "0" && state.rfVerification == "NATIVE_RESULT"
 
     private fun isStopSuccess(state: RuntimeStatus, generation: Long): Boolean {
-        return state.commandGeneration == generation &&
-            state.handledGeneration == generation &&
-            state.commandStatus == "SUCCESS" &&
-            state.rfGeneration == generation &&
-            state.rfResult == "0" &&
-            state.rfStatus.startsWith("RF_STOCK_RESTORED")
+        val common = state.commandGeneration == generation && state.handledGeneration == generation &&
+            state.commandStatus == "SUCCESS" && state.currentPid > 0 && state.commandPid == state.currentPid &&
+            state.rfGeneration == generation && state.rfPid == state.currentPid
+        if (!common) return false
+        return when {
+            state.rfStatus == "RF_STOCK_RESTORED" -> state.rfResult == "0" && state.rfVerification == "NATIVE_RESULT"
+            state.rfStatus == "RF_STOCK_RESTORED_BY_RESTART" -> state.rfVerification == "PROCESS_RESTART"
+            else -> false
+        }
     }
 
     private fun waitForHookOnly(timeoutMs: Long): RuntimeStatus {
@@ -632,9 +580,7 @@ class MainActivity : ComponentActivity() {
     private fun readProviderMap(): Map<String, String> {
         val map = mutableMapOf<String, String>()
         runCatching {
-            contentResolver.query(ConfigProvider.URI, null, null, null, null)?.use { c ->
-                while (c.moveToNext()) map[c.getString(0)] = c.getString(1)
-            }
+            contentResolver.query(ConfigProvider.URI, null, null, null, null)?.use { c -> while (c.moveToNext()) map[c.getString(0)] = c.getString(1) }
         }
         return map
     }
@@ -643,25 +589,19 @@ class MainActivity : ComponentActivity() {
         val map = readProviderMap()
         val scopePid = map[ConfigProvider.KEY_SCOPE_PID]?.toIntOrNull() ?: 0
         val hookPid = map[ConfigProvider.KEY_HOOK_PID]?.toIntOrNull() ?: 0
-        val rfPidFromProvider = map[ConfigProvider.KEY_RF_PID]?.toIntOrNull() ?: 0
+        val rfPid = map[ConfigProvider.KEY_RF_PID]?.toIntOrNull() ?: 0
         val commandPid = map[ConfigProvider.KEY_COMMAND_PID]?.toIntOrNull() ?: 0
-        val currentPid = if (includeRootPid) {
-            currentNfcPid().toIntOrNull() ?: 0
-        } else {
-            hookPid.takeIf { it > 0 } ?: commandPid.takeIf { it > 0 } ?: scopePid.takeIf { it > 0 } ?: rfPidFromProvider
-        }
+        val currentPid = if (includeRootPid) currentNfcPid().toIntOrNull() ?: 0
+        else hookPid.takeIf { it > 0 } ?: commandPid.takeIf { it > 0 } ?: scopePid.takeIf { it > 0 } ?: rfPid
         val hookBuild = map[ConfigProvider.KEY_HOOK_BUILD]?.toIntOrNull() ?: 0
-        val hookFresh = currentPid > 0 && hookPid == currentPid && map[ConfigProvider.KEY_HOOK_INSTALLED].toBoolean()
-        val scopeFresh = currentPid > 0 && scopePid == currentPid && map[ConfigProvider.KEY_SCOPE_OK].toBoolean()
-        val rfPid = rfPidFromProvider
         return RuntimeStatus(
             appBuild = map[ConfigProvider.KEY_APP_BUILD]?.toIntOrNull() ?: 0,
             hookBuild = hookBuild,
             currentPid = currentPid,
             scopePid = scopePid,
             hookPid = hookPid,
-            scopeOk = scopeFresh,
-            hookInstalled = hookFresh,
+            scopeOk = currentPid > 0 && scopePid == currentPid && map[ConfigProvider.KEY_SCOPE_OK].toBoolean(),
+            hookInstalled = currentPid > 0 && hookPid == currentPid && map[ConfigProvider.KEY_HOOK_INSTALLED].toBoolean(),
             simulationEnabled = map[ConfigProvider.KEY_SIMULATION_ENABLED].toBoolean(),
             selectedUid = map[ConfigProvider.KEY_UID]?.takeIf { it.isNotBlank() },
             commandGeneration = map[ConfigProvider.KEY_COMMAND_GENERATION]?.toLongOrNull() ?: 0L,
@@ -677,6 +617,7 @@ class MainActivity : ComponentActivity() {
             rfError = if (rfPid == currentPid) map[ConfigProvider.KEY_RF_ERROR]?.takeIf { it.isNotBlank() } else null,
             rfPid = rfPid,
             rfGeneration = map[ConfigProvider.KEY_RF_GENERATION]?.toLongOrNull() ?: 0L,
+            rfVerification = if (rfPid == currentPid) map[ConfigProvider.KEY_RF_VERIFICATION]?.takeIf { it.isNotBlank() } else null,
             fullDiagStage = map[ConfigProvider.KEY_FULL_DIAG_STAGE]?.takeIf { it.isNotBlank() },
             fullDiagSummary = map[ConfigProvider.KEY_FULL_DIAG_SUMMARY]?.takeIf { it.isNotBlank() }
         )
@@ -691,7 +632,7 @@ class MainActivity : ComponentActivity() {
         appendLine("CONFIG: ${if (s.simulationEnabled) "ENABLED" else "IDLE"} uid=${s.selectedUid}")
         appendLine("COMMAND: generation=${s.commandGeneration} handled=${s.handledGeneration} action=${s.commandAction} status=${s.commandStatus} detail=${s.commandDetail}")
         appendLine("READ_MODE: ${if (readModeEnabled) "ENABLED" else "IDLE"}")
-        appendLine("RF: generation=${s.rfGeneration} ${s.rfStatus} uid=${s.rfUid} source=${s.rfSource} result=${s.rfResult} error=${s.rfError}")
+        appendLine("RF: generation=${s.rfGeneration} ${s.rfStatus} uid=${s.rfUid} source=${s.rfSource} result=${s.rfResult} verification=${s.rfVerification} error=${s.rfError}")
         append("FINAL: stage=${s.fullDiagStage} summary=${s.fullDiagSummary}")
     }
 
@@ -700,10 +641,8 @@ class MainActivity : ComponentActivity() {
         val output = when (source) {
             LogSource.STATUS -> runRootCmd("logcat -d -t 350 -v threadtime -s NfcDoorCard NfcUIDSim 2>/dev/null")
             LogSource.LSPOSED -> runRootCmd("""
-                {
-                  grep -R -h -E 'NfcUIDSim|com.example.nfcdoorcard|PROD MODULE|PROD HOOK|RFPROBE|NFCID1|COMMAND|LSPosed' /data/adb/lspd/log 2>/dev/null || true
-                  logcat -b all -d -v threadtime 2>/dev/null | grep -E 'NfcUIDSim|PROD MODULE|PROD HOOK|RFPROBE|NFCID1|COMMAND' || true
-                } | tail -n 1500
+                { grep -R -h -E 'NfcUIDSim|com.example.nfcdoorcard|PROD MODULE|PROD HOOK|RFPROBE|NFCID1|COMMAND|LSPosed' /data/adb/lspd/log 2>/dev/null || true
+                  logcat -b all -d -v threadtime 2>/dev/null | grep -E 'NfcUIDSim|PROD MODULE|PROD HOOK|RFPROBE|NFCID1|COMMAND' || true; } | tail -n 1500
             """.trimIndent())
             LogSource.KERNEL_SU -> runRootCmd("for f in ${'$'}(ls -t /data/adb/ksu/log/sulog* 2>/dev/null | head -n 3); do echo === ${'$'}f ===; tail -n 300 ${'$'}f; done")
             LogSource.SYSTEM -> runRootCmd("logcat -b all -d -v threadtime 2>/dev/null | tail -n 1800")
@@ -713,24 +652,19 @@ class MainActivity : ComponentActivity() {
                 runRootCmd("logcat -b all -d -v threadtime 2>/dev/null | awk '$pidFilter' | tail -n 1800")
             }
             LogSource.HAL -> runRootCmd("""
-                echo '--- NFC PROCESSES ---'
-                ps -A | grep -E 'android.hardware.nfc|vendor.oplus.hardware.nfc|com.android.nfc' || true
-                echo '--- NFC PROPERTIES ---'
-                getprop | grep -i -E 'nfc|nxp|st21|st54|sn100|sn220|oplus' | head -n 300 || true
-                echo '--- HAL LOGCAT ---'
-                logcat -b all -d -v threadtime 2>/dev/null | grep -i -E 'android.hardware.nfc|vendor.oplus.hardware.nfc|NxpNfc|NfcHal|libnfc|nfc-service|NFC HAL|STNfc|sn100|sn220' | tail -n 1200 || true
+                echo '--- NFC PROCESSES ---'; ps -A | grep -E 'android.hardware.nfc|vendor.oplus.hardware.nfc|com.android.nfc' || true
+                echo '--- NFC PROPERTIES ---'; getprop | grep -i -E 'nfc|nxp|st21|st54|sn100|sn220|oplus' | head -n 300 || true
+                echo '--- HAL LOGCAT ---'; logcat -b all -d -v threadtime 2>/dev/null | grep -i -E 'android.hardware.nfc|vendor.oplus.hardware.nfc|NxpNfc|NfcHal|libnfc|nfc-service|NFC HAL|STNfc|sn100|sn220' | tail -n 1200 || true
             """.trimIndent())
             LogSource.PROVIDER -> buildString {
-                appendLine("=== PROVIDER STATE ===")
-                readProviderMap().toSortedMap().forEach { (k, v) -> appendLine("$k=$v") }
-                appendLine("current_nfc_pid=${currentNfcPid()}")
+                appendLine("=== PROVIDER STATE ==="); readProviderMap().toSortedMap().forEach { (k, v) -> appendLine("$k=$v") }; appendLine("current_nfc_pid=${currentNfcPid()}")
             }
             LogSource.APP -> AppLogger.readAll().ifBlank { "No app logs" }
         }
         return output.ifBlank { "No matching logs found for ${source.label}" }
     }
 
-    private fun currentNfcPid(): String = runRootCmd("pidof com.android.nfc 2>/dev/null | awk '{print ${'$'}1}'")
+    private fun currentNfcPid(): String = runRootCmd("pidof com.android.nfc 2>/dev/null | awk '{print ${'$'}1}'", 5, 4096)
         .lineSequence().firstOrNull { it.trim().matches(Regex("\\d+")) }?.trim().orEmpty()
 
     private fun loadCards(): List<CardModel> {
@@ -743,9 +677,7 @@ class MainActivity : ComponentActivity() {
         return if (json.isNullOrBlank()) emptyList() else runCatching { gson.fromJson<List<CardModel>>(json, object : TypeToken<List<CardModel>>() {}.type) ?: emptyList() }.getOrDefault(emptyList())
     }
 
-    private fun saveCards(cards: List<CardModel>) {
-        getSharedPreferences("cards", 0).edit().putString("list", gson.toJson(cards)).apply()
-    }
+    private fun saveCards(cards: List<CardModel>) { getSharedPreferences("cards", 0).edit().putString("list", gson.toJson(cards)).apply() }
 
     private fun saveDiagnosticWithoutSharing(onDone: () -> Unit) {
         stopReadMode("diagnostic_save")
@@ -754,27 +686,14 @@ class MainActivity : ComponentActivity() {
             try {
                 val fileName = "nfc_fullcheck_${BuildConfig.VERSION_NAME}_${System.currentTimeMillis()}.txt"
                 val values = ContentValues().apply {
-                    put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
-                    put(MediaStore.MediaColumns.MIME_TYPE, "text/plain")
-                    put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
-                    put(MediaStore.MediaColumns.IS_PENDING, 1)
+                    put(MediaStore.MediaColumns.DISPLAY_NAME, fileName); put(MediaStore.MediaColumns.MIME_TYPE, "text/plain")
+                    put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS); put(MediaStore.MediaColumns.IS_PENDING, 1)
                 }
-                createdUri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
-                    ?: error("无法在 Download 创建日志文件")
-
-                contentResolver.openOutputStream(createdUri, "w")?.bufferedWriter()?.use { writer ->
-                    writer.write(buildFullDiagnosticReport())
-                } ?: error("无法写入日志文件")
-
-                contentResolver.update(createdUri, ContentValues().apply {
-                    put(MediaStore.MediaColumns.IS_PENDING, 0)
-                }, null, null)
-
+                createdUri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values) ?: error("无法在 Download 创建日志文件")
+                contentResolver.openOutputStream(createdUri, "w")?.bufferedWriter()?.use { it.write(buildFullDiagnosticReport()) } ?: error("无法写入日志文件")
+                contentResolver.update(createdUri, ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }, null, null)
                 AppLogger.i("Diagnostics saved to public Downloads: $fileName uri=$createdUri")
-                runOnUiThread {
-                    onDone()
-                    Toast.makeText(this@MainActivity, "日志已保存到 Download/$fileName", Toast.LENGTH_LONG).show()
-                }
+                runOnUiThread { onDone(); Toast.makeText(this@MainActivity, "日志已保存到 Download/$fileName", Toast.LENGTH_LONG).show() }
             } catch (e: Exception) {
                 createdUri?.let { runCatching { contentResolver.delete(it, null, null) } }
                 AppLogger.i("Diagnostics failed ${e.javaClass.simpleName}: ${e.message}")
@@ -787,40 +706,28 @@ class MainActivity : ComponentActivity() {
         val s = readRuntimeStatus(includeRootPid = true)
         appendLine("=== NFC FULL CHECK ${BuildConfig.VERSION_NAME} ===")
         appendLine("Generated: ${System.currentTimeMillis()}")
-        appendLine("Trigger: LSPosed in-process NFC command engine; vendor transaction 6 -> 15 is executed inside com.android.nfc")
-        appendLine("--- FINAL SUMMARY ---")
-        appendLine(buildStatusSummary(s))
-        appendLine()
+        appendLine("Trigger: LSPosed in-process NFC command engine; AIDL transaction IDs are reflected with compatibility fallbacks")
+        appendLine("--- FINAL SUMMARY ---"); appendLine(buildStatusSummary(s)); appendLine()
         appendLine("--- SAVED CARDS ---")
-        val cards = loadCards()
-        appendLine("count=${cards.size}")
-        cards.forEach { appendLine("card uid=${it.uid} sak=${it.sak} atqa=${it.atqa}") }
-        appendLine("--- APP / APK ---")
-        appendLine(runRootCmd("dumpsys package $packageName 2>/dev/null | grep -E 'versionName=|versionCode=|path:' | head -n 30"))
-        appendLine("--- ROOT ---")
-        appendLine(runRootCmd("id; su -v 2>/dev/null || true"))
-        appendLine("--- NFC PROCESS / HAL ---")
-        appendLine(runRootCmd("pm path com.android.nfc; pidof com.android.nfc; ps -A | grep -E 'android.hardware.nfc|vendor.oplus.hardware.nfc|com.android.nfc|$packageName'"))
+        val cards = loadCards(); appendLine("count=${cards.size}"); cards.forEach { appendLine("card uid=${it.uid} sak=${it.sak} atqa=${it.atqa}") }
+        appendLine("--- APP / APK ---"); appendLine(runRootCmd("dumpsys package $packageName 2>/dev/null | grep -E 'versionName=|versionCode=|path:'"))
+        appendLine("--- ROOT ---"); appendLine(runRootCmd("id; su -v 2>/dev/null || true"))
+        appendLine("--- NFC PROCESS / HAL ---"); appendLine(runRootCmd("pm path com.android.nfc; pidof com.android.nfc; ps -A | grep -E 'android.hardware.nfc|vendor.oplus.hardware.nfc|com.android.nfc|$packageName'"))
         appendLine("--- NFC SERVICE FULL ---")
-        appendLine(runRootCmd("dumpsys nfc 2>/dev/null | head -n 1000"))
-        LogSource.entries.forEach { source ->
-            appendLine()
-            appendLine("=== LOG SOURCE: ${source.name} / ${source.label} ===")
-            appendLine(fetchLogsSync(source))
-        }
+        // Do not pipe dumpsys into head: closing the pipe early makes NfcService log EPIPE.
+        appendLine(runRootCmd("dumpsys nfc 2>/dev/null", 25, 300_000))
+        LogSource.entries.forEach { source -> appendLine(); appendLine("=== LOG SOURCE: ${source.name} / ${source.label} ==="); appendLine(fetchLogsSync(source)) }
     }
 
     private fun ensureRootAccess(showToast: Boolean = true): Boolean {
         rootAvailableCache?.let { if (it) return true }
         val ok = try {
-            val process = Runtime.getRuntime().exec(arrayOf("su", "-c", "id -u"))
+            val process = ProcessBuilder("su", "-c", "id -u").redirectErrorStream(true).start()
             val finished = process.waitFor(4, TimeUnit.SECONDS)
             val output = if (finished) process.inputStream.bufferedReader().readText().trim() else ""
             if (!finished) process.destroyForcibly()
             finished && process.exitValue() == 0 && output.lineSequence().any { it.trim() == "0" }
-        } catch (_: Throwable) {
-            false
-        }
+        } catch (_: Throwable) { false }
         rootAvailableCache = if (ok) true else null
         if (!ok && showToast) notifyRootUnavailable()
         return ok
@@ -830,19 +737,37 @@ class MainActivity : ComponentActivity() {
         val now = System.currentTimeMillis()
         if (now - lastRootToastAt < 3000L) return
         lastRootToastAt = now
-        runOnUiThread {
-            Toast.makeText(this@MainActivity, "Root 获取失败，请在 Root 管理器中授予本应用权限", Toast.LENGTH_LONG).show()
-        }
+        runOnUiThread { Toast.makeText(this@MainActivity, "Root 获取失败，请在 Root 管理器中授予本应用权限", Toast.LENGTH_LONG).show() }
     }
 
-    private fun runRootCmd(command: String): String {
+    private fun runRootCmd(command: String, timeoutSeconds: Long = 20, maxChars: Int = 1_000_000): String {
         if (!ensureRootAccess(showToast = true)) return "ROOT_UNAVAILABLE"
         return try {
-            val process = Runtime.getRuntime().exec(arrayOf("su", "-c", command))
-            val out = process.inputStream.bufferedReader().readText()
-            val err = process.errorStream.bufferedReader().readText()
-            process.waitFor()
-            buildString { append(out); if (err.isNotBlank()) appendLine(err); appendLine("[exit=${process.exitValue()}]") }
+            val process = ProcessBuilder("su", "-c", command).redirectErrorStream(true).start()
+            val output = StringBuilder()
+            val reader = Thread({
+                runCatching {
+                    process.inputStream.bufferedReader().useLines { lines ->
+                        lines.forEach { line ->
+                            if (output.length < maxChars) {
+                                val remaining = maxChars - output.length
+                                val piece = if (line.length + 1 <= remaining) line + "\n" else line.take(remaining)
+                                output.append(piece)
+                            }
+                        }
+                    }
+                }
+            }, "NfcDoorCard-RootReader").apply { isDaemon = true; start() }
+
+            val finished = process.waitFor(timeoutSeconds, TimeUnit.SECONDS)
+            if (!finished) {
+                process.destroyForcibly()
+                process.waitFor(2, TimeUnit.SECONDS)
+            }
+            reader.join(1500)
+            if (!finished) output.appendLine("[timeout=${timeoutSeconds}s]")
+            else output.appendLine("[exit=${process.exitValue()}]")
+            output.toString()
         } catch (t: Throwable) {
             rootAvailableCache = null
             notifyRootUnavailable()
