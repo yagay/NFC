@@ -12,8 +12,8 @@ android {
         applicationId = "com.example.nfcdoorcard"
         minSdk = 31
         targetSdk = 35
-        versionCode = 29
-        versionName = "1.0.28"
+        versionCode = 30
+        versionName = "1.0.29"
 
         // Runtime protocol v5; NFC lifecycle hook build 22 is validated with this app build.
         buildConfigField("int", "HOOK_BUILD", "22")
@@ -55,6 +55,7 @@ dependencies {
     implementation("androidx.appcompat:appcompat:1.7.0")
     implementation("androidx.activity:activity-compose:1.10.0")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
+    implementation("androidx.lifecycle:lifecycle-viewmodel-ktx:2.8.7")
     implementation(platform("androidx.compose:compose-bom:2025.01.00"))
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.ui:ui")
