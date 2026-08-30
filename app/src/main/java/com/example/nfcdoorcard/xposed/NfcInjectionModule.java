@@ -139,8 +139,9 @@ public class NfcInjectionModule extends XposedModule {
         Method method = target.resolve(cl);
         hook(method).intercept(chain -> {
             Object[] args = chain.getArgs().toArray();
-            if (args.length != 1 || !(args[0] instanceof byte[])) return chain.proceed();
-            byte[] original = (byte[]) args[0];
+            int payloadArg = findSingleByteArrayArg(args);
+            if (payloadArg < 0) return chain.proceed();
+            byte[] original = (byte[]) args[payloadArg];
             int payloadScore = payloadEngine.inspectScore(original);
             if (payloadScore <= 0) return chain.proceed();
 
@@ -165,7 +166,9 @@ public class NfcInjectionModule extends XposedModule {
                 if (cfg.initialized && "STOP".equals(cfg.commandAction) && !isGenerationCompleted(cfg.generation, pid)) {
                     byte[] stock = reversibleStockPayload;
                     if (stock != null && target.fingerprint().equals(reversibleTargetFingerprint)) {
-                        Object result = chain.proceed(new Object[]{stock.clone()});
+                        Object[] stockArgs = args.clone();
+                        stockArgs[payloadArg] = stock.clone();
+                        Object result = chain.proceed(stockArgs);
                         NativeOutcome outcome = interpretNativeResult(method, result);
                         if (outcome.accepted) {
                             clearRestoreState();
@@ -206,7 +209,9 @@ public class NfcInjectionModule extends XposedModule {
             Log.i(TAG, "NFCID1 APPLY target=" + target.fingerprint() + " codec=" + rewritten.codecId +
                     " reason=" + rewritten.reason + " pid=" + pid + " generation=" + cfg.generation + " uid=" + uidHex);
 
-            Object result = chain.proceed(new Object[]{rewritten.data});
+            Object[] rewrittenArgs = args.clone();
+            rewrittenArgs[payloadArg] = rewritten.data;
+            Object result = chain.proceed(rewrittenArgs);
             NativeOutcome outcome = interpretNativeResult(method, result);
             if (outcome.accepted) {
                 disabledAfterFailure = false;
@@ -776,6 +781,18 @@ public class NfcInjectionModule extends XposedModule {
 
     private static String normalizeUid(String uid) {
         return uid == null ? "" : uid.replaceAll("[^0-9A-Fa-f]", "").toUpperCase(Locale.ROOT);
+    }
+
+    private static int findSingleByteArrayArg(Object[] args) {
+        if (args == null || args.length == 0) return -1;
+        int index = -1;
+        for (int i = 0; i < args.length; i++) {
+            if (args[i] instanceof byte[]) {
+                if (index >= 0) return -1;
+                index = i;
+            }
+        }
+        return index;
     }
 
     private static NativeOutcome interpretNativeResult(Method method, Object result) {

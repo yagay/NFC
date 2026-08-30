@@ -11,11 +11,9 @@ final class NfcProcessVendorController {
     private static final String NFC_SERVICE_NAME = "nfc";
     private static final String INFC_DESCRIPTOR = "android.nfc.INfcAdapter";
     private static final String INFC_STUB = "android.nfc.INfcAdapter$Stub";
-    private static final int FALLBACK_TX_GET_VENDOR_INTERFACE = 6;
     private static final String VENDOR_NAME = "vendor";
     private static final String VENDOR_DESCRIPTOR = "com.vendor.nfc.IVendorNfcAdapter";
     private static final String VENDOR_STUB = "com.vendor.nfc.IVendorNfcAdapter$Stub";
-    private static final int FALLBACK_TX_ENABLE_SHARE_MODE = 15;
     private static final int STARTUP_RETRY_COUNT = 30;
     private static final long STARTUP_RETRY_DELAY_MS = 100L;
 
@@ -47,111 +45,77 @@ final class NfcProcessVendorController {
                 last.vendorDescriptor);
     }
 
-    /**
-     * Reinitializes the actual NFC controller instead of only restarting the Java process.
-     * This is required when LA_NFCID1 was appended to CORE_SET_CONFIG: replaying a payload
-     * that omits parameter 0x33 does not delete the value already stored by the controller.
-     */
+    /** Experimental lifecycle capability; normal STOP currently uses process restart. */
     Result reinitializeController() {
-        Result last = null;
-        for (int attempt = 0; attempt < 3; attempt++) {
-            last = reinitializeControllerOnce();
-            if (last.success || !isControllerTransient(last.stage)) return last;
-            if (attempt < 2) sleep(120L);
-        }
-        return last == null
-                ? new Result(false, "CONTROLLER_UNKNOWN", "No controller reinit result", null)
-                : new Result(false, last.stage, last.detail + " after transient retries", last.vendorDescriptor);
-    }
-
-    private Result reinitializeControllerOnce() {
         try {
             IBinder main = serviceManagerBinder();
-            if (main == null || !main.isBinderAlive() || !main.pingBinder()) {
-                return new Result(false, "CONTROLLER_BINDER", "NFC binder unavailable for controller reinit", null);
+            if (!alive(main)) return new Result(false, "CONTROLLER_BINDER", "NFC binder unavailable", null);
+            if (!INFC_DESCRIPTOR.equals(safeDescriptor(main))) {
+                return new Result(false, "CONTROLLER_DESCRIPTOR", "Unexpected descriptor=" + safeDescriptor(main), null);
             }
-            String descriptor = safeDescriptor(main);
-            if (!INFC_DESCRIPTOR.equals(descriptor)) {
-                return new Result(false, "CONTROLLER_DESCRIPTOR", "Unexpected descriptor=" + descriptor, null);
-            }
-
-            int txDisable = resolveRequiredTransaction(INFC_STUB, "TRANSACTION_disable");
-            int txEnable = resolveRequiredTransaction(INFC_STUB, "TRANSACTION_enable");
-            if (txDisable <= 0 || txEnable <= 0) {
-                return new Result(false, "CONTROLLER_TRANSACTIONS",
-                        "Unable to reflect INfcAdapter disable/enable transaction IDs", null);
-            }
-
-            boolean disabled = transactDisable(main, txDisable, false);
-            if (!disabled) {
-                return new Result(false, "CONTROLLER_DISABLE",
-                        "INfcAdapter.disable(false) rejected tx=" + txDisable, null);
-            }
-
-            // Let NfcService drive native close/deinit before reopening the controller.
+            Object proxy = asInterface(INFC_STUB, main);
+            if (proxy == null) return new Result(false, "CONTROLLER_PROXY", "INfcAdapter Stub.asInterface unavailable", null);
+            Boolean disabled = invokeBooleanMethod(proxy, "disable", new Class<?>[]{boolean.class}, new Object[]{false});
+            if (!Boolean.TRUE.equals(disabled)) return new Result(false, "CONTROLLER_DISABLE", "INfcAdapter.disable(false) unavailable/rejected", null);
             sleep(500L);
-
-            IBinder afterDisable = serviceManagerBinder();
-            if (afterDisable == null || !afterDisable.isBinderAlive()) afterDisable = main;
-            boolean enabled = transactEnable(afterDisable, txEnable);
-            if (!enabled) {
-                return new Result(false, "CONTROLLER_ENABLE",
-                        "INfcAdapter.enable() rejected tx=" + txEnable, null);
-            }
-            return new Result(true, "CONTROLLER_REINITIALIZED",
-                    "NFC controller reinitialized through INfcAdapter disable(false)->enable() tx=" +
-                            txDisable + "->" + txEnable,
-                    null);
+            IBinder after = serviceManagerBinder();
+            if (!alive(after)) after = main;
+            Object afterProxy = asInterface(INFC_STUB, after);
+            Boolean enabled = invokeBooleanMethod(afterProxy, "enable", new Class<?>[0], new Object[0]);
+            if (!Boolean.TRUE.equals(enabled)) return new Result(false, "CONTROLLER_ENABLE", "INfcAdapter.enable() unavailable/rejected", null);
+            return new Result(true, "CONTROLLER_REINITIALIZED", "NFC controller reinitialized through reflected AIDL proxy", null);
         } catch (Throwable t) {
-            return new Result(false, "CONTROLLER_EXCEPTION",
-                    t.getClass().getName() + ": " + String.valueOf(t.getMessage()), null);
+            return new Result(false, "CONTROLLER_EXCEPTION", t.getClass().getName() + ": " + String.valueOf(t.getMessage()), null);
         }
     }
 
     private Result setShareModeOnce(boolean enabled) {
         try {
             IBinder main = serviceManagerBinder();
-            if (main == null) return new Result(false, "MAIN_BINDER", "ServiceManager returned null NFC binder", null);
-            if (!main.isBinderAlive() || !main.pingBinder()) return new Result(false, "MAIN_BINDER", "NFC binder is not alive", null);
-
+            if (!alive(main)) return new Result(false, "MAIN_BINDER", "NFC binder unavailable", null);
             String mainDescriptor = safeDescriptor(main);
-            if (!INFC_DESCRIPTOR.equals(mainDescriptor)) {
-                return new Result(false, "MAIN_DESCRIPTOR", "Unexpected descriptor=" + mainDescriptor, null);
-            }
+            if (!INFC_DESCRIPTOR.equals(mainDescriptor)) return new Result(false, "MAIN_DESCRIPTOR", "Unexpected descriptor=" + mainDescriptor, null);
 
-            int txGetVendor = resolveTransaction(INFC_STUB, "TRANSACTION_getNfcAdapterVendorInterface", FALLBACK_TX_GET_VENDOR_INTERFACE);
-            IBinder vendor = getVendorBinder(main, txGetVendor);
-            if (vendor == null) return new Result(false, "GET_VENDOR_BINDER", "transaction " + txGetVendor + " returned null/rejected", null);
-            if (!vendor.isBinderAlive() || !vendor.pingBinder()) return new Result(false, "GET_VENDOR_BINDER", "Vendor binder is not alive", null);
+            // Preferred path: generated AIDL proxies. This follows the runtime method ABI and does
+            // not depend on transaction numbering. If the OEM interface cannot be reflected, use
+            // only transaction IDs reflected from the current Stub; never guess a numeric ID.
+            Object mainProxy = asInterface(INFC_STUB, main);
+            IBinder vendor = getVendorBinderViaProxy(mainProxy);
+            String path = "aidl-proxy";
+            if (vendor == null) {
+                int txGetVendor = resolveRequiredTransaction(INFC_STUB, "TRANSACTION_getNfcAdapterVendorInterface");
+                if (txGetVendor <= 0) return new Result(false, "GET_VENDOR_CAPABILITY", "No proxy method or reflected vendor transaction", null);
+                vendor = getVendorBinderTransact(main, txGetVendor);
+                path = "reflected-transaction";
+            }
+            if (!alive(vendor)) return new Result(false, "GET_VENDOR_BINDER", "Vendor binder unavailable", null);
 
             String vendorDescriptor = safeDescriptor(vendor);
             if (!VENDOR_DESCRIPTOR.equals(vendorDescriptor)) {
                 return new Result(false, "VENDOR_DESCRIPTOR", "Unexpected descriptor=" + vendorDescriptor, vendorDescriptor);
             }
 
-            int txShare = resolveTransaction(VENDOR_STUB, "TRANSACTION_enableNfcShareMode", FALLBACK_TX_ENABLE_SHARE_MODE);
+            Object vendorProxy = asInterface(VENDOR_STUB, vendor);
+            Boolean proxyAccepted = invokeBooleanMethod(vendorProxy, "enableNfcShareMode",
+                    new Class<?>[]{boolean.class}, new Object[]{enabled});
+            if (proxyAccepted != null) {
+                return new Result(proxyAccepted, proxyAccepted ? "TRIGGERED" : "SHARE_MODE",
+                        "enableNfcShareMode(" + enabled + ") via AIDL proxy", vendorDescriptor);
+            }
+
+            int txShare = resolveRequiredTransaction(VENDOR_STUB, "TRANSACTION_enableNfcShareMode");
+            if (txShare <= 0) return new Result(false, "SHARE_MODE_CAPABILITY", "No proxy method or reflected share-mode transaction", vendorDescriptor);
             boolean accepted = transactShareMode(vendor, enabled, txShare);
-            return new Result(
-                    accepted,
-                    accepted ? "TRIGGERED" : "SHARE_MODE",
-                    accepted
-                            ? "enableNfcShareMode(" + enabled + ") accepted in NFC process tx=" + txShare + " getterTx=" + txGetVendor
-                            : "enableNfcShareMode reply rejected/empty tx=" + txShare,
-                    vendorDescriptor
-            );
+            return new Result(accepted, accepted ? "TRIGGERED" : "SHARE_MODE",
+                    "enableNfcShareMode(" + enabled + ") via " + path + "/reflected-tx=" + txShare,
+                    vendorDescriptor);
         } catch (Throwable t) {
             return new Result(false, "EXCEPTION", t.getClass().getName() + ": " + String.valueOf(t.getMessage()), null);
         }
     }
 
     private static boolean isTransient(String stage) {
-        return "MAIN_BINDER".equals(stage)
-                || "GET_VENDOR_BINDER".equals(stage)
-                || "EXCEPTION".equals(stage);
-    }
-
-    private static boolean isControllerTransient(String stage) {
-        return "CONTROLLER_BINDER".equals(stage) || "CONTROLLER_EXCEPTION".equals(stage);
+        return "MAIN_BINDER".equals(stage) || "GET_VENDOR_BINDER".equals(stage) || "EXCEPTION".equals(stage);
     }
 
     private static IBinder serviceManagerBinder() {
@@ -160,14 +124,58 @@ final class NfcProcessVendorController {
             Method method = sm.getDeclaredMethod("getService", String.class);
             method.setAccessible(true);
             return (IBinder) method.invoke(null, NFC_SERVICE_NAME);
-        } catch (Throwable ignored) {
-            return null;
-        }
+        } catch (Throwable ignored) { return null; }
     }
 
-    private static int resolveTransaction(String stubClass, String fieldName, int fallback) {
-        int reflected = resolveRequiredTransaction(stubClass, fieldName);
-        return reflected > 0 ? reflected : fallback;
+    private static Object asInterface(String stubClass, IBinder binder) {
+        if (binder == null) return null;
+        try {
+            Class<?> stub = Class.forName(stubClass);
+            Method m = stub.getDeclaredMethod("asInterface", IBinder.class);
+            m.setAccessible(true);
+            return m.invoke(null, binder);
+        } catch (Throwable ignored) { return null; }
+    }
+
+    private static IBinder getVendorBinderViaProxy(Object proxy) {
+        if (proxy == null) return null;
+        try {
+            for (Method m : proxy.getClass().getMethods()) {
+                if (!"getNfcAdapterVendorInterface".equals(m.getName())) continue;
+                Class<?>[] p = m.getParameterTypes();
+                if (p.length == 1 && p[0] == String.class) {
+                    m.setAccessible(true);
+                    Object result = m.invoke(proxy, VENDOR_NAME);
+                    if (result instanceof IBinder) return (IBinder) result;
+                    if (result != null) {
+                        try {
+                            Method asBinder = result.getClass().getMethod("asBinder");
+                            Object b = asBinder.invoke(result);
+                            if (b instanceof IBinder) return (IBinder) b;
+                        } catch (Throwable ignored) { }
+                    }
+                }
+            }
+        } catch (Throwable ignored) { }
+        return null;
+    }
+
+    /** Returns null when the capability/signature is absent, otherwise the boolean result. */
+    private static Boolean invokeBooleanMethod(Object proxy, String name, Class<?>[] params, Object[] args) {
+        if (proxy == null) return null;
+        try {
+            Method m = proxy.getClass().getMethod(name, params);
+            m.setAccessible(true);
+            Object result = m.invoke(proxy, args);
+            if (m.getReturnType() == Void.TYPE) return Boolean.TRUE;
+            return result instanceof Boolean ? (Boolean) result : null;
+        } catch (NoSuchMethodException ignored) {
+            return null;
+        } catch (Throwable t) {
+            Throwable cause = t.getCause();
+            if (cause instanceof RuntimeException) throw (RuntimeException) cause;
+            throw new RuntimeException(cause == null ? t : cause);
+        }
     }
 
     private static int resolveRequiredTransaction(String stubClass, String fieldName) {
@@ -176,12 +184,10 @@ final class NfcProcessVendorController {
             Field f = c.getDeclaredField(fieldName);
             f.setAccessible(true);
             return f.getInt(null);
-        } catch (Throwable ignored) {
-            return -1;
-        }
+        } catch (Throwable ignored) { return -1; }
     }
 
-    private static IBinder getVendorBinder(IBinder mainBinder, int transaction) throws Exception {
+    private static IBinder getVendorBinderTransact(IBinder mainBinder, int transaction) throws Exception {
         Parcel data = Parcel.obtain();
         Parcel reply = Parcel.obtain();
         try {
@@ -213,44 +219,15 @@ final class NfcProcessVendorController {
         }
     }
 
-    private static boolean transactDisable(IBinder main, int transaction, boolean saveState) throws Exception {
-        Parcel data = Parcel.obtain();
-        Parcel reply = Parcel.obtain();
-        try {
-            data.writeInterfaceToken(INFC_DESCRIPTOR);
-            data.writeBoolean(saveState);
-            if (!main.transact(transaction, data, reply, 0)) return false;
-            reply.setDataPosition(0);
-            reply.readException();
-            return reply.dataAvail() >= 4 && reply.readBoolean();
-        } finally {
-            reply.recycle();
-            data.recycle();
-        }
-    }
-
-    private static boolean transactEnable(IBinder main, int transaction) throws Exception {
-        Parcel data = Parcel.obtain();
-        Parcel reply = Parcel.obtain();
-        try {
-            data.writeInterfaceToken(INFC_DESCRIPTOR);
-            if (!main.transact(transaction, data, reply, 0)) return false;
-            reply.setDataPosition(0);
-            reply.readException();
-            return reply.dataAvail() >= 4 && reply.readBoolean();
-        } finally {
-            reply.recycle();
-            data.recycle();
-        }
+    private static boolean alive(IBinder binder) {
+        return binder != null && binder.isBinderAlive() && binder.pingBinder();
     }
 
     private static String safeDescriptor(IBinder binder) {
         try {
             String value = binder.getInterfaceDescriptor();
             return value == null ? "" : value;
-        } catch (Throwable ignored) {
-            return "";
-        }
+        } catch (Throwable ignored) { return ""; }
     }
 
     private static void sleep(long millis) {

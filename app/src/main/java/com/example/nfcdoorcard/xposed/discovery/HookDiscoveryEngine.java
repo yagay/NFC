@@ -12,8 +12,9 @@ import java.util.Set;
 
 /** Capability-oriented hook discovery for RF writes and refresh triggers. */
 public final class HookDiscoveryEngine {
-    private static final int MAX_CLASSES = 1500;
+    private static final int MAX_CLASSES = 1800;
     private static final int MAX_RESULTS = 12;
+    private static final int MAX_RF_PARAMS = 4;
 
     private static final String[] PROVEN_RF_CLASSES = new String[] {
             "com.android.nfc.dhimpl.NxpNativeNfcManager",
@@ -72,14 +73,29 @@ public final class HookDiscoveryEngine {
         try {
             Class<?> c = Class.forName(className, false, cl);
             for (Method m : c.getDeclaredMethods()) {
-                Class<?>[] p = m.getParameterTypes();
-                if (p.length != 1 || p[0] != byte[].class || m.getReturnType() == Void.TYPE) continue;
+                if (!isRfSignatureCandidate(m)) continue;
                 int score = scoreRfMethod(c, m, knownFamily);
                 if (score < 40) continue;
                 HookTarget target = HookTarget.fromMethod(Capability.RF_CONFIG_WRITE, m, score, source);
                 if (seen.add(target.fingerprint())) out.add(target);
             }
         } catch (Throwable ignored) { }
+    }
+
+    /** Package-visible for unit tests. Runtime payload inspection is the final safety gate. */
+    static boolean isRfSignatureCandidate(Method m) {
+        if (m == null) return false;
+        Class<?>[] p = m.getParameterTypes();
+        if (p.length < 1 || p.length > MAX_RF_PARAMS) return false;
+        int bytes = 0;
+        for (Class<?> type : p) if (type == byte[].class) bytes++;
+        if (bytes != 1) return false;
+        Class<?> r = m.getReturnType();
+        return r == Void.TYPE || r == Boolean.TYPE || r == Boolean.class ||
+                r == Integer.TYPE || r == Integer.class ||
+                r == Long.TYPE || r == Long.class ||
+                r == Short.TYPE || r == Short.class ||
+                Number.class.isAssignableFrom(r);
     }
 
     private void inspectTriggerClass(ClassLoader cl, String className, String source,
@@ -105,9 +121,9 @@ public final class HookDiscoveryEngine {
         if (knownFamily) score += 80;
         if (cn.contains("nfc")) score += 20;
         if (cn.contains("nxp")) score += 20;
-        if (cn.contains("native")) score += 60; // prefer deepest hardware-facing implementation
+        if (cn.contains("native")) score += 60;
         if (cn.contains("dhimpl") || cn.contains("devicehost")) score += 20;
-        if (cn.contains("adapterservice")) score -= 35; // Java wrapper, useful for observation but not mutation owner
+        if (cn.contains("adapterservice")) score -= 35;
         if (cn.contains("oplus")) score += 10;
         if (cn.contains("manager")) score += 10;
         if (cn.contains("service")) score += 2;
@@ -117,6 +133,9 @@ public final class HookDiscoveryEngine {
         if (mn.contains("change") || mn.contains("set") || mn.contains("apply") || mn.contains("update")) score += 10;
         if ("int".equals(rt) || "java.lang.Integer".equals(rt)) score += 15;
         if ("boolean".equals(rt) || "java.lang.Boolean".equals(rt)) score += 5;
+        if ("void".equals(rt)) score += 2;
+        if (m.getParameterTypes().length == 1) score += 12;
+        else score -= (m.getParameterTypes().length - 1) * 4;
         if ("changeRfParamsByConfig".equals(m.getName())) score += 100;
         return score;
     }
@@ -141,7 +160,8 @@ public final class HookDiscoveryEngine {
 
     private boolean looksNfcRelated(String name) {
         String n = name.toLowerCase(Locale.ROOT);
-        return n.contains("nfc") || n.contains("nxp") || n.contains("oplus") || n.contains("rfconfig");
+        return n.contains("nfc") || n.contains("nxp") || n.contains("oplus") || n.contains("rfconfig") ||
+                n.contains("devicehost") || n.contains("nci") || n.contains("native") || n.contains("hal");
     }
 
     private List<String> enumerateClassNames(ClassLoader classLoader) {
