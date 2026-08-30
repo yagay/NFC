@@ -1,0 +1,38 @@
+name: Apply RF Final Settling
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'scripts/apply_rf_final_settling.py'
+      - '.github/workflows/apply-rf-final-settling.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Apply migration
+        run: python3 scripts/apply_rf_final_settling.py
+      - name: Verify expected changes
+        run: |
+          grep -q 'versionName = "1.0.46"' app/build.gradle.kts
+          grep -q 'HOOK_BUILD", "34"' app/build.gradle.kts
+          grep -q 'LIFECYCLE FINAL REAPPLY success' app/src/main/java/com/yagay/nfcdoorcard/xposed/NfcInjectionModule.java
+          grep -q 'class RfSettlingPolicy' app/src/main/java/com/yagay/nfcdoorcard/xposed/RfSettlingPolicy.java
+      - name: Commit product changes
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add app/build.gradle.kts app/src/main/java app/src/test/java
+          if git diff --cached --quiet; then
+            echo 'No product changes to commit'
+            exit 0
+          fi
+          git commit -m 'feat: finalize NFC UID after RF startup settles'
+          git push origin HEAD:main
