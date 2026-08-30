@@ -55,6 +55,7 @@ data class RuntimeStatus(
     val simulationEnabled: Boolean = false,
     val selectedUid: String? = null,
     val commandGeneration: Long = 0,
+    val consumedGeneration: Long = Long.MIN_VALUE,
     val handledGeneration: Long = Long.MIN_VALUE,
     val commandAction: String = "",
     val commandStatus: String = "IDLE",
@@ -370,7 +371,7 @@ class MainActivity : ComponentActivity() {
     @Composable
     private fun RuntimeStatusPanel(status: RuntimeStatus, operationMessage: String?) {
         val hookReady = status.currentPid > 0 && status.scopeOk && status.hookInstalled && status.hookBuild == EXPECTED_HOOK_BUILD
-        val commandInFlight = status.commandStatus in setOf("PENDING", "RUNNING", "TRIGGERED") &&
+        val commandInFlight = status.commandStatus in setOf("PENDING", "RUNNING", "TRIGGERED", "RESTART_REQUIRED") &&
             status.commandGeneration != status.handledGeneration
         val semanticBusy = status.operationState in setOf("APPLYING", "STOPPING", "RESETTING_CONTROLLER")
         val commandTone = when {
@@ -382,7 +383,7 @@ class MainActivity : ComponentActivity() {
             status.operationState == "RESETTING_CONTROLLER" ->
                 "执行中 · 正在重新初始化 NFC Controller · gen=${status.commandGeneration} · pid=${status.commandPid}"
             commandInFlight || semanticBusy ->
-                "执行中 · ${status.operationState} · gen=${status.commandGeneration}/${status.handledGeneration} · ${status.commandAction.ifBlank { "UNKNOWN" }} · pid=${status.commandPid}"
+                "执行中 · ${status.operationState} · gen=${status.commandGeneration} consumed=${status.consumedGeneration} completed=${status.handledGeneration} · ${status.commandAction.ifBlank { "UNKNOWN" }} · pid=${status.commandPid}"
             status.commandStatus == "SUCCESS" && status.commandGeneration == status.handledGeneration ->
                 "当前空闲 · 最近操作 ${status.commandAction.ifBlank { "UNKNOWN" }} 成功 · gen=${status.commandGeneration} · pid=${status.commandPid}"
             status.commandStatus in setOf("FAILED", "TRIGGER_FAILED", "OBSERVER_FAILED") || status.operationState == "FAILED" ->
@@ -598,7 +599,7 @@ class MainActivity : ComponentActivity() {
                 return@execute
             }
 
-            AppLogger.i("SIMULATION: STOP timeout snapshot before fallback generation=$generation\n${buildStatusSummary(state)}\nPROVIDER=${readProviderMap().toSortedMap()}")
+            AppLogger.i("SIMULATION: STOP handoff snapshot before fallback generation=$generation\n${buildStatusSummary(state)}\nPROVIDER=${readProviderMap().toSortedMap()}")
             if (!isCurrentCommandGeneration(generation)) {
                 state = readRuntimeStatus(includeRootPid = true)
                 AppLogger.i("SIMULATION: STOP fallback cancelled because generation=$generation is no longer current")
@@ -614,6 +615,7 @@ class MainActivity : ComponentActivity() {
                 val currentPid = currentNfcPid().toIntOrNull() ?: state.currentPid
                 contentResolver.insert(ConfigProvider.URI, ContentValues().apply {
                     put(ConfigProvider.KEY_STATE_GENERATION, generation)
+                    put(ConfigProvider.KEY_COMMAND_CONSUMED_GENERATION, generation)
                     put(ConfigProvider.KEY_COMMAND_HANDLED_GENERATION, generation)
                     put(ConfigProvider.KEY_COMMAND_ACTION, "STOP")
                     put(ConfigProvider.KEY_COMMAND_STATUS, "SUCCESS")
@@ -718,6 +720,7 @@ class MainActivity : ComponentActivity() {
         while (System.currentTimeMillis() < end) {
             state = readRuntimeStatus(includeRootPid = true)
             if (if (apply) isApplySuccess(state, generation, uid.orEmpty()) else isStopSuccess(state, generation)) return state
+            if (state.commandGeneration == generation && state.commandStatus == "RESTART_REQUIRED" && state.consumedGeneration == generation) return state
             if (state.commandGeneration == generation && state.handledGeneration == generation && state.commandStatus == "FAILED") return state
             Thread.sleep(100)
         }
@@ -764,23 +767,31 @@ class MainActivity : ComponentActivity() {
 
     private fun readRuntimeStatus(includeRootPid: Boolean = false): RuntimeStatus {
         val map = readProviderMap()
+        val rootPid = if (includeRootPid) currentNfcPid().toIntOrNull() else null
+        return decodeRuntimeStatus(map, rootPid)
+    }
+
+    private fun decodeRuntimeStatus(map: Map<String, String>, rootPid: Int?): RuntimeStatus {
         val scopePid = map[ConfigProvider.KEY_SCOPE_PID]?.toIntOrNull() ?: 0
         val hookPid = map[ConfigProvider.KEY_HOOK_PID]?.toIntOrNull() ?: 0
         val runtimePid = map[ConfigProvider.KEY_RUNTIME_PID]?.toIntOrNull() ?: 0
         val rfPid = map[ConfigProvider.KEY_RF_PID]?.toIntOrNull() ?: 0
         val commandPid = map[ConfigProvider.KEY_COMMAND_PID]?.toIntOrNull() ?: 0
-        val rootPid = if (includeRootPid) currentNfcPid().toIntOrNull() else null
         val currentPid = rootPid ?: runtimePid.takeIf { it > 0 }
             ?: hookPid.takeIf { it > 0 } ?: commandPid.takeIf { it > 0 } ?: scopePid.takeIf { it > 0 } ?: rfPid
         val hookBuild = map[ConfigProvider.KEY_HOOK_BUILD]?.toIntOrNull() ?: 0
         val rawRfStatus = map[ConfigProvider.KEY_RF_STATUS] ?: "IDLE"
         val rfFresh = currentPid > 0 && rfPid > 0 && rfPid == currentPid && (runtimePid == 0 || runtimePid == currentPid)
+        val restartTransition = map[ConfigProvider.KEY_COMMAND_STATUS] == "RESTART_REQUIRED" &&
+            map[ConfigProvider.KEY_COMMAND_GENERATION]?.toLongOrNull() == map[ConfigProvider.KEY_RF_GENERATION]?.toLongOrNull()
         val visibleRfStatus = when {
             rawRfStatus == "IDLE" -> "IDLE"
             rfFresh -> rawRfStatus
+            restartTransition -> "RESETTING($rawRfStatus)"
             rfPid == 0 && rawRfStatus in setOf("WAITING", "APPLYING", "STOPPING") -> rawRfStatus
             else -> "STALE($rawRfStatus)"
         }
+        val semanticVisible = rfFresh || rfPid == 0 || restartTransition
         return RuntimeStatus(
             appBuild = map[ConfigProvider.KEY_APP_BUILD]?.toIntOrNull() ?: 0,
             hookBuild = hookBuild,
@@ -793,14 +804,15 @@ class MainActivity : ComponentActivity() {
             simulationEnabled = map[ConfigProvider.KEY_SIMULATION_ENABLED].toBoolean(),
             selectedUid = map[ConfigProvider.KEY_UID]?.takeIf { it.isNotBlank() },
             commandGeneration = map[ConfigProvider.KEY_COMMAND_GENERATION]?.toLongOrNull() ?: 0L,
+            consumedGeneration = map[ConfigProvider.KEY_COMMAND_CONSUMED_GENERATION]?.toLongOrNull() ?: Long.MIN_VALUE,
             handledGeneration = map[ConfigProvider.KEY_COMMAND_HANDLED_GENERATION]?.toLongOrNull() ?: Long.MIN_VALUE,
             commandAction = map[ConfigProvider.KEY_COMMAND_ACTION].orEmpty(),
             commandStatus = map[ConfigProvider.KEY_COMMAND_STATUS] ?: "IDLE",
             commandDetail = map[ConfigProvider.KEY_COMMAND_DETAIL]?.takeIf { it.isNotBlank() },
             commandPid = commandPid,
-            operationState = if (rfFresh || rfPid == 0) map[ConfigProvider.KEY_OPERATION_STATE] ?: "IDLE" else "STALE",
-            effectiveState = if (rfFresh) map[ConfigProvider.KEY_EFFECTIVE_STATE] ?: "UNKNOWN" else "UNKNOWN",
-            verificationConfidence = if (rfFresh) map[ConfigProvider.KEY_VERIFICATION_CONFIDENCE] ?: "NONE" else "NONE",
+            operationState = if (semanticVisible) map[ConfigProvider.KEY_OPERATION_STATE] ?: "IDLE" else "STALE",
+            effectiveState = if (semanticVisible) map[ConfigProvider.KEY_EFFECTIVE_STATE] ?: "UNKNOWN" else "UNKNOWN",
+            verificationConfidence = if (semanticVisible) map[ConfigProvider.KEY_VERIFICATION_CONFIDENCE] ?: "NONE" else "NONE",
             rfAccepted = rfFresh && map[ConfigProvider.KEY_RF_ACCEPTED].toBoolean(),
             rfStatus = visibleRfStatus,
             rfUid = if (rfFresh) map[ConfigProvider.KEY_RF_UID]?.takeIf { it.isNotBlank() } else null,
@@ -811,7 +823,7 @@ class MainActivity : ComponentActivity() {
             rfError = if (rfFresh) map[ConfigProvider.KEY_RF_ERROR]?.takeIf { it.isNotBlank() } else null,
             rfPid = rfPid,
             rfGeneration = map[ConfigProvider.KEY_RF_GENERATION]?.toLongOrNull() ?: 0L,
-            rfVerification = if (rfFresh) map[ConfigProvider.KEY_RF_VERIFICATION]?.takeIf { it.isNotBlank() } else null,
+            rfVerification = if (rfFresh) map[ConfigProvider.KEY_RF_VERIFICATION]?.takeIf { it.isNotBlank() } else if (restartTransition) "LIFECYCLE_PENDING" else null,
             fullDiagStage = map[ConfigProvider.KEY_FULL_DIAG_STAGE]?.takeIf { it.isNotBlank() },
             fullDiagSummary = map[ConfigProvider.KEY_FULL_DIAG_SUMMARY]?.takeIf { it.isNotBlank() }
         )
@@ -825,7 +837,7 @@ class MainActivity : ComponentActivity() {
         appendLine("HOOK: ${if (s.hookInstalled) "SUCCESS" else "NOT INSTALLED/STALE"}")
         appendLine("CONFIG: ${if (s.simulationEnabled) "ENABLED" else "IDLE"} uid=${s.selectedUid}")
         appendLine("SEMANTIC: operation=${s.operationState} effective=${s.effectiveState} confidence=${s.verificationConfidence} accepted=${s.rfAccepted}")
-        appendLine("COMMAND: generation=${s.commandGeneration} handled=${s.handledGeneration} action=${s.commandAction} status=${s.commandStatus} detail=${s.commandDetail}")
+        appendLine("COMMAND: generation=${s.commandGeneration} consumed=${s.consumedGeneration} completed=${s.handledGeneration} action=${s.commandAction} status=${s.commandStatus} detail=${s.commandDetail}")
         appendLine("READ_MODE: ${if (readModeEnabled) "ENABLED" else "IDLE"}")
         appendLine("RF: generation=${s.rfGeneration} ${s.rfStatus} uid=${s.rfUid} source=${s.rfSource} result=${s.rfResult} raw=${s.rfNativeResult}/${s.rfNativeResultType} verification=${s.rfVerification} error=${s.rfError}")
         append("FINAL: stage=${s.fullDiagStage} summary=${s.fullDiagSummary}")
@@ -926,9 +938,13 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun buildFullDiagnosticReport(): String = buildString {
-        val s = readRuntimeStatus(includeRootPid = true)
+        val snapshotAt = System.currentTimeMillis()
+        val snapshotMap = readProviderMap().toMap()
+        val snapshotPid = currentNfcPid().toIntOrNull()
+        val s = decodeRuntimeStatus(snapshotMap, snapshotPid)
         appendLine("=== NFC FULL CHECK ${BuildConfig.VERSION_NAME} ===")
-        appendLine("Generated: ${System.currentTimeMillis()}")
+        appendLine("Generated: $snapshotAt")
+        appendLine("Snapshot: frozen provider + NFC PID; generation=${s.commandGeneration} pid=${s.currentPid}")
         appendLine("Trigger: LSPosed in-process NFC command engine; AIDL transaction IDs are reflected with compatibility fallbacks")
         appendLine("--- FINAL SUMMARY ---"); appendLine(buildStatusSummary(s)); appendLine()
         appendLine("--- SAVED CARDS ---")
@@ -938,7 +954,16 @@ class MainActivity : ComponentActivity() {
         appendLine("--- NFC PROCESS / HAL ---"); appendLine(runRootCmd("pm path com.android.nfc; pidof com.android.nfc; ps -A | grep -E 'android.hardware.nfc|vendor.oplus.hardware.nfc|com.android.nfc|$packageName'"))
         appendLine("--- NFC SERVICE FULL ---")
         appendLine(runRootCmd("dumpsys nfc 2>/dev/null", 25, 300_000))
-        LogSource.entries.forEach { source -> appendLine(); appendLine("=== LOG SOURCE: ${source.name} / ${source.label} ==="); appendLine(fetchLogsSync(source)) }
+        LogSource.entries.forEach { source ->
+            appendLine(); appendLine("=== LOG SOURCE: ${source.name} / ${source.label} ===")
+            if (source == LogSource.PROVIDER) {
+                appendLine("=== PROVIDER STATE (FROZEN SNAPSHOT) ===")
+                snapshotMap.toSortedMap().forEach { (k, v) -> appendLine("$k=$v") }
+                appendLine("current_nfc_pid=${snapshotPid ?: 0}")
+            } else {
+                appendLine(fetchLogsSync(source))
+            }
+        }
     }
 
     private fun ensureRootAccess(showToast: Boolean = true): Boolean {

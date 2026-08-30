@@ -15,7 +15,7 @@ class ConfigProvider : ContentProvider() {
         const val AUTHORITY = "com.example.nfcdoorcard.config"
         const val PATH_SETTINGS = "settings"
         private const val PREFS_NAME = "nfc_config"
-        const val STATE_SCHEMA_VERSION = 4
+        const val STATE_SCHEMA_VERSION = 5
         const val PROFILE_SCHEMA_VERSION = 3
         val APP_BUILD: Int = BuildConfig.VERSION_CODE
 
@@ -30,6 +30,7 @@ class ConfigProvider : ContentProvider() {
         const val KEY_ATQA = "atqa"
 
         const val KEY_COMMAND_GENERATION = "command_generation"
+        const val KEY_COMMAND_CONSUMED_GENERATION = "command_consumed_generation"
         const val KEY_COMMAND_HANDLED_GENERATION = "command_handled_generation"
         const val KEY_COMMAND_ACTION = "command_action"
         const val KEY_COMMAND_STATUS = "command_status"
@@ -94,7 +95,7 @@ class ConfigProvider : ContentProvider() {
         )
         private val RUNTIME_KEYS = setOf(
             KEY_STATE_GENERATION,
-            KEY_COMMAND_GENERATION, KEY_COMMAND_HANDLED_GENERATION, KEY_COMMAND_ACTION,
+            KEY_COMMAND_GENERATION, KEY_COMMAND_CONSUMED_GENERATION, KEY_COMMAND_HANDLED_GENERATION, KEY_COMMAND_ACTION,
             KEY_COMMAND_STATUS, KEY_COMMAND_DETAIL, KEY_COMMAND_PID,
             KEY_OPERATION_STATE, KEY_EFFECTIVE_STATE, KEY_VERIFICATION_CONFIDENCE,
             KEY_RF_ACCEPTED, KEY_RF_NATIVE_RESULT, KEY_RF_NATIVE_RESULT_TYPE, KEY_RUNTIME_PID,

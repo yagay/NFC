@@ -267,6 +267,10 @@ public class NfcInjectionModule extends XposedModule {
         if (!cfg.initialized) return;
         cachedConfig = cfg;
         int pid = Process.myPid();
+        if ("RESTART_REQUIRED".equals(cfg.commandStatus) &&
+                cfg.consumedGeneration == cfg.generation && cfg.handledGeneration != cfg.generation) {
+            return;
+        }
         if (isGenerationCompleted(cfg.generation, pid) || cfg.generation == lastTriggeredGeneration) return;
         lastTriggeredGeneration = cfg.generation;
 
@@ -277,13 +281,8 @@ public class NfcInjectionModule extends XposedModule {
 
         if (!cfg.active && controllerReinitRequired) {
             NfcProcessVendorController.Result stopTrigger = vendorController.setShareMode(false);
-            writeRfProgress(cfg, "STOPPING", "",
-                    stopTrigger.detail + "; appended LA_NFCID1 requires NFC process/controller restart", "controller-lifecycle");
-            // OxygenOS 16 rejects raw INfcAdapter disable/enable Binder calls from UID 1027 when
-            // generated attribution/package identity is absent. Use the proven process lifecycle reset.
-            failCommand(cfg, "RF_CONTROLLER_RESTART_REQUIRED", "",
-                    "CONTROLLER_RESTART_REQUIRED: appended LA_NFCID1 cannot be deleted in-place; restart com.android.nfc to reinitialize controller",
-                    NativeOutcome.notInvoked());
+            String detail = stopTrigger.detail + "; appended LA_NFCID1 requires NFC process/controller restart";
+            requestControllerRestart(cfg, detail);
             return;
         }
 
@@ -482,6 +481,7 @@ public class NfcInjectionModule extends XposedModule {
         v.put("operation_state", "IDLE");
         v.put("effective_state", cfg.active ? "ACTIVE" : "STOCK");
         v.put("verification_confidence", "VERIFIED");
+        v.put("command_consumed_generation", cfg.generation);
         v.put("command_handled_generation", cfg.generation);
         v.put("command_action", cfg.active ? "APPLY" : "STOP");
         v.put("command_status", "SUCCESS");
@@ -489,6 +489,34 @@ public class NfcInjectionModule extends XposedModule {
         v.put("command_pid", pid);
         v.put("full_diag_stage", rfState);
         v.put("full_diag_summary", detail == null ? "" : detail);
+        writeValuesWithRetry(v, 20, 100L);
+    }
+
+    private void requestControllerRestart(SimConfig cfg, String detail) {
+        int pid = Process.myPid();
+        ContentValues v = baseHookState();
+        v.put("state_generation", cfg.generation);
+        v.put("command_consumed_generation", cfg.generation);
+        v.put("command_action", "STOP");
+        v.put("command_status", "RESTART_REQUIRED");
+        v.put("command_detail", detail == null ? "Controller restart required" : detail);
+        v.put("command_pid", pid);
+        v.put("rf_status", "RF_CONTROLLER_RESTART_REQUIRED");
+        v.put("rf_uid", "");
+        v.put("rf_source", activeCodec == null ? "" : activeCodec);
+        v.put("rf_result", "");
+        v.put("rf_native_result", "");
+        v.put("rf_native_result_type", "not-invoked");
+        v.put("rf_accepted", false);
+        v.put("rf_error", "");
+        v.put("rf_pid", pid);
+        v.put("rf_generation", cfg.generation);
+        v.put("rf_verification", "LIFECYCLE_PENDING");
+        v.put("operation_state", "RESETTING_CONTROLLER");
+        v.put("effective_state", "UNKNOWN");
+        v.put("verification_confidence", "LIFECYCLE_PENDING");
+        v.put("full_diag_stage", "RF_CONTROLLER_RESTART_REQUIRED");
+        v.put("full_diag_summary", detail == null ? "Controller restart required" : detail);
         writeValuesWithRetry(v, 20, 100L);
     }
 
@@ -512,6 +540,7 @@ public class NfcInjectionModule extends XposedModule {
         v.put("operation_state", "FAILED");
         v.put("effective_state", "UNKNOWN");
         v.put("verification_confidence", "FAILED");
+        v.put("command_consumed_generation", cfg.generation);
         v.put("command_handled_generation", cfg.generation);
         v.put("command_action", cfg.active ? "APPLY" : "STOP");
         v.put("command_status", "FAILED");
@@ -551,10 +580,14 @@ public class NfcInjectionModule extends XposedModule {
         v.put("command_pid", Process.myPid());
         v.put("command_action", action == null ? "" : action);
         if ("RUNNING".equals(status) || "TRIGGERED".equals(status)) {
+            v.put("command_consumed_generation", generation);
             v.put("operation_state", "APPLY".equals(action) ? "APPLYING" : "STOPPING");
             v.put("verification_confidence", "PENDING");
         }
-        if (handled) v.put("command_handled_generation", generation);
+        if (handled) {
+            v.put("command_consumed_generation", generation);
+            v.put("command_handled_generation", generation);
+        }
         writeValuesWithRetry(v, 20, 100L);
     }
 
@@ -600,7 +633,7 @@ public class NfcInjectionModule extends XposedModule {
         if (app == null) return SimConfig.uninitialized();
         boolean active = false, diagnostics = false;
         String uid = null, action = "", status = "";
-        long generation = 0L, handled = Long.MIN_VALUE;
+        long generation = 0L, consumed = Long.MIN_VALUE, handled = Long.MIN_VALUE;
         int commandPid = 0;
         try (Cursor c = app.getContentResolver().query(CONFIG_URI, null, null, null, null)) {
             if (c == null) return SimConfig.uninitialized();
@@ -610,13 +643,14 @@ public class NfcInjectionModule extends XposedModule {
                 else if ("uid".equals(key)) uid = value;
                 else if ("diagnostic_logging_enabled".equals(key)) diagnostics = Boolean.parseBoolean(value);
                 else if ("command_generation".equals(key)) generation = parseLong(value, 0L);
+                else if ("command_consumed_generation".equals(key)) consumed = parseLong(value, Long.MIN_VALUE);
                 else if ("command_handled_generation".equals(key)) handled = parseLong(value, Long.MIN_VALUE);
                 else if ("command_action".equals(key)) action = value == null ? "" : value;
                 else if ("command_status".equals(key)) status = value == null ? "" : value;
                 else if ("command_pid".equals(key)) commandPid = (int) parseLong(value, 0L);
             }
             if (action.isEmpty()) action = active ? "APPLY" : "STOP";
-            return new SimConfig(true, active, uid, diagnostics, generation, handled, action, status, commandPid);
+            return new SimConfig(true, active, uid, diagnostics, generation, consumed, handled, action, status, commandPid);
         } catch (Throwable t) {
             return SimConfig.uninitialized();
         }
@@ -685,14 +719,14 @@ public class NfcInjectionModule extends XposedModule {
     private static final class SimConfig {
         final boolean initialized, active, diagnostics;
         final String uid, commandAction, commandStatus;
-        final long generation, handledGeneration;
+        final long generation, consumedGeneration, handledGeneration;
         final int commandPid;
         SimConfig(boolean initialized, boolean active, String uid, boolean diagnostics, long generation,
-                  long handledGeneration, String commandAction, String commandStatus, int commandPid) {
+                  long consumedGeneration, long handledGeneration, String commandAction, String commandStatus, int commandPid) {
             this.initialized = initialized; this.active = active; this.uid = uid; this.diagnostics = diagnostics;
-            this.generation = generation; this.handledGeneration = handledGeneration; this.commandAction = commandAction;
-            this.commandStatus = commandStatus; this.commandPid = commandPid;
+            this.generation = generation; this.consumedGeneration = consumedGeneration; this.handledGeneration = handledGeneration;
+            this.commandAction = commandAction; this.commandStatus = commandStatus; this.commandPid = commandPid;
         }
-        static SimConfig uninitialized() { return new SimConfig(false, false, null, false, 0L, Long.MIN_VALUE, "", "", 0); }
+        static SimConfig uninitialized() { return new SimConfig(false, false, null, false, 0L, Long.MIN_VALUE, Long.MIN_VALUE, "", "", 0); }
     }
 }
