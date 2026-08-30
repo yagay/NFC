@@ -1,0 +1,55 @@
+name: Generalize Hook Runtime
+
+on:
+  push:
+    paths:
+      - '.github/workflows/generalize-hook.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  generalize:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Apply generalization patch
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('.github/scripts/generalize_hook.py')
+          s = p.read_text()
+          start = s.index("old = 'Object result = chain.proceed(new Object[]{stock.clone()});'")
+          end = s.index("helper = '''    private static int findSingleByteArrayArg", start)
+          block = '''old = 'Object result = chain.proceed(new Object[]{stock.clone()});'\nstock_inline = \"\"\"Object[] stockArgs = args.clone();\n                        stockArgs[payloadArg] = stock.clone();\n                        Object result = chain.proceed(stockArgs);\"\"\"\nif s.count(old) != 1: raise SystemExit('stock proceed pattern mismatch')\ns = s.replace(old, stock_inline)\nold = 'Object result = chain.proceed(new Object[]{rewritten.data});'\nrewrite_inline = \"\"\"Object[] rewrittenArgs = args.clone();\n            rewrittenArgs[payloadArg] = rewritten.data;\n            Object result = chain.proceed(rewrittenArgs);\"\"\"\nif s.count(old) != 1: raise SystemExit('rewrite proceed pattern mismatch')\ns = s.replace(old, rewrite_inline)\nanchor = ''' + "'''    private static NativeOutcome interpretNativeResult(Method method, Object result) {'''" + '''\n'''
+          p.write_text(s[:start] + block + s[end:])
+          PY
+          python3 .github/scripts/generalize_hook.py
+      - name: Verify tests and APKs
+        run: |
+          chmod +x ./gradlew
+          ./gradlew --no-daemon :app:testDebugUnitTest :app:assembleDebug :app:lintDebug :app:assembleRelease --stacktrace
+          unzip -l app/build/outputs/apk/debug/app-debug.apk | grep -q 'META-INF/xposed/java_init.list'
+          unzip -l app/build/outputs/apk/release/app-release.apk | grep -q 'META-INF/xposed/java_init.list'
+          grep -q 'NfcInjectionModule' <(unzip -p app/build/outputs/apk/debug/app-debug.apk META-INF/xposed/java_init.list)
+          "$ANDROID_HOME/build-tools/35.0.0/zipalign" -c -P 16 -v 4 app/build/outputs/apk/debug/app-debug.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose app/build/outputs/apk/debug/app-debug.apk
+          "$ANDROID_HOME/build-tools/35.0.0/zipalign" -c -P 16 -v 4 app/build/outputs/apk/release/app-release.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose app/build/outputs/apk/release/app-release.apk
+      - name: Commit verified changes
+        run: |
+          git config user.name 'Jie'
+          git config user.email '1614094+yagay@users.noreply.github.com'
+          git rm -f .github/workflows/generalize-hook.yml .github/scripts/generalize_hook.py
+          git add -A
+          git commit -m 'Generalize hook discovery and Binder capabilities'
+          git push origin HEAD:main
