@@ -222,10 +222,14 @@ public class NfcInjectionModule extends XposedModule {
             // A natural RF write in a new NFC process is the best lifecycle recovery trigger. Mark
             // it as a lifecycle reapply before mutating so a successful native result updates only
             // observed RF evidence; the original user APPLY command history remains untouched.
-            boolean persistedApplyFromOldProcess = cfg.active && cfg.generation > 0L &&
-                    cfg.handledGeneration == cfg.generation && "SUCCESS".equals(cfg.commandStatus) &&
-                    cfg.commandPid > 0 && cfg.commandPid != pid;
-            if (persistedApplyFromOldProcess && !isLifecycleVerified(cfg.generation, pid, cfg.uid)) {
+            // Any terminal desired APPLY whose RF proof is no longer fresh is a lifecycle
+            // reapply, even when com.android.nfc kept the same PID. This is crucial for adapter
+            // OFF -> ON: the controller resets but the Java service process may survive. The
+            // controller epoch makes stale proof detectable, and this natural OEM RF write is the
+            // preferred place to reapply instead of manufacturing a share-mode refresh.
+            boolean terminalDesiredApply = cfg.active && cfg.generation > 0L &&
+                    cfg.handledGeneration == cfg.generation && "SUCCESS".equals(cfg.commandStatus);
+            if (terminalDesiredApply && !isLifecycleVerified(cfg.generation, pid, cfg.uid)) {
                 synchronized (this) {
                     lifecycleReapplyPending = true;
                     lifecycleRecoveryGeneration = cfg.generation;
@@ -477,8 +481,14 @@ public class NfcInjectionModule extends XposedModule {
         // intentionally permits it to advance after a successful APPLY. Existing RF evidence is
         // then stale because rf_controller_epoch no longer matches.
         v.put("controller_epoch", nextEpoch);
+        // Epoch invalidation is a correctness barrier, not diagnostic telemetry. Commit it
+        // synchronously so an immediately following ADAPTER_STATE_ON or OEM RF write cannot read
+        // the previous epoch. Normal status/log writes remain asynchronous.
+        if (!writeValuesSynchronously(v, 5, 25L)) {
+            Log.w(TAG, "CONTROLLER EPOCH synchronous write failed reason=" + reason +
+                    " generation=" + cfg.generation + " nextEpoch=" + nextEpoch);
+        }
         persistRefreshRuntime("LIFECYCLE_INVALIDATED", "", reason, cfg.generation, false);
-        writeValuesWithRetry(v, 8, 75L);
         synchronized (this) {
             lifecycleReapplyPending = false;
             lifecycleRecoveryGeneration = Long.MIN_VALUE;
@@ -1056,6 +1066,23 @@ public class NfcInjectionModule extends XposedModule {
                 sleep(delayMs);
             }
         });
+    }
+
+    private boolean writeValuesSynchronously(ContentValues values, int attempts, long delayMs) {
+        ContentValues copy = new ContentValues(values);
+        for (int i = 0; i < attempts; i++) {
+            Context ctx = currentContext();
+            if (ctx != null) {
+                try {
+                    ctx.getContentResolver().insert(CONFIG_URI, copy);
+                    return true;
+                } catch (Throwable e) {
+                    Log.w(TAG, "sync state write attempt " + (i + 1) + " failed: " + e.getMessage());
+                }
+            }
+            if (i + 1 < attempts) sleep(delayMs);
+        }
+        return false;
     }
 
     private SimConfig readConfig() {
