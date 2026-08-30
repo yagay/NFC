@@ -12,11 +12,23 @@ android {
         applicationId = "com.example.nfcdoorcard"
         minSdk = 31
         targetSdk = 35
-        versionCode = 28
-        versionName = "1.0.27"
+        versionCode = 29
+        versionName = "1.0.28"
 
         // Hook/runtime state protocol v5 + NFC lifecycle reapply validated with this build.
         buildConfigField("int", "HOOK_BUILD", "22")
+    }
+
+    buildTypes {
+        getByName("release") {
+            isMinifyEnabled = true
+            isShrinkResources = true
+            signingConfig = signingConfigs.getByName("debug")
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
+        }
     }
 
     compileOptions {
@@ -49,4 +61,5 @@ dependencies {
     implementation("com.google.code.gson:gson:2.11.0")
     compileOnly("io.github.libxposed:api:102.0.0")
     debugImplementation("androidx.compose.ui:ui-tooling")
+    testImplementation("junit:junit:4.13.2")
 }
