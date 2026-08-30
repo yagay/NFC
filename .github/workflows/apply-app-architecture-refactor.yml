@@ -26,7 +26,9 @@ jobs:
       - run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
       - uses: gradle/actions/setup-gradle@v4
       - name: Apply refactor
-        run: python3 .github/scripts/refactor_app_arch.py
+        run: |
+          sed -i "s/, 'private fun decodeRuntimeStatus(map'//" .github/scripts/refactor_app_arch.py
+          python3 .github/scripts/refactor_app_arch.py
       - name: Verify refactor
         run: |
           chmod +x ./gradlew
