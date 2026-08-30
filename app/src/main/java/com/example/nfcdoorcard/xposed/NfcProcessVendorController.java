@@ -16,6 +16,8 @@ final class NfcProcessVendorController {
     private static final String VENDOR_DESCRIPTOR = "com.vendor.nfc.IVendorNfcAdapter";
     private static final String VENDOR_STUB = "com.vendor.nfc.IVendorNfcAdapter$Stub";
     private static final int FALLBACK_TX_ENABLE_SHARE_MODE = 15;
+    private static final int STARTUP_RETRY_COUNT = 30;
+    private static final long STARTUP_RETRY_DELAY_MS = 100L;
 
     static final class Result {
         final boolean success;
@@ -33,12 +35,19 @@ final class NfcProcessVendorController {
 
     Result setShareMode(boolean enabled) {
         Result last = null;
-        for (int attempt = 0; attempt < 2; attempt++) {
+        for (int attempt = 0; attempt < STARTUP_RETRY_COUNT; attempt++) {
             last = setShareModeOnce(enabled);
             if (last.success || !isTransient(last.stage)) return last;
-            if (attempt == 0) sleep(80L);
+            if (attempt + 1 < STARTUP_RETRY_COUNT) sleep(STARTUP_RETRY_DELAY_MS);
         }
-        return last == null ? new Result(false, "UNKNOWN", "No vendor result", null) : last;
+        if (last == null) return new Result(false, "UNKNOWN", "No vendor result", null);
+        return new Result(
+                false,
+                last.stage,
+                last.detail + " after " + STARTUP_RETRY_COUNT + " attempts/~" +
+                        ((STARTUP_RETRY_COUNT - 1) * STARTUP_RETRY_DELAY_MS) + "ms",
+                last.vendorDescriptor
+        );
     }
 
     private Result setShareModeOnce(boolean enabled) {
@@ -78,8 +87,9 @@ final class NfcProcessVendorController {
     }
 
     private static boolean isTransient(String stage) {
-        return "MAIN_BINDER".equals(stage) || "MAIN_DESCRIPTOR".equals(stage)
-                || "GET_VENDOR_BINDER".equals(stage) || "EXCEPTION".equals(stage);
+        return "MAIN_BINDER".equals(stage)
+                || "GET_VENDOR_BINDER".equals(stage)
+                || "EXCEPTION".equals(stage);
     }
 
     private static IBinder serviceManagerBinder() {
