@@ -278,15 +278,12 @@ public class NfcInjectionModule extends XposedModule {
         if (!cfg.active && controllerReinitRequired) {
             NfcProcessVendorController.Result stopTrigger = vendorController.setShareMode(false);
             writeRfProgress(cfg, "STOPPING", "",
-                    stopTrigger.detail + "; reinitializing NFC controller because LA_NFCID1 was appended", "controller-lifecycle");
-            writeSemanticState("RESETTING_CONTROLLER", "UNKNOWN", "LIFECYCLE_PENDING", false, null);
-            NfcProcessVendorController.Result reset = vendorController.reinitializeController();
-            if (reset.success) {
-                clearRestoreState();
-                completeControllerReinit(cfg, reset.detail);
-            } else {
-                failCommand(cfg, "RF_CONTROLLER_RESET_FAILED", "", reset.stage + ": " + reset.detail, NativeOutcome.notInvoked());
-            }
+                    stopTrigger.detail + "; appended LA_NFCID1 requires NFC process/controller restart", "controller-lifecycle");
+            // OxygenOS 16 rejects raw INfcAdapter disable/enable Binder calls from UID 1027 when
+            // generated attribution/package identity is absent. Use the proven process lifecycle reset.
+            failCommand(cfg, "RF_CONTROLLER_RESTART_REQUIRED", "",
+                    "CONTROLLER_RESTART_REQUIRED: appended LA_NFCID1 cannot be deleted in-place; restart com.android.nfc to reinitialize controller",
+                    NativeOutcome.notInvoked());
             return;
         }
 
@@ -311,6 +308,8 @@ public class NfcInjectionModule extends XposedModule {
 
     private void persistRestoreState() {
         ContentValues v = new ContentValues();
+        SimConfig cfg = cachedConfig;
+        if (cfg.initialized && cfg.generation > 0L) v.put("state_generation", cfg.generation);
         v.put("rf_restore_mode", restoreMode);
         v.put("rf_controller_reinit_required", controllerReinitRequired);
         v.put("stock_snapshot_available", reversibleStockPayload != null);
@@ -432,6 +431,7 @@ public class NfcInjectionModule extends XposedModule {
 
     private void writeRfProgress(SimConfig cfg, String state, String uid, String detail, String codecId) {
         ContentValues v = baseHookState();
+        v.put("state_generation", cfg.generation);
         v.put("rf_status", state);
         v.put("rf_uid", uid == null ? "" : uid);
         v.put("rf_source", codecId == null ? "" : codecId);
@@ -467,6 +467,7 @@ public class NfcInjectionModule extends XposedModule {
         completedGeneration = cfg.generation;
         completedPid = pid;
         ContentValues v = baseHookState();
+        v.put("state_generation", cfg.generation);
         v.put("rf_status", rfState);
         v.put("rf_uid", uid == null ? "" : uid);
         v.put("rf_source", source == null ? "" : source);
@@ -496,6 +497,7 @@ public class NfcInjectionModule extends XposedModule {
         completedGeneration = cfg.generation;
         completedPid = pid;
         ContentValues v = baseHookState();
+        v.put("state_generation", cfg.generation);
         v.put("rf_status", rfState);
         v.put("rf_uid", uid == null ? "" : uid);
         v.put("rf_source", activeCodec == null ? "" : activeCodec);
@@ -543,6 +545,7 @@ public class NfcInjectionModule extends XposedModule {
 
     private void writeSimpleCommandState(String status, String detail, long generation, String action, boolean handled) {
         ContentValues v = baseHookState();
+        if (generation > 0L) v.put("state_generation", generation);
         v.put("command_status", status);
         v.put("command_detail", detail == null ? "" : detail);
         v.put("command_pid", Process.myPid());
@@ -558,6 +561,8 @@ public class NfcInjectionModule extends XposedModule {
     private void writeSemanticState(String operation, String effective, String confidence,
                                     boolean accepted, NativeOutcome outcome) {
         ContentValues v = baseHookState();
+        SimConfig cfg = cachedConfig;
+        if (cfg.initialized && cfg.generation > 0L) v.put("state_generation", cfg.generation);
         v.put("operation_state", operation);
         v.put("effective_state", effective);
         v.put("verification_confidence", confidence);

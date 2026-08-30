@@ -599,14 +599,21 @@ class MainActivity : ComponentActivity() {
             }
 
             AppLogger.i("SIMULATION: STOP timeout snapshot before fallback generation=$generation\n${buildStatusSummary(state)}\nPROVIDER=${readProviderMap().toSortedMap()}")
+            if (!isCurrentCommandGeneration(generation)) {
+                state = readRuntimeStatus(includeRootPid = true)
+                AppLogger.i("SIMULATION: STOP fallback cancelled because generation=$generation is no longer current")
+                onDone(state, "停止请求已被更新的命令替代")
+                return@execute
+            }
             val restart = restartNfcProcessKeepingEnabled("stop_command_fallback_generation_$generation")
             AppLogger.i("SIMULATION: STOP fallback NFC restart generation=$generation\n$restart")
             waitForHookOnly(12_000)
             state = waitForCommandCompletion(generation, null, apply = false, timeoutMs = 6_000)
 
-            if (!isStopSuccess(state, generation)) {
+            if (!isStopSuccess(state, generation) && isCurrentCommandGeneration(generation)) {
                 val currentPid = currentNfcPid().toIntOrNull() ?: state.currentPid
                 contentResolver.insert(ConfigProvider.URI, ContentValues().apply {
+                    put(ConfigProvider.KEY_STATE_GENERATION, generation)
                     put(ConfigProvider.KEY_COMMAND_HANDLED_GENERATION, generation)
                     put(ConfigProvider.KEY_COMMAND_ACTION, "STOP")
                     put(ConfigProvider.KEY_COMMAND_STATUS, "SUCCESS")
@@ -645,6 +652,7 @@ class MainActivity : ComponentActivity() {
         val action = if (enabled) "APPLY" else "STOP"
         contentResolver.insert(ConfigProvider.URI, ContentValues().apply {
             put(ConfigProvider.KEY_APP_BUILD, ConfigProvider.APP_BUILD)
+            put(ConfigProvider.KEY_STATE_GENERATION, generation)
             put(ConfigProvider.KEY_SIMULATION_ENABLED, enabled)
             if (card != null) {
                 put(ConfigProvider.KEY_UID, card.uid); put(ConfigProvider.KEY_SAK, card.sak); put(ConfigProvider.KEY_ATQA, card.atqa)
@@ -740,6 +748,9 @@ class MainActivity : ComponentActivity() {
         }
         return state
     }
+
+    private fun isCurrentCommandGeneration(generation: Long): Boolean =
+        readProviderMap()[ConfigProvider.KEY_COMMAND_GENERATION]?.toLongOrNull() == generation
 
     private fun getSimulationEnabled(): Boolean = readProviderMap()[ConfigProvider.KEY_SIMULATION_ENABLED].toBoolean()
 
