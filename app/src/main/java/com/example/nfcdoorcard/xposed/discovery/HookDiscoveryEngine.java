@@ -2,6 +2,7 @@ package com.example.nfcdoorcard.xposed.discovery;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.Enumeration;
@@ -47,10 +48,17 @@ public final class HookDiscoveryEngine {
         return top(out);
     }
 
-    public List<HookTarget> discoverTriggerCandidates(ClassLoader classLoader) {
+    public List<HookTarget> discoverKnownTriggerCandidates(ClassLoader classLoader) {
         List<HookTarget> out = new ArrayList<>();
         Set<String> seen = new HashSet<>();
         for (String name : PROVEN_TRIGGER_CLASSES) inspectTriggerClass(classLoader, name, "known-family", out, seen, true);
+        return top(out);
+    }
+
+    public List<HookTarget> discoverTriggerCandidates(ClassLoader classLoader) {
+        List<HookTarget> out = new ArrayList<>(discoverKnownTriggerCandidates(classLoader));
+        Set<String> seen = new HashSet<>();
+        for (HookTarget target : out) seen.add(target.fingerprint());
 
         int inspected = 0;
         for (String name : enumerateClassNames(classLoader)) {
@@ -73,7 +81,7 @@ public final class HookDiscoveryEngine {
         try {
             Class<?> c = Class.forName(className, false, cl);
             for (Method m : c.getDeclaredMethods()) {
-                if (!isRfSignatureCandidate(m)) continue;
+                if (!isRfSignatureCandidate(m) || !isRfSemanticCandidate(m)) continue;
                 int score = scoreRfMethod(c, m, knownFamily);
                 if (score < 40) continue;
                 HookTarget target = HookTarget.fromMethod(Capability.RF_CONFIG_WRITE, m, score, source);
@@ -85,6 +93,8 @@ public final class HookDiscoveryEngine {
     /** Package-visible for unit tests. Runtime payload inspection is the final safety gate. */
     static boolean isRfSignatureCandidate(Method m) {
         if (m == null) return false;
+        int modifiers = m.getModifiers();
+        if (Modifier.isAbstract(modifiers) || m.getDeclaringClass().isInterface() || m.isBridge() || m.isSynthetic()) return false;
         Class<?>[] p = m.getParameterTypes();
         if (p.length < 1 || p.length > MAX_RF_PARAMS) return false;
         int bytes = 0;
@@ -98,19 +108,37 @@ public final class HookDiscoveryEngine {
                 Number.class.isAssignableFrom(r);
     }
 
+    static boolean isRfSemanticCandidate(Method m) {
+        String n = m.getName().toLowerCase(Locale.ROOT);
+        boolean domain = n.contains("rf") || n.contains("config") || n.contains("param");
+        boolean action = n.contains("change") || n.contains("set") || n.contains("apply") ||
+                n.contains("update") || n.contains("write");
+        return domain && action;
+    }
+
     private void inspectTriggerClass(ClassLoader cl, String className, String source,
                                      List<HookTarget> out, Set<String> seen, boolean knownFamily) {
         try {
             Class<?> c = Class.forName(className, false, cl);
             for (Method m : c.getDeclaredMethods()) {
+                int modifiers = m.getModifiers();
+                if (Modifier.isAbstract(modifiers) || c.isInterface() || m.isBridge() || m.isSynthetic()) continue;
                 Class<?>[] p = m.getParameterTypes();
                 if (p.length != 1 || (p[0] != boolean.class && p[0] != Boolean.class)) continue;
+                if (!isTriggerSemanticCandidate(m)) continue;
                 int score = scoreTriggerMethod(c, m, knownFamily);
                 if (score < 45) continue;
                 HookTarget target = HookTarget.fromMethod(Capability.RF_REFRESH_TRIGGER, m, score, source);
                 if (seen.add(target.fingerprint())) out.add(target);
             }
         } catch (Throwable ignored) { }
+    }
+
+    static boolean isTriggerSemanticCandidate(Method m) {
+        String n = m.getName().toLowerCase(Locale.ROOT);
+        if (n.contains("share") || n.contains("refresh") || n.contains("reload")) return true;
+        return n.contains("rf") && (n.contains("enable") || n.contains("set") || n.contains("apply") ||
+                n.contains("update") || n.contains("rotate") || n.contains("restart"));
     }
 
     private int scoreRfMethod(Class<?> c, Method m, boolean knownFamily) {

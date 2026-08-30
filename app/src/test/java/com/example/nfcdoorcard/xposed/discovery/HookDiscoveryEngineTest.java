@@ -14,6 +14,12 @@ public class HookDiscoveryEngineTest {
         int noBytes(int x) { return 0; }
         int twoBytes(byte[] a, byte[] b) { return 0; }
         int tooMany(int a, int b, int c, int d, byte[] data) { return 0; }
+        int changeRfParamsByConfig(byte[] data) { return 0; }
+        boolean sendRawFrame(byte[] data) { return true; }
+    }
+
+    private abstract static class AbstractSamples {
+        abstract int changeRfParamsByConfig(byte[] data);
     }
 
     private Method m(String name, Class<?>... p) throws Exception { return Samples.class.getDeclaredMethod(name, p); }
@@ -23,6 +29,16 @@ public class HookDiscoveryEngineTest {
         assertTrue(HookDiscoveryEngine.isRfSignatureCandidate(m("oneVoid", byte[].class)));
         assertTrue(HookDiscoveryEngine.isRfSignatureCandidate(m("second", int.class, byte[].class)));
         assertTrue(HookDiscoveryEngine.isRfSignatureCandidate(m("fourth", String.class, int.class, boolean.class, byte[].class)));
+    }
+
+    @Test public void rejectsAbstractRfMethods() throws Exception {
+        Method method = AbstractSamples.class.getDeclaredMethod("changeRfParamsByConfig", byte[].class);
+        assertFalse(HookDiscoveryEngine.isRfSignatureCandidate(method));
+    }
+
+    @Test public void semanticFilterRejectsUnrelatedByteArrayMethods() throws Exception {
+        assertTrue(HookDiscoveryEngine.isRfSemanticCandidate(m("changeRfParamsByConfig", byte[].class)));
+        assertFalse(HookDiscoveryEngine.isRfSemanticCandidate(m("sendRawFrame", byte[].class)));
     }
 
     @Test public void rejectsAmbiguousOrUnsupportedShapes() throws Exception {

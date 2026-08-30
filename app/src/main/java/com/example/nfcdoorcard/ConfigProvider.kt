@@ -15,7 +15,7 @@ class ConfigProvider : ContentProvider() {
         const val AUTHORITY = "com.example.nfcdoorcard.config"
         const val PATH_SETTINGS = "settings"
         private const val PREFS_NAME = "nfc_config"
-        const val STATE_SCHEMA_VERSION = 5
+        const val STATE_SCHEMA_VERSION = 6
         const val PROFILE_SCHEMA_VERSION = 3
         val APP_BUILD: Int = BuildConfig.VERSION_CODE
 
@@ -70,6 +70,11 @@ class ConfigProvider : ContentProvider() {
         const val KEY_REFRESH_PROBE_CANDIDATES = "refresh_probe_candidates"
         const val KEY_REFRESH_PROBE_COUNT = "refresh_probe_count"
         const val KEY_REFRESH_PROBE_PID = "refresh_probe_pid"
+        const val KEY_REFRESH_TRIGGER_STATUS = "refresh_trigger_status"
+        const val KEY_REFRESH_TRIGGER_TARGET = "refresh_trigger_target"
+        const val KEY_REFRESH_TRIGGER_SOURCE = "refresh_trigger_source"
+        const val KEY_REFRESH_TRIGGER_GENERATION = "refresh_trigger_generation"
+        const val KEY_REFRESH_TRIGGER_RF_CONFIRMED = "refresh_trigger_rf_confirmed"
 
         const val KEY_RF_STATUS = "rf_status"
         const val KEY_RF_UID = "rf_uid"
@@ -101,6 +106,8 @@ class ConfigProvider : ContentProvider() {
             KEY_RF_ACCEPTED, KEY_RF_NATIVE_RESULT, KEY_RF_NATIVE_RESULT_TYPE, KEY_RUNTIME_PID,
             KEY_RF_STATUS, KEY_RF_UID, KEY_RF_SOURCE, KEY_RF_RESULT, KEY_RF_ERROR,
             KEY_RF_PID, KEY_RF_GENERATION, KEY_RF_VERIFICATION,
+            KEY_REFRESH_TRIGGER_STATUS, KEY_REFRESH_TRIGGER_TARGET, KEY_REFRESH_TRIGGER_SOURCE,
+            KEY_REFRESH_TRIGGER_GENERATION, KEY_REFRESH_TRIGGER_RF_CONFIRMED,
             KEY_FULL_DIAG_STAGE, KEY_FULL_DIAG_SUMMARY
         )
     }
@@ -141,6 +148,13 @@ class ConfigProvider : ContentProvider() {
             .remove(KEY_REFRESH_PROBE_CANDIDATES)
             .remove(KEY_REFRESH_PROBE_COUNT)
             .remove(KEY_REFRESH_PROBE_PID)
+            .remove("refresh_probe_events")
+            .remove("refresh_probe_last")
+            .remove(KEY_REFRESH_TRIGGER_STATUS)
+            .remove(KEY_REFRESH_TRIGGER_TARGET)
+            .remove(KEY_REFRESH_TRIGGER_SOURCE)
+            .remove(KEY_REFRESH_TRIGGER_GENERATION)
+            .remove(KEY_REFRESH_TRIGGER_RF_CONFIRMED)
             .putInt(KEY_STATE_SCHEMA, STATE_SCHEMA_VERSION)
             .apply()
     }

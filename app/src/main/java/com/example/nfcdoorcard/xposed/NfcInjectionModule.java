@@ -36,6 +36,8 @@ public class NfcInjectionModule extends XposedModule {
     private static final int HOOK_BUILD = BuildConfig.HOOK_BUILD;
     private static final Uri CONFIG_URI = Uri.parse("content://com.example.nfcdoorcard.config/settings");
     private static final int MAX_LEARNING_HOOKS = 4;
+    private static final int MAX_TRIGGER_HOOKS = 4;
+    private static final long TRIGGER_RF_WINDOW_MS = 3_000L;
 
     private final ExecutorService stateSyncExecutor = Executors.newSingleThreadExecutor(r -> daemon(r, "NfcUIDSim-StateSync"));
     private final ExecutorService commandExecutor = Executors.newSingleThreadExecutor(r -> daemon(r, "NfcUIDSim-Command"));
@@ -43,6 +45,7 @@ public class NfcInjectionModule extends XposedModule {
     private final RfPayloadEngine payloadEngine = new RfPayloadEngine();
     private final HookProfileStore profileStore = new HookProfileStore();
     private final NfcProcessVendorController vendorController = new NfcProcessVendorController();
+    private final RefreshTriggerEngine refreshTriggerEngine = new RefreshTriggerEngine();
 
     private volatile HookTarget activeTarget;
     private volatile String activeCodec = "";
@@ -59,6 +62,10 @@ public class NfcInjectionModule extends XposedModule {
     private volatile boolean disabledAfterFailure;
     private volatile String disabledFailureUid;
     private volatile long disabledFailureGeneration = Long.MIN_VALUE;
+    private volatile long pendingTriggerGeneration = Long.MIN_VALUE;
+    private volatile long pendingTriggerStartedAt;
+    private volatile long confirmedTriggerGeneration = Long.MIN_VALUE;
+    private volatile String pendingTriggerTarget = "";
 
     private volatile byte[] reversibleStockPayload;
     private volatile String reversibleTargetFingerprint;
@@ -88,6 +95,9 @@ public class NfcInjectionModule extends XposedModule {
         }
 
         List<HookTarget> installTargets = new ArrayList<>();
+        List<HookTarget> triggerTargets = discoveryEngine.discoverKnownTriggerCandidates(cl);
+        if (triggerTargets.isEmpty()) triggerTargets = discoveryEngine.discoverTriggerCandidates(cl);
+        persistTriggerCandidates(pid, triggerTargets);
         HookTarget cached = profileStore.loadValid(app, cl);
         if (cached != null) {
             learningMode = false;
@@ -97,9 +107,6 @@ public class NfcInjectionModule extends XposedModule {
             Log.i(TAG, "PROFILE HIT target=" + cached + " pid=" + pid);
         } else {
             learningMode = true;
-            // Trigger candidate discovery is diagnostic-only. Avoid the expensive DEX walk on
-            // the verified-profile fast path; only refresh it when RF profile discovery is needed.
-            persistTriggerCandidates(pid, discoveryEngine.discoverTriggerCandidates(cl));
             reportStatusWithRetry(pid, false, 0, "DISCOVERING", "Profile invalid/missing; learning deepest RF_CONFIG_WRITE", null);
             List<HookTarget> candidates = discoveryEngine.discoverRfCandidates(cl);
             persistDiscoveryCandidates(pid, candidates);
@@ -124,6 +131,18 @@ public class NfcInjectionModule extends XposedModule {
             }
         }
         installedHookCount = installed;
+        int triggerHookCount = 0;
+        for (int i = 0; i < Math.min(MAX_TRIGGER_HOOKS, triggerTargets.size()); i++) {
+            HookTarget target = triggerTargets.get(i);
+            try {
+                installRefreshTriggerHook(cl, pid, target);
+                triggerHookCount++;
+            } catch (Throwable t) {
+                Log.w(TAG, "REFRESH TRIGGER HOOK skipped target=" + target + " " + t.getClass().getSimpleName() + ": " + t.getMessage());
+            }
+        }
+        persistRefreshRuntime("DISCOVERED", "", "hook-probe", 0L, false);
+        Log.i(TAG, "REFRESH TRIGGER hooks=" + triggerHookCount + " candidates=" + triggerTargets.size() + " pid=" + pid);
         if (installed == 0) {
             reportStatusWithRetry(pid, false, 0, "HOOK_FAILED", "All RF_CONFIG_WRITE candidates failed to install", null);
             return;
@@ -155,6 +174,7 @@ public class NfcInjectionModule extends XposedModule {
             }
 
             SimConfig cfg = currentConfig();
+            markRfObservedForPendingTrigger(cfg, target, pid);
             if (cfg.diagnostics) {
                 String caller = compactCallStack(24);
                 Log.i(TAG, "RFPROBE ACTIVE target=" + target.fingerprint() + " targetScore=" + target.score +
@@ -258,6 +278,76 @@ public class NfcInjectionModule extends XposedModule {
         });
     }
 
+    private void installRefreshTriggerHook(ClassLoader cl, int pid, HookTarget target) throws Exception {
+        Method method = target.resolve(cl);
+        hook(method).intercept(chain -> {
+            Object receiver = chain.getThisObject();
+            Object result = chain.proceed();
+            if (refreshTriggerEngine.observe(target, method, receiver, result)) {
+                persistRefreshRuntime("VERIFIED_INSTANCE", target.fingerprint(), "java-observed", 0L, false);
+                Log.i(TAG, "REFRESH TRIGGER VERIFIED target=" + target.fingerprint() + " pid=" + pid);
+            }
+            return result;
+        });
+    }
+
+    private NfcProcessVendorController.Result triggerRfRefresh(SimConfig cfg, boolean enabled, String reason) {
+        armTriggerWindow(cfg.generation, reason);
+        RefreshTriggerEngine.Invocation javaTrigger = refreshTriggerEngine.invoke(enabled);
+        if (javaTrigger.success) {
+            pendingTriggerTarget = javaTrigger.targetFingerprint;
+            persistRefreshRuntime("TRIGGERED", javaTrigger.targetFingerprint, "java-verified", cfg.generation, false);
+            Log.i(TAG, "REFRESH TRIGGER java success generation=" + cfg.generation + " target=" + javaTrigger.targetFingerprint);
+            return new NfcProcessVendorController.Result(true, "JAVA_TRIGGERED", javaTrigger.detail, null);
+        }
+
+        NfcProcessVendorController.Result fallback = vendorController.setShareMode(enabled);
+        String fallbackTarget = "vendor-controller:" + fallback.stage;
+        pendingTriggerTarget = fallbackTarget;
+        persistRefreshRuntime(fallback.success ? "TRIGGERED" : "TRIGGER_FAILED", fallbackTarget,
+                "vendor-fallback", cfg.generation, false);
+        if (!fallback.success) clearTriggerWindow(cfg.generation);
+        return fallback;
+    }
+
+    private void armTriggerWindow(long generation, String source) {
+        pendingTriggerGeneration = generation;
+        pendingTriggerStartedAt = System.currentTimeMillis();
+        confirmedTriggerGeneration = Long.MIN_VALUE;
+        pendingTriggerTarget = source == null ? "" : source;
+        persistRefreshRuntime("ARMED", pendingTriggerTarget, "command", generation, false);
+    }
+
+    private void markRfObservedForPendingTrigger(SimConfig cfg, HookTarget rfTarget, int pid) {
+        long generation = pendingTriggerGeneration;
+        if (!cfg.initialized || generation <= 0L || cfg.generation != generation) return;
+        long elapsed = System.currentTimeMillis() - pendingTriggerStartedAt;
+        if (elapsed < 0L || elapsed > TRIGGER_RF_WINDOW_MS) return;
+        if (confirmedTriggerGeneration == generation) return;
+        confirmedTriggerGeneration = generation;
+        persistRefreshRuntime("RF_WRITE_OBSERVED", pendingTriggerTarget, "causal-window", generation, true);
+        Log.i(TAG, "REFRESH TRIGGER RF confirmed generation=" + generation + " elapsedMs=" + elapsed +
+                " trigger=" + pendingTriggerTarget + " rfTarget=" + rfTarget.fingerprint() + " pid=" + pid);
+    }
+
+    private void clearTriggerWindow(long generation) {
+        if (pendingTriggerGeneration != generation) return;
+        pendingTriggerGeneration = Long.MIN_VALUE;
+        pendingTriggerStartedAt = 0L;
+        pendingTriggerTarget = "";
+    }
+
+    private void persistRefreshRuntime(String status, String target, String source, long generation, boolean rfConfirmed) {
+        ContentValues v = baseHookState();
+        if (generation > 0L) v.put("state_generation", generation);
+        v.put("refresh_trigger_status", status == null ? "" : status);
+        v.put("refresh_trigger_target", target == null ? "" : target);
+        v.put("refresh_trigger_source", source == null ? "" : source);
+        v.put("refresh_trigger_generation", generation);
+        v.put("refresh_trigger_rf_confirmed", rfConfirmed);
+        writeValuesWithRetry(v, 8, 75L);
+    }
+
     private void startCommandBridge(Application app, int pid) {
         try {
             ContentObserver observer = new ContentObserver(null) {
@@ -321,7 +411,7 @@ public class NfcInjectionModule extends XposedModule {
 
         Log.i(TAG, "LIFECYCLE REAPPLY trigger reason=" + reason + " generation=" + cfg.generation +
                 " uid=" + uidHex + " pid=" + Process.myPid());
-        NfcProcessVendorController.Result trigger = vendorController.setShareMode(true);
+        NfcProcessVendorController.Result trigger = triggerRfRefresh(cfg, true, "lifecycle:" + reason);
         if (!trigger.success) {
             lifecycleReapplyPending = false;
             ContentValues failed = baseHookState();
@@ -364,13 +454,11 @@ public class NfcInjectionModule extends XposedModule {
                 " restoreMode=" + restoreMode);
 
         if (!cfg.active && controllerReinitRequired) {
-            NfcProcessVendorController.Result stopTrigger = vendorController.setShareMode(false);
-            String detail = stopTrigger.detail + "; appended LA_NFCID1 requires NFC process/controller restart";
-            requestControllerRestart(cfg, detail);
+            requestControllerRestart(cfg, "Appended LA_NFCID1 requires NFC process/controller restart; direct stock delete is not assumed safe");
             return;
         }
 
-        NfcProcessVendorController.Result trigger = vendorController.setShareMode(cfg.active);
+        NfcProcessVendorController.Result trigger = triggerRfRefresh(cfg, cfg.active, "command:" + reason);
         if (isGenerationCompleted(cfg.generation, pid)) return;
         if (trigger.success) {
             writeSimpleCommandState("TRIGGERED", trigger.detail + "; waiting for RF confirmation", cfg.generation, action, false);
@@ -506,8 +594,15 @@ public class NfcInjectionModule extends XposedModule {
         v.put("hook_count", count);
         v.put("hook_pid", pid);
         v.put("runtime_pid", pid);
-        v.put("full_diag_stage", stage);
-        v.put("full_diag_summary", summary);
+        v.put("hook_runtime_stage", stage);
+        v.put("hook_runtime_summary", summary);
+        SimConfig cfg = readConfig();
+        boolean commandOwnsSummary = cfg.initialized && cfg.generation > 0L &&
+                cfg.commandStatus != null && !cfg.commandStatus.isEmpty() && !"SUCCESS".equals(cfg.commandStatus);
+        if (!commandOwnsSummary) {
+            v.put("full_diag_stage", stage);
+            v.put("full_diag_summary", summary);
+        }
         if (targetId != null) v.put("rf_hook_fingerprint", targetId);
         writeValuesWithRetry(v, 20, 150L);
     }
@@ -535,7 +630,10 @@ public class NfcInjectionModule extends XposedModule {
     }
 
     private void completeCommand(SimConfig cfg, String rfState, String uid, String source, NativeOutcome outcome, String detail) {
-        completeCommandWithVerification(cfg, rfState, uid, source, outcome, detail, "NATIVE_RESULT");
+        String verification = confirmedTriggerGeneration == cfg.generation ?
+                "TRIGGER_CONFIRMED_NATIVE_RESULT" : "NATIVE_RESULT";
+        completeCommandWithVerification(cfg, rfState, uid, source, outcome, detail, verification);
+        clearTriggerWindow(cfg.generation);
     }
 
     private void completeLifecycleReapply(SimConfig cfg, String uid, String source,
@@ -552,7 +650,8 @@ public class NfcInjectionModule extends XposedModule {
         v.put("rf_error", "");
         v.put("rf_pid", Process.myPid());
         v.put("rf_generation", cfg.generation);
-        v.put("rf_verification", "LIFECYCLE_REAPPLY_NATIVE_RESULT");
+        v.put("rf_verification", confirmedTriggerGeneration == cfg.generation ?
+                "LIFECYCLE_REAPPLY_TRIGGER_CONFIRMED" : "LIFECYCLE_REAPPLY_NATIVE_RESULT");
         v.put("operation_state", "IDLE");
         v.put("effective_state", "ACTIVE");
         v.put("verification_confidence", "VERIFIED");
@@ -560,6 +659,7 @@ public class NfcInjectionModule extends XposedModule {
         v.put("full_diag_summary", "Saved UID automatically reapplied after NFC adapter restart via " +
                 target.className + "#" + target.methodName);
         writeValuesWithRetry(v, 20, 100L);
+        clearTriggerWindow(cfg.generation);
         Log.i(TAG, "LIFECYCLE REAPPLY success generation=" + cfg.generation + " uid=" + uid +
                 " target=" + target.fingerprint() + " pid=" + Process.myPid());
     }

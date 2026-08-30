@@ -95,6 +95,22 @@ final class NfcProcessVendorController {
                 return new Result(false, "VENDOR_DESCRIPTOR", "Unexpected descriptor=" + vendorDescriptor, vendorDescriptor);
             }
 
+            // In com.android.nfc the returned vendor binder can be the actual local Stub/service.
+            // Prefer that real Java object first: it follows the OEM implementation directly and
+            // avoids both transaction-number coupling and generated Stub class visibility issues.
+            Object localInterface = null;
+            try { localInterface = vendor.queryLocalInterface(vendorDescriptor); } catch (Throwable ignored) { }
+            Boolean directAccepted = invokeBooleanMethod(localInterface, "enableNfcShareMode",
+                    new Class<?>[]{boolean.class}, new Object[]{enabled});
+            if (directAccepted == null) {
+                directAccepted = invokeBooleanMethod(vendor, "enableNfcShareMode",
+                        new Class<?>[]{boolean.class}, new Object[]{enabled});
+            }
+            if (directAccepted != null) {
+                return new Result(directAccepted, directAccepted ? "TRIGGERED" : "SHARE_MODE",
+                        "enableNfcShareMode(" + enabled + ") via in-process vendor service", vendorDescriptor);
+            }
+
             Object vendorProxy = asInterface(VENDOR_STUB, vendor);
             Boolean proxyAccepted = invokeBooleanMethod(vendorProxy, "enableNfcShareMode",
                     new Class<?>[]{boolean.class}, new Object[]{enabled});
