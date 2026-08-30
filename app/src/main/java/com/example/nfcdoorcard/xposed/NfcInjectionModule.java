@@ -16,6 +16,8 @@ import com.example.nfcdoorcard.xposed.payload.RfPayloadEngine;
 import com.example.nfcdoorcard.xposed.profile.HookProfileStore;
 
 import java.lang.reflect.Method;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.ExecutorService;
@@ -25,19 +27,19 @@ import io.github.libxposed.api.XposedModule;
 import io.github.libxposed.api.XposedModuleInterface;
 
 /**
- * Capability-oriented LSPosed NFC execution engine.
+ * Capability-oriented, self-learning LSPosed NFC execution engine.
  *
- * The UI publishes desired state to ConfigProvider. Inside com.android.nfc this module:
- *  1) discovers RF_CONFIG_WRITE by structural capability instead of one permanent name,
- *  2) hooks the best production target,
- *  3) classifies each byte[] payload independently,
- *  4) rewrites only a recognized/safe RF representation,
- *  5) treats native result=0 as runtime verification and persists the verified profile.
+ * Fast path: reuse one VERIFIED target when the system fingerprint/NFC package build and
+ * method signature still match. OTA path: discover and temporarily hook a bounded set of
+ * high-scoring RF_CONFIG_WRITE candidates. Only calls carrying a recognized RF payload
+ * are touched. The candidate that accepts a rewritten payload with native result=0 is
+ * persisted as the next VERIFIED profile.
  */
 public class NfcInjectionModule extends XposedModule {
     private static final String TAG = "NfcUIDSim";
     private static final int HOOK_BUILD = BuildConfig.HOOK_BUILD;
     private static final Uri CONFIG_URI = Uri.parse("content://com.example.nfcdoorcard.config/settings");
+    private static final int MAX_LEARNING_HOOKS = 4;
 
     private final ExecutorService stateSyncExecutor = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(r, "NfcUIDSim-StateSync");
@@ -78,145 +80,177 @@ public class NfcInjectionModule extends XposedModule {
     public void onPackageLoaded(XposedModuleInterface.PackageLoadedParam lp) {
         super.onPackageLoaded(lp);
         if (!"com.android.nfc".equals(lp.getPackageName())) return;
-
         final int pid = Process.myPid();
         final ClassLoader cl = lp.getDefaultClassLoader();
-        reportStatusWithRetry(pid, false, 0, "DISCOVERING", "Discovering RF_CONFIG_WRITE capability", null);
+        commandExecutor.execute(() -> initializeRuntime(cl, pid));
+    }
 
-        List<HookTarget> candidates = discoveryEngine.discoverRfCandidates(cl);
-        persistDiscoveryCandidates(pid, candidates);
-        if (candidates.isEmpty()) {
-            Log.e(TAG, "RF_CONFIG_WRITE UNSUPPORTED pid=" + pid);
-            reportStatusWithRetry(pid, false, 0, "UNSUPPORTED", "No RF_CONFIG_WRITE candidate discovered", null);
+    private void initializeRuntime(ClassLoader cl, int pid) {
+        reportStatusWithRetry(pid, false, 0, "INITIALIZING", "Waiting for NFC application context", null);
+        Application app = waitForApplication(8_000L);
+        if (app == null) {
+            reportStatusWithRetry(pid, false, 0, "INIT_FAILED", "NFC Application context unavailable", null);
             return;
         }
 
-        HookTarget target = candidates.get(0);
-        activeTarget = target;
-        try {
-            Method method = target.resolve(cl);
-            hook(method).intercept(chain -> {
-                Object[] args = chain.getArgs().toArray();
-                if (args.length != 1 || !(args[0] instanceof byte[])) return chain.proceed();
+        List<HookTarget> installTargets = new ArrayList<>();
+        HookTarget cached = profileStore.loadValid(app, cl);
+        if (cached != null) {
+            installTargets.add(cached);
+            activeTarget = cached;
+            persistProfileStatus("CACHED_VERIFIED", cached);
+            Log.i(TAG, "PROFILE HIT target=" + cached + " pid=" + pid);
+        } else {
+            reportStatusWithRetry(pid, false, 0, "DISCOVERING", "Profile invalid/missing; discovering RF_CONFIG_WRITE", null);
+            List<HookTarget> candidates = discoveryEngine.discoverRfCandidates(cl);
+            persistDiscoveryCandidates(pid, candidates);
+            if (candidates.isEmpty()) {
+                Log.e(TAG, "RF_CONFIG_WRITE UNSUPPORTED pid=" + pid);
+                reportStatusWithRetry(pid, false, 0, "UNSUPPORTED", "No RF_CONFIG_WRITE candidate discovered", null);
+                return;
+            }
 
-                SimConfig cfg = currentConfig();
-                if (!cfg.active) {
-                    Object result = chain.proceed();
-                    if (cfg.initialized && "STOP".equals(cfg.commandAction) && nativeOk(result)
-                            && !isGenerationCompleted(cfg.generation, pid)) {
-                        Log.i(TAG, "STOCK RF ACCEPTED target=" + target.fingerprint() + " pid=" + pid +
-                                " generation=" + cfg.generation + " result=" + result);
-                        markTargetVerified(target);
-                        completeCommand(cfg, "RF_STOCK_RESTORED", "", target.fingerprint(),
-                                String.valueOf(result), "Stock RF config accepted by verified RF_CONFIG_WRITE target");
-                    }
-                    return result;
-                }
+            int hookCount = candidates.get(0).source.equals("known-family")
+                    ? 1 : Math.min(MAX_LEARNING_HOOKS, candidates.size());
+            installTargets.addAll(candidates.subList(0, hookCount));
+            activeTarget = installTargets.get(0);
+            profileStore.save(app, activeTarget, hookCount == 1 ? "DISCOVERED" : "LEARNING");
+            Log.i(TAG, "DISCOVERY installCount=" + hookCount + " top=" + activeTarget + " pid=" + pid);
+        }
 
-                if (cfg.uid == null) return chain.proceed();
-                String uidHex = normalizeUid(cfg.uid);
+        int installed = 0;
+        for (HookTarget target : installTargets) {
+            try {
+                installRfHook(cl, pid, target);
+                installed++;
+            } catch (Throwable t) {
+                Log.e(TAG, "HOOK CANDIDATE FAILED target=" + target + " " + t.getClass().getSimpleName() + ": " + t.getMessage(), t);
+            }
+        }
 
-                if (disabledAfterFailure) {
-                    boolean sameFailedAttempt = disabledFailureGeneration == cfg.generation
-                            && disabledFailureUid != null
-                            && disabledFailureUid.equals(uidHex);
-                    if (sameFailedAttempt) return chain.proceed();
-                    disabledAfterFailure = false;
-                    disabledFailureUid = null;
-                    disabledFailureGeneration = Long.MIN_VALUE;
-                    Log.i(TAG, "NFCID1 RETRY unlocked generation=" + cfg.generation + " uid=" + uidHex + " pid=" + pid);
-                }
+        if (installed == 0) {
+            reportStatusWithRetry(pid, false, 0, "HOOK_FAILED", "All RF_CONFIG_WRITE candidates failed to install", null);
+            return;
+        }
 
-                if (cfg.diagnostics) {
-                    String caller = compactCallStack(24);
-                    Log.i(TAG, "RFPROBE target=" + target.fingerprint() + " pid=" + pid +
-                            " generation=" + cfg.generation + " uid=" + uidHex + " stack=" + caller);
-                    persistRfCaller(pid, caller);
-                }
+        reportStatusWithRetry(pid, true, installed, "READY",
+                installed == 1 ? "RF_CONFIG_WRITE profile ready" : "RF_CONFIG_WRITE learning mode hooks=" + installed,
+                activeTarget == null ? null : activeTarget.fingerprint());
+        Log.i(TAG, "PROD HOOK READY build=" + HOOK_BUILD + " hooks=" + installed + " pid=" + pid);
+        startCommandBridge(app, pid);
+    }
 
-                if (uidHex.length() != 8) {
-                    failCommand(cfg, "UID_INVALID", uidHex, "UID must be 4 bytes", "");
-                    return chain.proceed();
-                }
+    private void installRfHook(ClassLoader cl, int pid, HookTarget target) throws Exception {
+        Method method = target.resolve(cl);
+        hook(method).intercept(chain -> {
+            Object[] args = chain.getArgs().toArray();
+            if (args.length != 1 || !(args[0] instanceof byte[])) return chain.proceed();
+            byte[] original = (byte[]) args[0];
 
-                RewriteResult rewritten = payloadEngine.rewrite((byte[]) args[0], hexToBytes(uidHex));
-                if (!rewritten.changed) {
-                    writeRfProgress(cfg, "WAITING", uidHex, rewritten.reason, "", rewritten.codecId);
-                    return chain.proceed();
-                }
+            // This is the safety gate for learning hooks: unrelated byte[] methods remain
+            // observationally identical and cannot complete STOP or mutate APPLY state.
+            int payloadScore = payloadEngine.inspectScore(original);
+            if (payloadScore <= 0) return chain.proceed();
 
-                activeCodec = rewritten.codecId;
-                Log.i(TAG, "NFCID1 APPLY target=" + target.fingerprint() + " codec=" + rewritten.codecId +
-                        " reason=" + rewritten.reason + " pid=" + pid + " generation=" + cfg.generation +
-                        " uid=" + uidHex + " payload=" + rewritten.oldPayloadLength + "->" + rewritten.newPayloadLength +
-                        " params=" + rewritten.oldParamCount + "->" + rewritten.newParamCount);
-                writeRfProgress(cfg, "APPLYING", uidHex, rewritten.reason, "pending", rewritten.codecId);
+            SimConfig cfg = currentConfig();
+            if (cfg.diagnostics) {
+                String caller = compactCallStack(24);
+                Log.i(TAG, "RFPROBE target=" + target.fingerprint() + " targetScore=" + target.score +
+                        " payloadScore=" + payloadScore + " pid=" + pid + " generation=" + cfg.generation + " stack=" + caller);
+                persistRfCaller(pid, caller);
+            }
 
-                Object result = chain.proceed(new Object[]{rewritten.data});
-                if (nativeOk(result)) {
-                    disabledAfterFailure = false;
-                    disabledFailureUid = null;
-                    disabledFailureGeneration = Long.MIN_VALUE;
+            if (!cfg.active) {
+                Object result = chain.proceed();
+                if (cfg.initialized && "STOP".equals(cfg.commandAction) && nativeOk(result)
+                        && !isGenerationCompleted(cfg.generation, pid)) {
+                    activeTarget = target;
                     markTargetVerified(target);
+                    Log.i(TAG, "STOCK RF ACCEPTED target=" + target.fingerprint() + " pid=" + pid +
+                            " generation=" + cfg.generation + " result=" + result);
+                    completeCommand(cfg, "RF_STOCK_RESTORED", "", target.fingerprint(),
+                            String.valueOf(result), "Stock RF accepted by verified RF_CONFIG_WRITE target");
+                }
+                return result;
+            }
+
+            if (cfg.uid == null) return chain.proceed();
+            String uidHex = normalizeUid(cfg.uid);
+            if (uidHex.length() != 8) {
+                failCommand(cfg, "UID_INVALID", uidHex, "UID must be 4 bytes", "");
+                return chain.proceed();
+            }
+
+            if (disabledAfterFailure) {
+                boolean sameFailedAttempt = disabledFailureGeneration == cfg.generation
+                        && disabledFailureUid != null && disabledFailureUid.equals(uidHex);
+                if (sameFailedAttempt) return chain.proceed();
+                disabledAfterFailure = false;
+                disabledFailureUid = null;
+                disabledFailureGeneration = Long.MIN_VALUE;
+                Log.i(TAG, "NFCID1 RETRY unlocked generation=" + cfg.generation + " uid=" + uidHex + " pid=" + pid);
+            }
+
+            RewriteResult rewritten = payloadEngine.rewrite(original, hexToBytes(uidHex));
+            if (!rewritten.changed) {
+                writeRfProgress(cfg, "WAITING", uidHex,
+                        target.methodName + ": " + rewritten.reason, "", rewritten.codecId);
+                return chain.proceed();
+            }
+
+            activeCodec = rewritten.codecId;
+            Log.i(TAG, "NFCID1 APPLY target=" + target.fingerprint() + " codec=" + rewritten.codecId +
+                    " reason=" + rewritten.reason + " pid=" + pid + " generation=" + cfg.generation +
+                    " uid=" + uidHex + " payload=" + rewritten.oldPayloadLength + "->" + rewritten.newPayloadLength +
+                    " params=" + rewritten.oldParamCount + "->" + rewritten.newParamCount);
+            writeRfProgress(cfg, "APPLYING", uidHex, rewritten.reason, "pending", rewritten.codecId);
+
+            Object result = chain.proceed(new Object[]{rewritten.data});
+            if (nativeOk(result)) {
+                disabledAfterFailure = false;
+                disabledFailureUid = null;
+                disabledFailureGeneration = Long.MIN_VALUE;
+                activeTarget = target;
+                markTargetVerified(target);
+                if (!isGenerationCompleted(cfg.generation, pid)) {
                     Log.i(TAG, "NFCID1 ACCEPTED target=" + target.fingerprint() + " codec=" + rewritten.codecId +
                             " pid=" + pid + " generation=" + cfg.generation + " uid=" + uidHex + " result=" + result);
                     completeCommand(cfg, "RF_UID_APPLIED", uidHex, rewritten.codecId,
-                            String.valueOf(result), "UID applied by verified RF_CONFIG_WRITE target using " + rewritten.codecId);
-                } else {
-                    disabledAfterFailure = true;
-                    disabledFailureUid = uidHex;
-                    disabledFailureGeneration = cfg.generation;
-                    Log.e(TAG, "NFCID1 FAILED target=" + target.fingerprint() + " codec=" + rewritten.codecId +
-                            " pid=" + pid + " generation=" + cfg.generation + " uid=" + uidHex + " result=" + result);
-                    failCommand(cfg, "RF_UID_FAILED", uidHex,
-                            "native rejected payload from " + rewritten.codecId + "; retry allowed on next generation",
-                            String.valueOf(result));
+                            String.valueOf(result), "UID applied by verified target " + target.className + "#" + target.methodName);
                 }
-                return result;
-            });
-
-            reportStatusWithRetry(pid, true, 1, "READY",
-                    "RF_CONFIG_WRITE target ready score=" + target.score + " source=" + target.source,
-                    target.fingerprint());
-            Log.i(TAG, "PROD HOOK READY build=" + HOOK_BUILD + " target=" + target + " pid=" + pid);
-            startCommandBridge(pid);
-        } catch (Throwable t) {
-            Log.e(TAG, "PROD HOOK FAILED build=" + HOOK_BUILD + " target=" + target + " pid=" + pid + " " +
-                    t.getClass().getSimpleName() + ": " + t.getMessage(), t);
-            reportStatusWithRetry(pid, false, 0, "HOOK_FAILED",
-                    t.getClass().getSimpleName() + ": " + t.getMessage(), target.fingerprint());
-        }
-    }
-
-    private void startCommandBridge(int pid) {
-        commandExecutor.execute(() -> {
-            for (int attempt = 0; attempt < 60 && !observerRegistered; attempt++) {
-                Application app = currentApplication();
-                if (app != null) {
-                    try {
-                        if (activeTarget != null) profileStore.save(app, activeTarget, "DISCOVERED");
-                        ContentObserver observer = new ContentObserver(null) {
-                            @Override public void onChange(boolean selfChange) { scheduleCommandRefresh("provider_change"); }
-                            @Override public void onChange(boolean selfChange, Uri uri) { scheduleCommandRefresh("provider_change"); }
-                        };
-                        app.getContentResolver().registerContentObserver(CONFIG_URI, true, observer);
-                        commandObserver = observer;
-                        observerRegistered = true;
-                        Log.i(TAG, "COMMAND BRIDGE ready pid=" + pid);
-                        refreshConfigAndProcess("startup");
-                        return;
-                    } catch (Throwable t) {
-                        Log.w(TAG, "command observer attempt=" + (attempt + 1) + " failed: " + t.getMessage());
-                    }
-                }
-                sleep(150L);
+            } else if (!isGenerationCompleted(cfg.generation, pid)) {
+                disabledAfterFailure = true;
+                disabledFailureUid = uidHex;
+                disabledFailureGeneration = cfg.generation;
+                Log.e(TAG, "NFCID1 FAILED target=" + target.fingerprint() + " codec=" + rewritten.codecId +
+                        " pid=" + pid + " generation=" + cfg.generation + " uid=" + uidHex + " result=" + result);
+                failCommand(cfg, "RF_UID_FAILED", uidHex,
+                        "native rejected payload from " + rewritten.codecId + "; retry allowed on next generation",
+                        String.valueOf(result));
             }
-            Log.e(TAG, "COMMAND BRIDGE unavailable pid=" + pid);
-            writeSimpleCommandState("OBSERVER_FAILED", "Cannot register ConfigProvider observer", 0L, "", false);
+            return result;
         });
     }
 
+    private void startCommandBridge(Application app, int pid) {
+        try {
+            ContentObserver observer = new ContentObserver(null) {
+                @Override public void onChange(boolean selfChange) { scheduleCommandRefresh("provider_change"); }
+                @Override public void onChange(boolean selfChange, Uri uri) { scheduleCommandRefresh("provider_change"); }
+            };
+            app.getContentResolver().registerContentObserver(CONFIG_URI, true, observer);
+            commandObserver = observer;
+            observerRegistered = true;
+            Log.i(TAG, "COMMAND BRIDGE ready pid=" + pid);
+            refreshConfigAndProcess("startup");
+        } catch (Throwable t) {
+            Log.e(TAG, "COMMAND BRIDGE unavailable pid=" + pid + " " + t.getMessage());
+            writeSimpleCommandState("OBSERVER_FAILED", "Cannot register ConfigProvider observer: " + t.getMessage(), 0L, "", false);
+        }
+    }
+
     private void scheduleCommandRefresh(String reason) {
+        if (!observerRegistered) return;
         commandExecutor.execute(() -> refreshConfigAndProcess(reason));
     }
 
@@ -262,6 +296,13 @@ public class NfcInjectionModule extends XposedModule {
         return cfg;
     }
 
+    private Application waitForApplication(long timeoutMs) {
+        long end = System.currentTimeMillis() + timeoutMs;
+        Application app;
+        while ((app = currentApplication()) == null && System.currentTimeMillis() < end) sleep(100L);
+        return app;
+    }
+
     private String compactCallStack(int maxFrames) {
         StringBuilder sb = new StringBuilder();
         int kept = 0;
@@ -299,6 +340,8 @@ public class NfcInjectionModule extends XposedModule {
             HookTarget t = candidates.get(0);
             v.put("rf_hook_class", t.className);
             v.put("rf_hook_method", t.methodName);
+            v.put("rf_hook_param_signature", t.parameterSignature);
+            v.put("rf_hook_return_type", t.returnType);
             v.put("rf_hook_signature", t.parameterSignature + "->" + t.returnType);
             v.put("rf_hook_score", t.score);
             v.put("rf_hook_source", t.source);
@@ -308,13 +351,17 @@ public class NfcInjectionModule extends XposedModule {
         writeValuesWithRetry(v, 20, 100L);
     }
 
+    private void persistProfileStatus(String status, HookTarget target) {
+        ContentValues v = new ContentValues();
+        v.put("profile_status", status);
+        if (target != null) v.put("rf_hook_fingerprint", target.fingerprint());
+        writeValuesWithRetry(v, 8, 75L);
+    }
+
     private void markTargetVerified(HookTarget target) {
         Application app = currentApplication();
         if (app != null) profileStore.save(app, target, "VERIFIED");
-        ContentValues v = new ContentValues();
-        v.put("profile_status", "VERIFIED");
-        v.put("rf_hook_fingerprint", target.fingerprint());
-        writeValuesWithRetry(v, 8, 75L);
+        persistProfileStatus("VERIFIED", target);
     }
 
     private void reportStatusWithRetry(int pid, boolean ready, int count, String stage, String summary, String targetId) {
