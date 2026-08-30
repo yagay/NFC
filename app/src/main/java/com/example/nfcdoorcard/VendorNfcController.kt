@@ -10,11 +10,14 @@ import android.os.Parcel
  * INfcAdapter#getNfcAdapterVendorInterface(String): transaction 6, vendorName="vendor"
  * IVendorNfcAdapter#enableNfcShareMode(boolean): transaction 15
  *
- * Every step validates the Binder descriptor before continuing.
+ * The NFC process can be restarted while this app stays alive. NfcAdapter.sService may
+ * then still point at the dead pre-restart Binder proxy, so always prefer a fresh
+ * ServiceManager lookup and retry once if the first Binder becomes stale.
  */
 class VendorNfcController {
     companion object {
         private const val INFC_DESCRIPTOR = "android.nfc.INfcAdapter"
+        private const val NFC_SERVICE_NAME = "nfc"
         private const val TX_GET_VENDOR_INTERFACE = 6
         private const val VENDOR_NAME = "vendor"
         private const val VENDOR_DESCRIPTOR = "com.vendor.nfc.IVendorNfcAdapter"
@@ -30,13 +33,31 @@ class VendorNfcController {
     )
 
     fun setShareMode(enabled: Boolean): Result {
-        return try {
-            val service = NfcAdapter::class.java.getDeclaredField("sService").apply {
-                isAccessible = true
-            }.get(null) ?: return Result(false, enabled, "INFC_SERVICE", "NfcAdapter.sService is null")
+        var lastFailure: Result? = null
+        repeat(2) { attempt ->
+            val result = setShareModeOnce(enabled, preferFresh = attempt > 0)
+            if (result.success) return result
+            lastFailure = result
 
-            val mainBinder = toBinder(service)
-                ?: return Result(false, enabled, "MAIN_BINDER", "Cannot obtain INfcAdapter binder")
+            // A blank/wrong descriptor, dead Binder or null service after com.android.nfc
+            // restart is transient. Re-resolve the system service and retry once.
+            if (result.stage !in setOf("INFC_SERVICE", "MAIN_BINDER", "MAIN_DESCRIPTOR", "GET_VENDOR_BINDER", "EXCEPTION")) {
+                return result
+            }
+            if (attempt == 0) Thread.sleep(120L)
+        }
+        return lastFailure ?: Result(false, enabled, "UNKNOWN", "Vendor Binder call failed")
+    }
+
+    private fun setShareModeOnce(enabled: Boolean, preferFresh: Boolean): Result {
+        return try {
+            val mainBinder = resolveMainBinder(preferFresh)
+                ?: return Result(false, enabled, "MAIN_BINDER", "Cannot obtain live INfcAdapter binder")
+
+            if (!mainBinder.isBinderAlive || !mainBinder.pingBinder()) {
+                return Result(false, enabled, "MAIN_BINDER", "INfcAdapter binder is not alive")
+            }
+
             val mainDescriptor = runCatching { mainBinder.interfaceDescriptor }.getOrNull().orEmpty()
             if (mainDescriptor != INFC_DESCRIPTOR) {
                 return Result(false, enabled, "MAIN_DESCRIPTOR", "Unexpected descriptor=$mainDescriptor")
@@ -44,6 +65,10 @@ class VendorNfcController {
 
             val vendorBinder = getVendorBinder(mainBinder)
                 ?: return Result(false, enabled, "GET_VENDOR_BINDER", "transaction 6 returned null/rejected")
+            if (!vendorBinder.isBinderAlive || !vendorBinder.pingBinder()) {
+                return Result(false, enabled, "GET_VENDOR_BINDER", "Vendor binder is not alive")
+            }
+
             val vendorDescriptor = runCatching { vendorBinder.interfaceDescriptor }.getOrNull().orEmpty()
             if (vendorDescriptor != VENDOR_DESCRIPTOR) {
                 return Result(false, enabled, "VENDOR_DESCRIPTOR", "Unexpected descriptor=$vendorDescriptor", vendorDescriptor)
@@ -59,6 +84,41 @@ class VendorNfcController {
             )
         } catch (t: Throwable) {
             Result(false, enabled, "EXCEPTION", "${t.javaClass.name}: ${t.message ?: "<no message>"}")
+        }
+    }
+
+    private fun resolveMainBinder(preferFresh: Boolean): IBinder? {
+        if (preferFresh) {
+            serviceManagerBinder()?.let { if (it.isBinderAlive && it.pingBinder()) return it }
+            nfcAdapterStaticBinder()?.let { if (it.isBinderAlive && it.pingBinder()) return it }
+        } else {
+            // ServiceManager is authoritative across NFC process restarts and avoids a
+            // stale NfcAdapter.sService proxy. Keep sService only as a compatibility fallback.
+            serviceManagerBinder()?.let { if (it.isBinderAlive && it.pingBinder()) return it }
+            nfcAdapterStaticBinder()?.let { if (it.isBinderAlive && it.pingBinder()) return it }
+        }
+        return null
+    }
+
+    private fun serviceManagerBinder(): IBinder? {
+        return try {
+            val sm = Class.forName("android.os.ServiceManager")
+            val method = sm.getDeclaredMethod("getService", String::class.java)
+            method.isAccessible = true
+            method.invoke(null, NFC_SERVICE_NAME) as? IBinder
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    private fun nfcAdapterStaticBinder(): IBinder? {
+        return try {
+            val service = NfcAdapter::class.java.getDeclaredField("sService").apply {
+                isAccessible = true
+            }.get(null) ?: return null
+            toBinder(service)
+        } catch (_: Throwable) {
+            null
         }
     }
 
