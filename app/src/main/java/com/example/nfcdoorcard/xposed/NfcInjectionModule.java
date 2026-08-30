@@ -8,12 +8,15 @@ import android.net.Uri;
 import android.os.Process;
 import android.util.Log;
 
-import com.example.nfcdoorcard.xposed.adapter.NfcStackAdapter;
+import com.example.nfcdoorcard.BuildConfig;
 import com.example.nfcdoorcard.xposed.adapter.GenericNxpAdapter;
+import com.example.nfcdoorcard.xposed.adapter.NfcStackAdapter;
 import com.example.nfcdoorcard.xposed.adapter.OplusNxpAdapter;
 
 import java.lang.reflect.Method;
 import java.util.Locale;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 import io.github.libxposed.api.XposedModule;
 import io.github.libxposed.api.XposedModuleInterface;
@@ -21,7 +24,7 @@ import io.github.libxposed.api.XposedModuleInterface;
 /** Stable LSPosed entry. Vendor-specific behavior lives in NfcStackAdapter implementations. */
 public class NfcInjectionModule extends XposedModule {
     private static final String TAG = "NfcUIDSim";
-    private static final int HOOK_BUILD = 10;
+    private static final int HOOK_BUILD = BuildConfig.HOOK_BUILD;
     private static final Uri CONFIG_URI = Uri.parse("content://com.example.nfcdoorcard.config/settings");
 
     private final NfcStackAdapter[] adapters = new NfcStackAdapter[]{
@@ -31,7 +34,19 @@ public class NfcInjectionModule extends XposedModule {
             new GenericNxpAdapter()
     };
 
+    /**
+     * All provider writes from the Hook are serialized. The previous implementation
+     * created one retry thread per write, which allowed an old DETECTING write to land
+     * after READY/RF_UID_APPLIED and overwrite newer state.
+     */
+    private final ExecutorService stateSyncExecutor = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "NfcUIDSim-StateSync");
+        t.setDaemon(true);
+        return t;
+    });
+
     private volatile boolean disabledAfterFailure;
+    private volatile String disabledFailureUid;
     private volatile NfcStackAdapter activeAdapter;
 
     @Override
@@ -64,9 +79,20 @@ public class NfcInjectionModule extends XposedModule {
                 if (args.length != 1 || !(args[0] instanceof byte[])) return chain.proceed();
 
                 SimConfig cfg = readConfig();
-                if (!cfg.active || cfg.uid == null || disabledAfterFailure) return chain.proceed();
+                if (!cfg.active || cfg.uid == null) return chain.proceed();
 
                 String uidHex = cfg.uid.replaceAll("[^0-9A-Fa-f]", "").toUpperCase(Locale.ROOT);
+                if (disabledAfterFailure) {
+                    if (disabledFailureUid != null && disabledFailureUid.equals(uidHex)) {
+                        return chain.proceed();
+                    }
+                    // A new UID/config is a new attempt. Do not force an NFC process restart
+                    // just because a previous UID was rejected by the native stack.
+                    disabledAfterFailure = false;
+                    disabledFailureUid = null;
+                    Log.i(TAG, "NFCID1 RETRY unlocked for changed uid=" + uidHex + " pid=" + pid);
+                }
+
                 if (cfg.diagnostics) {
                     String caller = compactCallStack(24);
                     Log.i(TAG, "RFPROBE: CHANGE_RF_CALLER pid=" + pid + " uid=" + uidHex + " stack=" + caller);
@@ -92,12 +118,15 @@ public class NfcInjectionModule extends XposedModule {
                 Object result = chain.proceed(new Object[]{injected.data});
                 boolean ok = result instanceof Number && ((Number) result).intValue() == 0;
                 if (ok) {
+                    disabledAfterFailure = false;
+                    disabledFailureUid = null;
                     Log.i(TAG, "NFCID1 ACCEPTED adapter=" + adapter.id() + " pid=" + pid + " uid=" + uidHex + " result=" + result);
                     writeRfStatus("RF_UID_APPLIED", uidHex, adapter.id(), String.valueOf(result));
                 } else {
                     disabledAfterFailure = true;
+                    disabledFailureUid = uidHex;
                     Log.e(TAG, "NFCID1 FAILED adapter=" + adapter.id() + " pid=" + pid + " uid=" + uidHex + " result=" + result);
-                    writeRfStatus("RF_UID_FAILED", uidHex, "native rejected; injection disabled until NFC process restart", String.valueOf(result));
+                    writeRfStatus("RF_UID_FAILED", uidHex, "native rejected; same UID injection disabled until config changes or NFC process restart", String.valueOf(result));
                 }
                 return result;
             });
@@ -167,7 +196,7 @@ public class NfcInjectionModule extends XposedModule {
         v.put("adapter_supported", supported);
         v.put("adapter_detail", detail == null ? "" : detail);
         v.put("adapter_pid", pid);
-        writeValuesWithRetry(v, 30, 200L);
+        writeValuesWithRetry(v, 20, 150L);
     }
 
     private void reportStatusWithRetry(int pid, boolean ready, int count, String stage, String summary, String adapterId) {
@@ -183,7 +212,7 @@ public class NfcInjectionModule extends XposedModule {
         v.put("full_diag_stage", stage);
         v.put("full_diag_summary", summary);
         if (adapterId != null) v.put("adapter_id", adapterId);
-        writeValuesWithRetry(v, 30, 200L);
+        writeValuesWithRetry(v, 20, 150L);
     }
 
     private void writeRfStatus(String state, String uid, String detail, String result) {
@@ -191,9 +220,7 @@ public class NfcInjectionModule extends XposedModule {
         ContentValues v = new ContentValues();
 
         // Reaching this method proves that the installed interceptor is executing in
-        // the current NFC process. Reassert the hook/scope state together with every
-        // RF status update so an older asynchronous DETECTING write cannot leave the
-        // UI showing "Hook not installed" after a successful interception.
+        // the current NFC process. Keep the hook/scope state aligned with RF evidence.
         v.put("hook_build", HOOK_BUILD);
         v.put("scope_ok", true);
         v.put("scope_process", "com.android.nfc");
@@ -211,12 +238,12 @@ public class NfcInjectionModule extends XposedModule {
         v.put("rf_pid", pid);
         v.put("full_diag_stage", state);
         v.put("full_diag_summary", detail == null ? "" : detail);
-        writeValuesWithRetry(v, 30, 200L);
+        writeValuesWithRetry(v, 20, 100L);
     }
 
     private void writeValuesWithRetry(ContentValues values, int attempts, long delayMs) {
-        ContentValues copy = new ContentValues(values);
-        Thread t = new Thread(() -> {
+        final ContentValues copy = new ContentValues(values);
+        stateSyncExecutor.execute(() -> {
             for (int i = 0; i < attempts; i++) {
                 Application app = currentApplication();
                 if (app != null) {
@@ -235,9 +262,7 @@ public class NfcInjectionModule extends XposedModule {
                 }
             }
             Log.w(TAG, "status write gave up after " + attempts + " attempts");
-        }, "NfcUIDSim-StateSync");
-        t.setDaemon(true);
-        t.start();
+        });
     }
 
     private SimConfig readConfig() {
