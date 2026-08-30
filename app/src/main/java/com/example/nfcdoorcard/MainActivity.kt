@@ -10,6 +10,8 @@ import android.nfc.NfcAdapter
 import android.nfc.Tag
 import android.nfc.tech.NfcA
 import android.os.Bundle
+import android.os.Environment
+import android.provider.MediaStore
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -706,19 +708,37 @@ class MainActivity : ComponentActivity() {
     private fun saveDiagnosticWithoutSharing(onDone: () -> Unit) {
         stopReadMode("diagnostic_save")
         diagnosticExecutor.execute {
+            var createdUri: android.net.Uri? = null
             try {
-                val dir = getExternalFilesDir("diagnostics") ?: filesDir
-                if (!dir.exists()) dir.mkdirs()
-                val file = File(dir, "nfc_fullcheck_1.0.15.txt")
-                file.writeText(buildFullDiagnosticReport())
-                AppLogger.i("Diagnostics saved without share chooser: ${file.absolutePath}")
-                val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                clipboard.setPrimaryClip(ClipData.newPlainText("NFC diagnostic path", file.absolutePath))
+                val fileName = "nfc_fullcheck_1.0.15_${System.currentTimeMillis()}.txt"
+                val values = ContentValues().apply {
+                    put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
+                    put(MediaStore.MediaColumns.MIME_TYPE, "text/plain")
+                    put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+                    put(MediaStore.MediaColumns.IS_PENDING, 1)
+                }
+                createdUri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                    ?: error("无法在 Download 创建日志文件")
+
+                contentResolver.openOutputStream(createdUri, "w")?.bufferedWriter()?.use { writer ->
+                    writer.write(buildFullDiagnosticReport())
+                } ?: error("无法写入日志文件")
+
+                contentResolver.update(createdUri, ContentValues().apply {
+                    put(MediaStore.MediaColumns.IS_PENDING, 0)
+                }, null, null)
+
+                AppLogger.i("Diagnostics saved to public Downloads: $fileName uri=$createdUri")
                 runOnUiThread {
                     onDone()
-                    Toast.makeText(this@MainActivity, "诊断已保存，路径已复制；未打开分享界面", Toast.LENGTH_LONG).show()
+                    Toast.makeText(
+                        this@MainActivity,
+                        "日志已保存到 Download/$fileName",
+                        Toast.LENGTH_LONG
+                    ).show()
                 }
             } catch (e: Exception) {
+                createdUri?.let { runCatching { contentResolver.delete(it, null, null) } }
                 AppLogger.i("Diagnostics failed ${e.javaClass.simpleName}: ${e.message}")
                 runOnUiThread { onDone(); Toast.makeText(this@MainActivity, "检测失败: ${e.message}", Toast.LENGTH_LONG).show() }
             }
