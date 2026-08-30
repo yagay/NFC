@@ -36,15 +36,12 @@ def main():
         "        nfcClassLoader = cl;\n",
         "remember classloader")
 
-    # Startup only installs cheap known trigger hooks. Full dex trigger discovery is compatibility
-    # fallback and is deferred until a trigger is actually needed.
     text = replace_once(text,
         "        List<HookTarget> triggerTargets = discoveryEngine.discoverKnownTriggerCandidates(cl);\n"
         "        if (triggerTargets.isEmpty()) triggerTargets = discoveryEngine.discoverTriggerCandidates(cl);\n",
         "        List<HookTarget> triggerTargets = discoveryEngine.discoverKnownTriggerCandidates(cl);\n",
         "make trigger discovery lazy")
 
-    # Insert lazy full discovery before triggerRfRefresh.
     anchor = "    private NfcProcessVendorController.Result triggerRfRefresh(SimConfig cfg, boolean enabled, String reason) {\n"
     helper = '''    private synchronized void ensureFullTriggerDiscovery() {
         if (fullTriggerDiscoveryDone) return;
@@ -82,7 +79,6 @@ def main():
         raise SystemExit("trigger anchor missing")
     text = text.replace(anchor, helper + anchor, 1)
 
-    # Only pay for full trigger discovery when the cheap known Java trigger cannot be invoked.
     text = replace_once(text,
         "        RefreshTriggerEngine.Invocation javaTrigger = refreshTriggerEngine.invoke(enabled);\n"
         "        if (javaTrigger.success) {",
@@ -94,8 +90,6 @@ def main():
         "        if (javaTrigger.success) {",
         "lazy fallback discovery invocation")
 
-    # Replace lifecycle recovery with state-machine-driven decisions. Timing and side effects remain
-    # here, but policy is now pure/testable.
     start = "    private void runLifecycleRecovery(String reason) {"
     end = "    private boolean waitForLifecycleVerified(long generation, int pid, String uid, long timeoutMs) {"
     replacement = '''    private void runLifecycleRecovery(String reason) {
@@ -189,7 +183,6 @@ def main():
 
 '''
     text = replace_between(text, start, end, replacement, "replace lifecycle recovery")
-
     MODULE.write_text(text)
 
     gradle = GRADLE.read_text()
@@ -198,13 +191,13 @@ def main():
         '        versionCode = 52\n        versionName = "1.0.51"\n',
         "bump version")
     gradle = replace_once(gradle,
-        '        // Runtime protocol v7; hook build 37; 1.0.50 removes obsolete RF settling/final-sequence machinery and keeps controller-ready exact replay as the primary recovery path, with share-mode only as compatibility fallback.\n'
-        '        // Application ID, source namespace, Provider authority and LSPosed entry all use com.yagay.nfcdoorcard.\n'
         '        buildConfigField("int", "HOOK_BUILD", "37")\n',
-        '        // Runtime protocol v7; hook build 38; 1.0.51 extracts pure recovery policy, defers full trigger discovery until fallback is needed, and keeps exact replay as the controller-ready primary path.\n'
-        '        // Application ID, source namespace, Provider authority and LSPosed entry all use com.yagay.nfcdoorcard.\n'
         '        buildConfigField("int", "HOOK_BUILD", "38")\n',
         "bump hook build")
+    marker = '        // Runtime protocol v7; hook build 37; 1.0.50 removes obsolete RF settling/final-sequence machinery and keeps controller-ready exact replay as the primary recovery path, with share-mode only as compatibility fallback.\n'
+    if marker in gradle:
+        gradle = gradle.replace(marker,
+            '        // Runtime protocol v7; hook build 38; 1.0.51 extracts pure recovery policy, defers full trigger discovery until fallback is needed, and keeps exact replay as the controller-ready primary path.\n', 1)
     GRADLE.write_text(gradle)
 
 if __name__ == "__main__":
