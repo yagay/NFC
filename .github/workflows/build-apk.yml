@@ -60,6 +60,7 @@ jobs:
             unzip -l "$apk" | grep -q 'META-INF/xposed/java_init.list'
             unzip -l "$apk" | grep -q 'META-INF/xposed/module.prop'
             unzip -p "$apk" META-INF/xposed/java_init.list | grep -q 'com.example.nfcdoorcard.xposed.NfcInjectionModule'
+            "$ANDROID_HOME/build-tools/35.0.0/aapt2" dump badging "$apk" | grep -q "package: name='com.yagay.nfcdoorcard'"
             "$ANDROID_HOME/build-tools/35.0.0/zipalign" -c -p 4 "$apk"
             "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose "$apk"
           done
