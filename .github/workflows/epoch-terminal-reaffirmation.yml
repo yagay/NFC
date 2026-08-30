@@ -1,0 +1,23 @@
+name: Epoch terminal reaffirmation
+
+on: [push]
+
+permissions:
+  contents: write
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Apply terminal reaffirmation
+        run: python3 scripts/epoch_terminal_reaffirmation.py
+      - name: Commit terminal reaffirmation
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app/src/main/java/com/yagay/nfcdoorcard/ConfigProvider.kt
+          git commit -m "fix: authenticate lifecycle reaffirmation by controller epoch" || exit 0
+          git push
