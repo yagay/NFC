@@ -302,13 +302,18 @@ public class NfcInjectionModule extends XposedModule {
                 disabledFailureUid = null;
                 disabledFailureGeneration = Long.MIN_VALUE;
 
-                boolean replacedExisting = rewritten.reason != null && rewritten.reason.contains("REPLACED_EXISTING_LA_NFCID1");
+                boolean reversibleExisting = rewritten.reason != null &&
+                        (rewritten.reason.contains("REPLACED_EXISTING_LA_NFCID1") ||
+                                rewritten.reason.contains("RESIZED_EXISTING_LA_NFCID1"));
                 synchronized (this) {
                     if (learningMode) {
                         markTargetVerified(target);
                         learningMode = false;
                     }
-                    if (replacedExisting) {
+                    if (reversibleExisting) {
+                        // Both same-length replacement and structurally verified resize mutate an
+                        // existing LA_NFCID1 parameter. The exact original payload is therefore a
+                        // safe inverse, including stock 33 00 -> 33 04/07/0A transitions.
                         reversibleStockPayload = original.clone();
                         reversibleTargetFingerprint = target.fingerprint();
                         reversibleCapturedGeneration = cfg.generation;
