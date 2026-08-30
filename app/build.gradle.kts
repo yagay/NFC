@@ -15,7 +15,7 @@ android {
         versionCode = 56
         versionName = "1.0.55"
 
-        // Runtime protocol v7; hook build 39; 1.0.55 finalizes recovery/replay separation, typed Provider commands, ReaderMode, and isolated diagnostics collection.
+        // Runtime protocol v7; hook build 39; 1.0.55 finalizes recovery/replay separation, typed Provider commands, ReaderMode, isolated diagnostics collection, and bounded root probing.
         // Historical cleanup is behavior-preserving: controller lifecycle/epoch, exact replay, reversible STOP and restart fallback remain intact.
         // Application ID, source namespace, Provider authority and LSPosed entry all use com.yagay.nfcdoorcard.
         buildConfigField("int", "HOOK_BUILD", "39")
