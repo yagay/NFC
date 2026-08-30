@@ -86,6 +86,8 @@ class ConfigProvider : ContentProvider() {
         const val KEY_RF_VERIFICATION = "rf_verification"
         const val KEY_CONTROLLER_EPOCH = "controller_epoch"
         const val KEY_RF_CONTROLLER_EPOCH = "rf_controller_epoch"
+        const val KEY_CONTROLLER_EPOCH = "controller_epoch"
+        const val KEY_RF_CONTROLLER_EPOCH = "rf_controller_epoch"
 
         const val KEY_FULL_DIAG_STAGE = "full_diag_stage"
         const val KEY_FULL_DIAG_SUMMARY = "full_diag_summary"

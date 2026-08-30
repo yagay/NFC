@@ -588,6 +588,8 @@ public class NfcInjectionModule extends XposedModule {
                 else if ("rf_uid".equals(key)) rfUid = normalizeUid(value);
                 else if ("controller_epoch".equals(key)) controllerEpoch = parseLong(value, 0L);
                 else if ("rf_controller_epoch".equals(key)) rfControllerEpoch = parseLong(value, Long.MIN_VALUE);
+                else if ("controller_epoch".equals(key)) controllerEpoch = parseLong(value, 0L);
+                else if ("rf_controller_epoch".equals(key)) rfControllerEpoch = parseLong(value, Long.MIN_VALUE);
             }
         } catch (Throwable ignored) { return false; }
         return rfGeneration == generation && rfPid == pid && accepted && controllerEpoch > 0L &&
@@ -1076,6 +1078,7 @@ public class NfcInjectionModule extends XposedModule {
                 else if ("command_action".equals(key)) action = value == null ? "" : value;
                 else if ("command_status".equals(key)) status = value == null ? "" : value;
                 else if ("command_pid".equals(key)) commandPid = (int) parseLong(value, 0L);
+                else if ("controller_epoch".equals(key)) controllerEpoch = parseLong(value, 0L);
                 else if ("controller_epoch".equals(key)) controllerEpoch = parseLong(value, 0L);
             }
             if (action.isEmpty()) action = active ? "APPLY" : "STOP";
