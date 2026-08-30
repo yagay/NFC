@@ -12,12 +12,12 @@ android {
         applicationId = "com.yagay.nfcdoorcard"
         minSdk = 31
         targetSdk = 35
-        versionCode = 50
-        versionName = "1.0.49"
+        versionCode = 51
+        versionName = "1.0.50"
 
-        // Runtime protocol v7; hook build 36; 1.0.49 replays the exact previously native-accepted RF invocation after controller READY, with share-mode only as fallback and same-epoch failure-loop suppression.
+        // Runtime protocol v7; hook build 37; 1.0.50 removes obsolete RF settling/final-sequence machinery and keeps controller-ready exact replay as the primary recovery path, with share-mode only as compatibility fallback.
         // Application ID, source namespace, Provider authority and LSPosed entry all use com.yagay.nfcdoorcard.
-        buildConfigField("int", "HOOK_BUILD", "36")
+        buildConfigField("int", "HOOK_BUILD", "37")
     }
 
     buildTypes {
