@@ -140,6 +140,56 @@ class ConfigProvider : ContentProvider() {
     private fun migrateStateIfNeeded(prefs: SharedPreferences) {
         val current = prefs.getInt(KEY_STATE_SCHEMA, 0)
         if (current >= STATE_SCHEMA_VERSION) return
+
+        // Schema 6 -> 7 only adds controller-lifecycle freshness. Keep the user's durable desired
+        // APPLY/STOP command and UID instead of wiping command history. For an ACTIVE simulation,
+        // deliberately leave rf_controller_epoch absent so old RF proof becomes stale and Hook 30
+        // must obtain a fresh native-accepted RF write. STOCK can safely adopt the new epoch because
+        // an app/schema upgrade itself does not inject a UID.
+        if (current == 6) {
+            val editor = prefs.edit()
+            prefs.all.keys.forEach { key ->
+                if (key in LEGACY_KEYS || LEGACY_PREFIXES.any { prefix -> key.startsWith(prefix) }) editor.remove(key)
+            }
+            val previousEpoch = (prefs.all[KEY_CONTROLLER_EPOCH] as? Number)?.toLong() ?: 0L
+            val nextEpoch = maxOf(previousEpoch + 1L, System.currentTimeMillis())
+            val simulationEnabled = prefs.getBoolean(KEY_SIMULATION_ENABLED, false)
+            val effective = prefs.getString(KEY_EFFECTIVE_STATE, "UNKNOWN") ?: "UNKNOWN"
+            val accepted = prefs.getBoolean(KEY_RF_ACCEPTED, false)
+            editor.putLong(KEY_CONTROLLER_EPOCH, nextEpoch)
+            if (!simulationEnabled && effective == "STOCK" && accepted) {
+                editor.putLong(KEY_RF_CONTROLLER_EPOCH, nextEpoch)
+            } else {
+                editor.remove(KEY_RF_CONTROLLER_EPOCH)
+            }
+            editor
+                .remove(KEY_PROFILE_STATUS)
+                .remove(KEY_PROFILE_SYSTEM_FINGERPRINT)
+                .remove(KEY_PROFILE_NFC_VERSION)
+                .remove(KEY_RF_HOOK_CLASS)
+                .remove(KEY_RF_HOOK_METHOD)
+                .remove(KEY_RF_HOOK_SIGNATURE)
+                .remove(KEY_RF_HOOK_SCORE)
+                .remove(KEY_RF_HOOK_SOURCE)
+                .remove(KEY_RF_HOOK_FINGERPRINT)
+                .remove(KEY_RF_HOOK_CANDIDATES)
+                .remove(KEY_RF_HOOK_CANDIDATE_COUNT)
+                .remove(KEY_RF_HOOK_DISCOVERY_PID)
+                .remove(KEY_REFRESH_PROBE_CANDIDATES)
+                .remove(KEY_REFRESH_PROBE_COUNT)
+                .remove(KEY_REFRESH_PROBE_PID)
+                .remove("refresh_probe_events")
+                .remove("refresh_probe_last")
+                .remove(KEY_REFRESH_TRIGGER_STATUS)
+                .remove(KEY_REFRESH_TRIGGER_TARGET)
+                .remove(KEY_REFRESH_TRIGGER_SOURCE)
+                .remove(KEY_REFRESH_TRIGGER_GENERATION)
+                .remove(KEY_REFRESH_TRIGGER_RF_CONFIRMED)
+                .putInt(KEY_STATE_SCHEMA, STATE_SCHEMA_VERSION)
+                .apply()
+            return
+        }
+
         val editor = prefs.edit()
         prefs.all.keys.forEach { key ->
             if (key in LEGACY_KEYS || key in RUNTIME_KEYS || LEGACY_PREFIXES.any { prefix -> key.startsWith(prefix) }) editor.remove(key)
