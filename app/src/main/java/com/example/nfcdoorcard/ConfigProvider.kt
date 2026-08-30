@@ -206,23 +206,17 @@ class ConfigProvider : ContentProvider() {
                 Log.w("NfcConfigProvider", "Dropped stale runtime write generation=$stateGeneration current=$currentGeneration uid=${Binder.getCallingUid()}")
                 return uri
             }
-            // Only a command publication is allowed to advance the generation. Runtime writers
-            // may update the current generation, but may never create a future generation by accident.
             if (stateGeneration > currentGeneration && declaredCommandGeneration != stateGeneration) {
                 Log.w("NfcConfigProvider", "Dropped future runtime write generation=$stateGeneration current=$currentGeneration without command publication")
                 return uri
             }
         }
 
-        // A completed command generation is monotonic, but lifecycle verification is allowed to
-        // reaffirm the same terminal result after com.android.nfc restarts. This keeps two rules:
-        // 1) a late RUNNING/TRIGGERED/STOPPING write can never downgrade SUCCESS/FAILED;
-        // 2) a new NFC process may replace old-PID RF evidence with fresh VERIFIED evidence only
-        //    when it preserves the exact terminal effective state expected by simulation_enabled.
         val terminalCurrentGeneration = currentGeneration > 0L &&
             currentHandledGeneration == currentGeneration && currentCommandStatus in TERMINAL_COMMAND_STATUSES
         val advancesCommand = declaredCommandGeneration != null && declaredCommandGeneration > currentGeneration
         val expectedEffective = if (simulationEnabled) "ACTIVE" else "STOCK"
+        val expectedAction = if (simulationEnabled) "APPLY" else "STOP"
         val incomingEffective = incoming.getAsString(KEY_EFFECTIVE_STATE)
         val incomingOperation = incoming.getAsString(KEY_OPERATION_STATE)
         val incomingConfidence = incoming.getAsString(KEY_VERIFICATION_CONFIDENCE)
@@ -237,8 +231,8 @@ class ConfigProvider : ContentProvider() {
             incomingConfidence == "VERIFIED" && incomingAccepted == true && incomingRfPid > 0 &&
             (incomingRuntimePid == 0 || incomingRuntimePid == incomingRfPid) &&
             (incomingCommandStatus == null || incomingCommandStatus == "SUCCESS") &&
-            currentCommandAction == if (simulationEnabled) "APPLY" else "STOP" &&
-            currentEffective == expectedEffective && currentConfidence == "VERIFIED" && currentRfAccepted
+            currentCommandAction == expectedAction && currentEffective == expectedEffective &&
+            currentConfidence == "VERIFIED" && currentRfAccepted
 
         if (terminalCurrentGeneration && !advancesCommand && !terminalReaffirmation) {
             val removed = mutableListOf<String>()
@@ -255,8 +249,6 @@ class ConfigProvider : ContentProvider() {
                 )
             }
         } else if (terminalReaffirmation) {
-            // Command history belongs to the original user command. Lifecycle confirmation may
-            // refresh RF evidence and semantic state but must not rewrite the historical command.
             listOf(
                 KEY_COMMAND_CONSUMED_GENERATION, KEY_COMMAND_HANDLED_GENERATION, KEY_COMMAND_ACTION,
                 KEY_COMMAND_STATUS, KEY_COMMAND_DETAIL, KEY_COMMAND_PID
@@ -267,11 +259,6 @@ class ConfigProvider : ContentProvider() {
             )
         }
 
-        // STOP has a special lifecycle proof: when a fully initialized *new* com.android.nfc
-        // process reports READY after a terminal verified STOP, the previous injected process is
-        // gone and the controller has been initialized with simulation_enabled=false. Adopt that
-        // new PID as fresh STOCK evidence. ACTIVE is intentionally excluded: it must be reapplied
-        // and receive a real RF/native success before its old evidence can become fresh again.
         val announcedRuntimePid = incoming.getAsInteger(KEY_RUNTIME_PID) ?: 0
         val announcedHookPid = incoming.getAsInteger(KEY_HOOK_PID) ?: 0
         val announcedScopePid = incoming.getAsInteger(KEY_SCOPE_PID) ?: 0
