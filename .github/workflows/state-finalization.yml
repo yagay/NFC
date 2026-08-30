@@ -6,6 +6,7 @@ on:
     paths:
       - '.github/workflows/state-finalization.yml'
       - '.github/scripts/state_finalize.py'
+      - '.github/scripts/state_finalize_fix.py'
 
 permissions:
   contents: write
@@ -26,7 +27,9 @@ jobs:
       - run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
       - uses: gradle/actions/setup-gradle@v4
       - name: Apply state finalization
-        run: python3 .github/scripts/state_finalize.py
+        run: |
+          python3 .github/scripts/state_finalize_fix.py
+          python3 .github/scripts/state_finalize.py
       - name: Build and lint patched app
         run: |
           chmod +x ./gradlew
@@ -36,7 +39,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git rm .github/workflows/state-finalization.yml .github/scripts/state_finalize.py
+          git rm .github/workflows/state-finalization.yml .github/scripts/state_finalize.py .github/scripts/state_finalize_fix.py
           git add app/build.gradle.kts app/src/main/java/com/example/nfcdoorcard/ConfigProvider.kt app/src/main/java/com/example/nfcdoorcard/MainActivity.kt app/src/main/java/com/example/nfcdoorcard/xposed/NfcInjectionModule.java
           git commit -m "Finalize restart handoff and diagnostic snapshots"
           git push origin HEAD:main
