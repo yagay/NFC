@@ -5,7 +5,7 @@ enum class LogSource(val label: String) {
     NFC("NFC"), HAL("HAL"), PROVIDER("Provider"), APP("App")
 }
 
-enum class StatusTone { OK, IDLE, BUSY, WARNING, ERROR }
+enum class StatusTone { OK, STOCK, IDLE, BUSY, WARNING, ERROR }
 
 data class RuntimeStatus(
     val appBuild: Int = 0,
