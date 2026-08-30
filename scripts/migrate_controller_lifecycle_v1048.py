@@ -1,5 +1,6 @@
 from pathlib import Path
 
+# Triggered after the workflow itself is present on main.
 module_path = Path('app/src/main/java/com/yagay/nfcdoorcard/xposed/NfcInjectionModule.java')
 build_path = Path('app/build.gradle.kts')
 text = module_path.read_text()
@@ -217,7 +218,6 @@ text = text.replace(
     '    private void invalidateRfEvidenceForControllerReset(String reason) {\n'
 )
 
-# Upgrade version + hook build because runtime hook behaviour changes.
 build = build_path.read_text()
 build = build.replace('versionCode = 48', 'versionCode = 49')
 build = build.replace('versionName = "1.0.47"', 'versionName = "1.0.48"')
@@ -230,6 +230,5 @@ build = build.replace('buildConfigField("int", "HOOK_BUILD", "34")', 'buildConfi
 module_path.write_text(text)
 build_path.write_text(build)
 
-# The migration is intentionally one-shot; remove itself and its workflow from the product tree.
 Path('scripts/migrate_controller_lifecycle_v1048.py').unlink(missing_ok=True)
 Path('.github/workflows/controller-lifecycle-v1048.yml').unlink(missing_ok=True)
