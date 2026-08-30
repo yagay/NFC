@@ -6,7 +6,7 @@ import android.os.Parcel;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 
-/** Executes the OEM refresh trigger from inside com.android.nfc with reflected transaction IDs. */
+/** Executes OEM RF triggers and NFC controller lifecycle operations from com.android.nfc. */
 final class NfcProcessVendorController {
     private static final String NFC_SERVICE_NAME = "nfc";
     private static final String INFC_DESCRIPTOR = "android.nfc.INfcAdapter";
@@ -41,13 +41,59 @@ final class NfcProcessVendorController {
             if (attempt + 1 < STARTUP_RETRY_COUNT) sleep(STARTUP_RETRY_DELAY_MS);
         }
         if (last == null) return new Result(false, "UNKNOWN", "No vendor result", null);
-        return new Result(
-                false,
-                last.stage,
+        return new Result(false, last.stage,
                 last.detail + " after " + STARTUP_RETRY_COUNT + " attempts/~" +
                         ((STARTUP_RETRY_COUNT - 1) * STARTUP_RETRY_DELAY_MS) + "ms",
-                last.vendorDescriptor
-        );
+                last.vendorDescriptor);
+    }
+
+    /**
+     * Reinitializes the actual NFC controller instead of only restarting the Java process.
+     * This is required when LA_NFCID1 was appended to CORE_SET_CONFIG: replaying a payload
+     * that omits parameter 0x33 does not delete the value already stored by the controller.
+     */
+    Result reinitializeController() {
+        try {
+            IBinder main = serviceManagerBinder();
+            if (main == null || !main.isBinderAlive() || !main.pingBinder()) {
+                return new Result(false, "CONTROLLER_BINDER", "NFC binder unavailable for controller reinit", null);
+            }
+            String descriptor = safeDescriptor(main);
+            if (!INFC_DESCRIPTOR.equals(descriptor)) {
+                return new Result(false, "CONTROLLER_DESCRIPTOR", "Unexpected descriptor=" + descriptor, null);
+            }
+
+            int txDisable = resolveRequiredTransaction(INFC_STUB, "TRANSACTION_disable");
+            int txEnable = resolveRequiredTransaction(INFC_STUB, "TRANSACTION_enable");
+            if (txDisable <= 0 || txEnable <= 0) {
+                return new Result(false, "CONTROLLER_TRANSACTIONS",
+                        "Unable to reflect INfcAdapter disable/enable transaction IDs", null);
+            }
+
+            boolean disabled = transactDisable(main, txDisable, false);
+            if (!disabled) {
+                return new Result(false, "CONTROLLER_DISABLE",
+                        "INfcAdapter.disable(false) rejected tx=" + txDisable, null);
+            }
+
+            // Let NfcService drive native close/deinit before reopening the controller.
+            sleep(500L);
+
+            IBinder afterDisable = serviceManagerBinder();
+            if (afterDisable == null || !afterDisable.isBinderAlive()) afterDisable = main;
+            boolean enabled = transactEnable(afterDisable, txEnable);
+            if (!enabled) {
+                return new Result(false, "CONTROLLER_ENABLE",
+                        "INfcAdapter.enable() rejected tx=" + txEnable, null);
+            }
+            return new Result(true, "CONTROLLER_REINITIALIZED",
+                    "NFC controller reinitialized through INfcAdapter disable(false)->enable() tx=" +
+                            txDisable + "->" + txEnable,
+                    null);
+        } catch (Throwable t) {
+            return new Result(false, "CONTROLLER_EXCEPTION",
+                    t.getClass().getName() + ": " + String.valueOf(t.getMessage()), null);
+        }
     }
 
     private Result setShareModeOnce(boolean enabled) {
@@ -104,13 +150,18 @@ final class NfcProcessVendorController {
     }
 
     private static int resolveTransaction(String stubClass, String fieldName, int fallback) {
+        int reflected = resolveRequiredTransaction(stubClass, fieldName);
+        return reflected > 0 ? reflected : fallback;
+    }
+
+    private static int resolveRequiredTransaction(String stubClass, String fieldName) {
         try {
             Class<?> c = Class.forName(stubClass);
             Field f = c.getDeclaredField(fieldName);
             f.setAccessible(true);
             return f.getInt(null);
         } catch (Throwable ignored) {
-            return fallback;
+            return -1;
         }
     }
 
@@ -139,8 +190,37 @@ final class NfcProcessVendorController {
             if (!vendor.transact(transaction, data, reply, 0)) return false;
             reply.setDataPosition(0);
             reply.readException();
-            // This AIDL method returns boolean on the currently supported OEM stack. Treat an
-            // empty or structurally changed reply as trigger failure; RF confirmation remains final proof.
+            return reply.dataAvail() >= 4 && reply.readBoolean();
+        } finally {
+            reply.recycle();
+            data.recycle();
+        }
+    }
+
+    private static boolean transactDisable(IBinder main, int transaction, boolean saveState) throws Exception {
+        Parcel data = Parcel.obtain();
+        Parcel reply = Parcel.obtain();
+        try {
+            data.writeInterfaceToken(INFC_DESCRIPTOR);
+            data.writeBoolean(saveState);
+            if (!main.transact(transaction, data, reply, 0)) return false;
+            reply.setDataPosition(0);
+            reply.readException();
+            return reply.dataAvail() >= 4 && reply.readBoolean();
+        } finally {
+            reply.recycle();
+            data.recycle();
+        }
+    }
+
+    private static boolean transactEnable(IBinder main, int transaction) throws Exception {
+        Parcel data = Parcel.obtain();
+        Parcel reply = Parcel.obtain();
+        try {
+            data.writeInterfaceToken(INFC_DESCRIPTOR);
+            if (!main.transact(transaction, data, reply, 0)) return false;
+            reply.setDataPosition(0);
+            reply.readException();
             return reply.dataAvail() >= 4 && reply.readBoolean();
         } finally {
             reply.recycle();
