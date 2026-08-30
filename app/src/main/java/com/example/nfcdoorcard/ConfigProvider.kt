@@ -15,11 +15,12 @@ class ConfigProvider : ContentProvider() {
         const val AUTHORITY = "com.example.nfcdoorcard.config"
         const val PATH_SETTINGS = "settings"
         private const val PREFS_NAME = "nfc_config"
-        const val STATE_SCHEMA_VERSION = 3
+        const val STATE_SCHEMA_VERSION = 4
         const val PROFILE_SCHEMA_VERSION = 3
         val APP_BUILD: Int = BuildConfig.VERSION_CODE
 
         const val KEY_STATE_SCHEMA = "state_schema"
+        const val KEY_STATE_GENERATION = "state_generation"
         const val KEY_APP_BUILD = "app_build"
         const val KEY_HOOK_BUILD = "hook_build"
         const val KEY_SIMULATION_ENABLED = "simulation_enabled"
@@ -91,6 +92,16 @@ class ConfigProvider : ContentProvider() {
             "last_native_result", "hce_get_uid", "rf_field_count", "text_config_length",
             "text_config_seen", "text_config_source"
         )
+        private val RUNTIME_KEYS = setOf(
+            KEY_STATE_GENERATION,
+            KEY_COMMAND_GENERATION, KEY_COMMAND_HANDLED_GENERATION, KEY_COMMAND_ACTION,
+            KEY_COMMAND_STATUS, KEY_COMMAND_DETAIL, KEY_COMMAND_PID,
+            KEY_OPERATION_STATE, KEY_EFFECTIVE_STATE, KEY_VERIFICATION_CONFIDENCE,
+            KEY_RF_ACCEPTED, KEY_RF_NATIVE_RESULT, KEY_RF_NATIVE_RESULT_TYPE, KEY_RUNTIME_PID,
+            KEY_RF_STATUS, KEY_RF_UID, KEY_RF_SOURCE, KEY_RF_RESULT, KEY_RF_ERROR,
+            KEY_RF_PID, KEY_RF_GENERATION, KEY_RF_VERIFICATION,
+            KEY_FULL_DIAG_STAGE, KEY_FULL_DIAG_SUMMARY
+        )
     }
 
     override fun onCreate(): Boolean {
@@ -111,7 +122,7 @@ class ConfigProvider : ContentProvider() {
         if (current >= STATE_SCHEMA_VERSION) return
         val editor = prefs.edit()
         prefs.all.keys.forEach { key ->
-            if (key in LEGACY_KEYS || LEGACY_PREFIXES.any { prefix -> key.startsWith(prefix) }) editor.remove(key)
+            if (key in LEGACY_KEYS || key in RUNTIME_KEYS || LEGACY_PREFIXES.any { prefix -> key.startsWith(prefix) }) editor.remove(key)
         }
         editor
             .remove(KEY_PROFILE_STATUS)
@@ -129,13 +140,6 @@ class ConfigProvider : ContentProvider() {
             .remove(KEY_REFRESH_PROBE_CANDIDATES)
             .remove(KEY_REFRESH_PROBE_COUNT)
             .remove(KEY_REFRESH_PROBE_PID)
-            .remove(KEY_OPERATION_STATE)
-            .remove(KEY_EFFECTIVE_STATE)
-            .remove(KEY_VERIFICATION_CONFIDENCE)
-            .remove(KEY_RF_ACCEPTED)
-            .remove(KEY_RF_NATIVE_RESULT)
-            .remove(KEY_RF_NATIVE_RESULT_TYPE)
-            .remove(KEY_RUNTIME_PID)
             .putInt(KEY_STATE_SCHEMA, STATE_SCHEMA_VERSION)
             .apply()
     }
@@ -150,13 +154,33 @@ class ConfigProvider : ContentProvider() {
         return cursor
     }
 
+    @Synchronized
     override fun insert(uri: Uri, values: ContentValues?): Uri {
         if (values == null) return uri
         if (!isTrustedCaller()) {
             Log.w("NfcConfigProvider", "Rejected config write from uid=${Binder.getCallingUid()}")
             return uri
         }
-        val editor = prefs().edit()
+
+        val prefs = prefs()
+        val currentGeneration = (prefs.all[KEY_COMMAND_GENERATION] as? Number)?.toLong() ?: 0L
+        val stateGeneration = values.getAsLong(KEY_STATE_GENERATION)
+        val declaredCommandGeneration = values.getAsLong(KEY_COMMAND_GENERATION)
+
+        if (stateGeneration != null && stateGeneration > 0L) {
+            if (currentGeneration > 0L && stateGeneration < currentGeneration) {
+                Log.w("NfcConfigProvider", "Dropped stale runtime write generation=$stateGeneration current=$currentGeneration uid=${Binder.getCallingUid()}")
+                return uri
+            }
+            // Only a command publication is allowed to advance the generation. Runtime writers
+            // may update the current generation, but may never create a future generation by accident.
+            if (stateGeneration > currentGeneration && declaredCommandGeneration != stateGeneration) {
+                Log.w("NfcConfigProvider", "Dropped future runtime write generation=$stateGeneration current=$currentGeneration without command publication")
+                return uri
+            }
+        }
+
+        val editor = prefs.edit()
         values.keySet().forEach { key ->
             when (val value = values.get(key)) {
                 is Boolean -> editor.putBoolean(key, value)
