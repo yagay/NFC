@@ -43,6 +43,10 @@ public class NfcInjectionModule extends XposedModule {
     private static final long LIFECYCLE_TRIGGER_WAIT_MS = 1_600L;
     private static final long LIFECYCLE_TOTAL_TIMEOUT_MS = 9_000L;
     private static final int LIFECYCLE_MAX_TRIGGER_ATTEMPTS = 3;
+    private static final long EARLY_CONFIG_WAIT_MS = 200L;
+    private static final long EARLY_CONFIG_RETRY_MS = 20L;
+    private static final long EARLY_REPLAY_TIMEOUT_MS = 8_000L;
+    private static final long EARLY_REPLAY_RETRY_MS = 50L;
 
     private final ExecutorService stateSyncExecutor = Executors.newSingleThreadExecutor(r -> daemon(r, "NfcUIDSim-StateSync"));
     private final ExecutorService commandExecutor = Executors.newSingleThreadExecutor(r -> daemon(r, "NfcUIDSim-Command"));
@@ -76,6 +80,12 @@ public class NfcInjectionModule extends XposedModule {
     private volatile long pendingTriggerWindowMs = TRIGGER_RF_WINDOW_MS;
     private volatile long confirmedTriggerGeneration = Long.MIN_VALUE;
     private volatile String pendingTriggerTarget = "";
+
+    // Cold-start bridge: if the first natural OEM RF write arrives before ConfigProvider is
+    // readable, capture that exact in-process invocation and replay it once durable desired
+    // state becomes available. This avoids depending on share-mode/Binder triggers for recovery.
+    private volatile EarlyRfInvocation pendingEarlyRfInvocation;
+    private volatile boolean earlyReplayWorkerScheduled;
 
     private volatile byte[] reversibleStockPayload;
     private volatile String reversibleTargetFingerprint;
@@ -217,7 +227,18 @@ public class NfcInjectionModule extends XposedModule {
             }
 
             SimConfig cfg = currentConfig();
-            if (!cfg.initialized) return chain.proceed();
+            if (!cfg.initialized) {
+                // The first controller RF configuration can race Provider availability during a
+                // cold com.android.nfc startup. Spend only a small bounded budget here so the NFC
+                // service is never stalled for seconds. If config is still unavailable, let the
+                // OEM call proceed unchanged but retain this exact verified RF writer invocation
+                // for one in-process replay as soon as durable desired state becomes readable.
+                cfg = awaitEarlyConfig();
+                if (!cfg.initialized) {
+                    captureEarlyRfInvocation(method, chain.getThisObject(), args, payloadArg, target, pid);
+                    return chain.proceed();
+                }
+            }
 
             // A natural RF write in a new NFC process is the best lifecycle recovery trigger. Mark
             // it as a lifecycle reapply before mutating so a successful native result updates only
@@ -328,6 +349,7 @@ public class NfcInjectionModule extends XposedModule {
                     }
                 }
                 persistRestoreState();
+                clearEarlyRfInvocation(target.fingerprint());
                 if (lifecycleReapplyPending) {
                     completeLifecycleReapply(cfg, uidHex, rewritten.codecId, outcome, target);
                     finishLifecycleRecovery(cfg.generation);
@@ -603,8 +625,6 @@ public class NfcInjectionModule extends XposedModule {
                 else if ("rf_uid".equals(key)) rfUid = normalizeUid(value);
                 else if ("controller_epoch".equals(key)) controllerEpoch = parseLong(value, 0L);
                 else if ("rf_controller_epoch".equals(key)) rfControllerEpoch = parseLong(value, Long.MIN_VALUE);
-                else if ("controller_epoch".equals(key)) controllerEpoch = parseLong(value, 0L);
-                else if ("rf_controller_epoch".equals(key)) rfControllerEpoch = parseLong(value, Long.MIN_VALUE);
             }
         } catch (Throwable ignored) { return false; }
         return rfGeneration == generation && rfPid == pid && accepted && controllerEpoch > 0L &&
@@ -729,6 +749,108 @@ public class NfcInjectionModule extends XposedModule {
         SimConfig cfg = readConfig();
         if (cfg.initialized) cachedConfig = cfg;
         return cfg.initialized ? cfg : cachedConfig;
+    }
+
+    private SimConfig awaitEarlyConfig() {
+        long end = System.currentTimeMillis() + EARLY_CONFIG_WAIT_MS;
+        SimConfig cfg;
+        do {
+            cfg = readConfig();
+            if (cfg.initialized) {
+                cachedConfig = cfg;
+                return cfg;
+            }
+            if (System.currentTimeMillis() >= end) break;
+            sleep(EARLY_CONFIG_RETRY_MS);
+        } while (true);
+        return SimConfig.uninitialized();
+    }
+
+    private void captureEarlyRfInvocation(Method method, Object receiver, Object[] args, int payloadArg,
+                                          HookTarget target, int pid) {
+        if (method == null || args == null || payloadArg < 0 || target == null) return;
+        Object[] snapshotArgs = cloneInvocationArgs(args);
+        EarlyRfInvocation snapshot = new EarlyRfInvocation(
+                method, receiver, snapshotArgs, target.fingerprint(), System.currentTimeMillis(), pid);
+        synchronized (this) {
+            // Keep the newest invocation from the active verified writer. During startup an OEM can
+            // emit several config writes; replaying the latest one minimizes stale side effects.
+            pendingEarlyRfInvocation = snapshot;
+            if (earlyReplayWorkerScheduled) return;
+            earlyReplayWorkerScheduled = true;
+        }
+        Log.i(TAG, "EARLY RF REPLAY captured target=" + target.fingerprint() + " pid=" + pid +
+                " payloadArg=" + payloadArg);
+        lifecycleExecutor.execute(this::runEarlyRfReplayWorker);
+    }
+
+    private void runEarlyRfReplayWorker() {
+        long deadline = System.currentTimeMillis() + EARLY_REPLAY_TIMEOUT_MS;
+        try {
+            while (System.currentTimeMillis() < deadline) {
+                EarlyRfInvocation snapshot = pendingEarlyRfInvocation;
+                if (snapshot == null) return;
+                SimConfig cfg = readConfig();
+                if (!cfg.initialized) {
+                    sleep(EARLY_REPLAY_RETRY_MS);
+                    continue;
+                }
+                cachedConfig = cfg;
+                if (!cfg.active || cfg.uid == null || cfg.generation <= 0L) {
+                    clearEarlyRfInvocation(snapshot.targetFingerprint);
+                    return;
+                }
+                String uidHex = normalizeUid(cfg.uid);
+                if (uidHex.length() != 8 && uidHex.length() != 14 && uidHex.length() != 20) {
+                    clearEarlyRfInvocation(snapshot.targetFingerprint);
+                    return;
+                }
+                if (isLifecycleVerified(cfg.generation, Process.myPid(), uidHex)) {
+                    clearEarlyRfInvocation(snapshot.targetFingerprint);
+                    return;
+                }
+                try {
+                    snapshot.method.setAccessible(true);
+                    Log.i(TAG, "EARLY RF REPLAY invoke target=" + snapshot.targetFingerprint +
+                            " generation=" + cfg.generation + " uid=" + uidHex + " pid=" + Process.myPid());
+                    snapshot.method.invoke(snapshot.receiver, cloneInvocationArgs(snapshot.args));
+                } catch (Throwable t) {
+                    Throwable cause = t.getCause() == null ? t : t.getCause();
+                    Log.w(TAG, "EARLY RF REPLAY failed target=" + snapshot.targetFingerprint + " " +
+                            cause.getClass().getSimpleName() + ": " + cause.getMessage());
+                }
+                // A replayed invocation re-enters the installed RF hook. Require the same closed-loop
+                // native-accepted controller-epoch proof used by every other lifecycle path.
+                if (waitForLifecycleVerified(cfg.generation, Process.myPid(), uidHex, 800L)) {
+                    clearEarlyRfInvocation(snapshot.targetFingerprint);
+                    return;
+                }
+                sleep(EARLY_REPLAY_RETRY_MS);
+            }
+            EarlyRfInvocation snapshot = pendingEarlyRfInvocation;
+            if (snapshot != null) {
+                Log.w(TAG, "EARLY RF REPLAY timeout target=" + snapshot.targetFingerprint +
+                        " ageMs=" + (System.currentTimeMillis() - snapshot.capturedAt));
+            }
+        } finally {
+            synchronized (this) { earlyReplayWorkerScheduled = false; }
+        }
+    }
+
+    private synchronized void clearEarlyRfInvocation(String targetFingerprint) {
+        EarlyRfInvocation snapshot = pendingEarlyRfInvocation;
+        if (snapshot == null) return;
+        if (targetFingerprint != null && !targetFingerprint.isEmpty() &&
+                !targetFingerprint.equals(snapshot.targetFingerprint)) return;
+        pendingEarlyRfInvocation = null;
+    }
+
+    private static Object[] cloneInvocationArgs(Object[] args) {
+        Object[] copy = args.clone();
+        for (int i = 0; i < copy.length; i++) {
+            if (copy[i] instanceof byte[]) copy[i] = ((byte[]) copy[i]).clone();
+        }
+        return copy;
     }
 
     private Application waitForApplication(long timeoutMs) {
@@ -1194,6 +1316,25 @@ public class NfcInjectionModule extends XposedModule {
 
     private static void sleep(long millis) {
         try { Thread.sleep(millis); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+    }
+
+    private static final class EarlyRfInvocation {
+        final Method method;
+        final Object receiver;
+        final Object[] args;
+        final String targetFingerprint;
+        final long capturedAt;
+        final int capturedPid;
+
+        EarlyRfInvocation(Method method, Object receiver, Object[] args, String targetFingerprint,
+                          long capturedAt, int capturedPid) {
+            this.method = method;
+            this.receiver = receiver;
+            this.args = args;
+            this.targetFingerprint = targetFingerprint;
+            this.capturedAt = capturedAt;
+            this.capturedPid = capturedPid;
+        }
     }
 
     private static final class NativeOutcome {

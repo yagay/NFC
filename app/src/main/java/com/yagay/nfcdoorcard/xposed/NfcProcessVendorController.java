@@ -55,14 +55,26 @@ final class NfcProcessVendorController {
             }
             Object proxy = asInterface(INFC_STUB, main);
             if (proxy == null) return new Result(false, "CONTROLLER_PROXY", "INfcAdapter Stub.asInterface unavailable", null);
-            Boolean disabled = invokeBooleanMethod(proxy, "disable", new Class<?>[]{boolean.class}, new Object[]{false});
-            if (!Boolean.TRUE.equals(disabled)) return new Result(false, "CONTROLLER_DISABLE", "INfcAdapter.disable(false) unavailable/rejected", null);
+            // Android 15+ INfcAdapter requires the caller package for attribution/security
+            // checks. Prefer the modern signatures and retain the legacy forms only as fallback for
+            // older vendor branches. This code executes inside com.android.nfc (UID 1027), so the
+            // package attribution is valid for the Binder caller identity.
+            Boolean disabled = invokeBooleanMethod(proxy, "disable",
+                    new Class<?>[]{boolean.class, String.class}, new Object[]{false, "com.android.nfc"});
+            if (disabled == null) {
+                disabled = invokeBooleanMethod(proxy, "disable", new Class<?>[]{boolean.class}, new Object[]{false});
+            }
+            if (!Boolean.TRUE.equals(disabled)) return new Result(false, "CONTROLLER_DISABLE", "INfcAdapter.disable unavailable/rejected", null);
             sleep(500L);
             IBinder after = serviceManagerBinder();
             if (!alive(after)) after = main;
             Object afterProxy = asInterface(INFC_STUB, after);
-            Boolean enabled = invokeBooleanMethod(afterProxy, "enable", new Class<?>[0], new Object[0]);
-            if (!Boolean.TRUE.equals(enabled)) return new Result(false, "CONTROLLER_ENABLE", "INfcAdapter.enable() unavailable/rejected", null);
+            Boolean enabled = invokeBooleanMethod(afterProxy, "enable",
+                    new Class<?>[]{String.class}, new Object[]{"com.android.nfc"});
+            if (enabled == null) {
+                enabled = invokeBooleanMethod(afterProxy, "enable", new Class<?>[0], new Object[0]);
+            }
+            if (!Boolean.TRUE.equals(enabled)) return new Result(false, "CONTROLLER_ENABLE", "INfcAdapter.enable unavailable/rejected", null);
             return new Result(true, "CONTROLLER_REINITIALIZED", "NFC controller reinitialized through reflected AIDL proxy", null);
         } catch (Throwable t) {
             return new Result(false, "CONTROLLER_EXCEPTION", t.getClass().getName() + ": " + String.valueOf(t.getMessage()), null);
