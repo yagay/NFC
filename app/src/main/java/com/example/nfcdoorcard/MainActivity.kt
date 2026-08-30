@@ -3,14 +3,11 @@ package com.example.nfcdoorcard
 import android.app.PendingIntent
 import android.content.ContentValues
 import android.content.Intent
-import android.database.ContentObserver
 import android.nfc.NfcAdapter
 import android.nfc.Tag
 import android.nfc.tech.NfcA
 import android.os.Bundle
 import android.os.Environment
-import android.os.Handler
-import android.os.Looper
 import android.provider.MediaStore
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -31,6 +28,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.viewmodel.compose.viewModel
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
 import java.util.concurrent.Executors
@@ -186,40 +184,31 @@ class MainActivity : ComponentActivity() {
     @Composable
     private fun NfcAppContent() {
         val cards = savedCardsState
-        var status by remember { mutableStateOf(RuntimeStatus()) }
+        val runtimeViewModel: RuntimeStatusViewModel = viewModel()
+        val status by runtimeViewModel.status.collectAsState()
+        val providerRevision by runtimeViewModel.providerRevision.collectAsState()
         val logLines = remember { mutableStateListOf<String>() }
         var selectedSource by remember { mutableStateOf(LogSource.STATUS) }
         var diagnosticRunning by remember { mutableStateOf(false) }
         var logsEnabled by remember { mutableStateOf(false) }
         var expandedUid by remember { mutableStateOf<String?>(null) }
         var operationMessage by remember { mutableStateOf<String?>(null) }
-        var providerRevision by remember { mutableLongStateOf(0L) }
         val logListState = rememberLazyListState()
-
-        DisposableEffect(Unit) {
-            val observer = object : ContentObserver(Handler(Looper.getMainLooper())) {
-                override fun onChange(selfChange: Boolean) { providerRevision++ }
-                override fun onChange(selfChange: Boolean, uri: android.net.Uri?) { providerRevision++ }
-            }
-            contentResolver.registerContentObserver(ConfigProvider.URI, true, observer)
-            providerRevision++
-            onDispose { runCatching { contentResolver.unregisterContentObserver(observer) } }
-        }
 
         // Provider changes are the primary state clock: fast, event-driven and root-free.
         LaunchedEffect(providerRevision) {
-            status = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            runtimeViewModel.update(kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
                 readRuntimeStatus(includeRootPid = false)
-            }
+            })
         }
 
         // External watchdog catches an NFC process replacement that happens before the new
         // process has had a chance to publish fresh provider state. Keep this deliberately low-rate.
         LaunchedEffect(Unit) {
             while (true) {
-                status = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                runtimeViewModel.update(kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
                     readRuntimeStatus(includeRootPid = true)
-                }
+                })
                 kotlinx.coroutines.delay(20_000)
             }
         }
@@ -235,7 +224,7 @@ class MainActivity : ComponentActivity() {
                     val text = if (selectedSource == LogSource.STATUS) buildStatusSummary(newStatus) + "\n\n" + raw else raw
                     newStatus to boundedLogLines(text)
                 }
-                status = snapshot.first
+                runtimeViewModel.update(snapshot.first)
                 updateLogWindow(logLines, snapshot.second)
                 kotlinx.coroutines.delay(2000)
             }
@@ -264,19 +253,19 @@ class MainActivity : ComponentActivity() {
                             { expandedUid = if (expandedUid?.equals(card.uid, true) == true) null else card.uid },
                             {
                                 operationMessage = "正在通过 NFC 进程应用 UID ${card.uid}..."
-                                simulateCard(card) { newStatus, message -> runOnUiThread { status = newStatus; operationMessage = message } }
-                                status = status.copy(
+                                simulateCard(card) { newStatus, message -> runOnUiThread { runtimeViewModel.update(newStatus); operationMessage = message } }
+                                runtimeViewModel.update(status.copy(
                                     simulationEnabled = true, selectedUid = card.uid, rfStatus = "WAITING",
                                     operationState = "APPLYING", effectiveState = "UNKNOWN", verificationConfidence = "PENDING", rfAccepted = false
-                                )
+                                ))
                             },
                             {
                                 operationMessage = "正在恢复原厂 RF..."
-                                stopSimulation { newStatus, message -> runOnUiThread { status = newStatus; operationMessage = message } }
-                                status = status.copy(
+                                stopSimulation { newStatus, message -> runOnUiThread { runtimeViewModel.update(newStatus); operationMessage = message } }
+                                runtimeViewModel.update(status.copy(
                                     simulationEnabled = false, rfStatus = "STOPPING",
                                     operationState = "STOPPING", effectiveState = "UNKNOWN", verificationConfidence = "PENDING", rfAccepted = false
-                                )
+                                ))
                             },
                             {
                                 if (active) stopSimulation { _, _ -> }
@@ -952,6 +941,8 @@ class MainActivity : ComponentActivity() {
         appendLine("--- APP / APK ---"); appendLine(runRootCmd("dumpsys package $packageName 2>/dev/null | grep -E 'versionName=|versionCode=|path:'"))
         appendLine("--- ROOT ---"); appendLine(runRootCmd("id; su -v 2>/dev/null || true"))
         appendLine("--- NFC PROCESS / HAL ---"); appendLine(runRootCmd("pm path com.android.nfc; pidof com.android.nfc; ps -A | grep -E 'android.hardware.nfc|vendor.oplus.hardware.nfc|com.android.nfc|$packageName'"))
+        appendLine("--- NFC CONFIG SNAPSHOT ---")
+        appendLine(collectNfcConfigSnapshot())
         appendLine("--- NFC SERVICE FULL ---")
         appendLine(runRootCmd("dumpsys nfc 2>/dev/null", 25, 300_000))
         LogSource.entries.forEach { source ->
@@ -964,6 +955,39 @@ class MainActivity : ComponentActivity() {
                 appendLine(fetchLogsSync(source))
             }
         }
+    }
+
+    private fun collectNfcConfigSnapshot(): String {
+        val script = """
+            echo '--- BUILD / NFC IDENTITY ---'
+            getprop ro.product.manufacturer
+            getprop ro.product.device
+            getprop ro.build.fingerprint
+            getprop ro.boot.hardware
+            pm path com.android.nfc 2>/dev/null || true
+            dumpsys package com.android.nfc 2>/dev/null | grep -E 'versionName=|versionCode=' | head -n 10 || true
+            echo '--- NFC CONFIG FILES ---'
+            roots='/vendor/etc /odm/etc /product/etc /system/etc /my_product/etc'
+            files=""
+            for root in ${'$'}roots; do
+              [ -d "${'$'}root" ] || continue
+              found=${'$'}(find "${'$'}root" -maxdepth 5 -type f \
+                \( -iname '*nfc*.conf' -o -iname '*nfc*.cfg' -o -iname '*nfc*.xml' -o \
+                   -iname '*nfc*.txt' -o -iname '*nfc*.json' -o -iname '*nfc*.properties' -o \
+                   -path '*/nfc/*.conf' -o -path '*/nfc/*.cfg' -o -path '*/nfc/*.xml' \) \
+                -size -262144c 2>/dev/null | sort -u | head -n 80)
+              files="${'$'}files
+${'$'}found"
+            done
+            echo "${'$'}files" | sed '/^${'$'}/d' | sort -u | while IFS= read -r f; do
+              [ -f "${'$'}f" ] || continue
+              echo
+              echo "===== FILE: ${'$'}f ====="
+              ls -lZ "${'$'}f" 2>/dev/null || ls -l "${'$'}f" 2>/dev/null || true
+              cat "${'$'}f" 2>/dev/null || echo '[read failed]'
+            done
+        """.trimIndent()
+        return runRootCmd(script, 25, 400_000)
     }
 
     private fun ensureRootAccess(showToast: Boolean = true): Boolean {
