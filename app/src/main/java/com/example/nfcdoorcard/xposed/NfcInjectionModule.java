@@ -2,7 +2,7 @@ package com.example.nfcdoorcard.xposed;
 
 import android.app.Application;
 import android.content.ContentValues;
-import android.content.Intent;
+import android.database.ContentObserver;
 import android.database.Cursor;
 import android.net.Uri;
 import android.os.Process;
@@ -21,33 +21,50 @@ import java.util.concurrent.Executors;
 import io.github.libxposed.api.XposedModule;
 import io.github.libxposed.api.XposedModuleInterface;
 
-/** Stable LSPosed entry. Vendor-specific behavior lives in NfcStackAdapter implementations. */
+/**
+ * LSPosed NFC execution engine.
+ *
+ * The UI publishes desired state to ConfigProvider. This module observes that state from
+ * inside com.android.nfc, triggers the OEM share-mode refresh in the same NFC process,
+ * injects LA_NFCID1 into the verified RF config call, and publishes generation-bound
+ * completion state back to the UI.
+ */
 public class NfcInjectionModule extends XposedModule {
     private static final String TAG = "NfcUIDSim";
     private static final int HOOK_BUILD = BuildConfig.HOOK_BUILD;
     private static final Uri CONFIG_URI = Uri.parse("content://com.example.nfcdoorcard.config/settings");
 
     private final NfcStackAdapter[] adapters = new NfcStackAdapter[]{
-            // Prefer the proven vendor-specific implementation, then fall back to
-            // a strictly validated raw CORE_SET_CONFIG NXP implementation.
             new OplusNxpAdapter(),
             new GenericNxpAdapter()
     };
 
-    /**
-     * All provider writes from the Hook are serialized. The previous implementation
-     * created one retry thread per write, which allowed an old DETECTING write to land
-     * after READY/RF_UID_APPLIED and overwrite newer state.
-     */
+    /** Provider writes are serialized so old status cannot overtake newer RF evidence. */
     private final ExecutorService stateSyncExecutor = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(r, "NfcUIDSim-StateSync");
         t.setDaemon(true);
         return t;
     });
 
+    /** Desired-state reads and OEM trigger calls are serialized independently of RF hot path. */
+    private final ExecutorService commandExecutor = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "NfcUIDSim-Command");
+        t.setDaemon(true);
+        return t;
+    });
+
+    private final NfcProcessVendorController vendorController = new NfcProcessVendorController();
+
+    private volatile NfcStackAdapter activeAdapter;
+    private volatile SimConfig cachedConfig = SimConfig.uninitialized();
+    private volatile ContentObserver commandObserver;
+    private volatile boolean observerRegistered;
+    private volatile long lastTriggeredGeneration = Long.MIN_VALUE;
+    private volatile long completedGeneration = Long.MIN_VALUE;
+    private volatile int completedPid;
     private volatile boolean disabledAfterFailure;
     private volatile String disabledFailureUid;
-    private volatile NfcStackAdapter activeAdapter;
+    private volatile long disabledFailureGeneration = Long.MIN_VALUE;
 
     @Override
     public void onModuleLoaded(XposedModuleInterface.ModuleLoadedParam param) {
@@ -78,62 +95,87 @@ public class NfcInjectionModule extends XposedModule {
                 Object[] args = chain.getArgs().toArray();
                 if (args.length != 1 || !(args[0] instanceof byte[])) return chain.proceed();
 
-                SimConfig cfg = readConfig();
-                if (!cfg.active || cfg.uid == null) return chain.proceed();
+                SimConfig cfg = currentConfig();
 
-                String uidHex = cfg.uid.replaceAll("[^0-9A-Fa-f]", "").toUpperCase(Locale.ROOT);
-                if (disabledAfterFailure) {
-                    if (disabledFailureUid != null && disabledFailureUid.equals(uidHex)) {
-                        return chain.proceed();
+                // STOP commands deliberately pass the OEM RF config through untouched.
+                // A native result=0 on that untouched config is direct evidence that stock
+                // RF was reloaded, so a routine stop no longer needs to restart NFC.
+                if (!cfg.active) {
+                    Object result = chain.proceed();
+                    if (cfg.initialized && "STOP".equals(cfg.commandAction) && nativeOk(result)
+                            && !isGenerationCompleted(cfg.generation, pid)) {
+                        Log.i(TAG, "STOCK RF ACCEPTED pid=" + pid + " generation=" + cfg.generation + " result=" + result);
+                        completeCommand(
+                                cfg,
+                                "RF_STOCK_RESTORED",
+                                "",
+                                activeAdapter == null ? "" : activeAdapter.id(),
+                                String.valueOf(result),
+                                "Stock RF config accepted in NFC process"
+                        );
                     }
-                    // A new UID/config is a new attempt. Do not force an NFC process restart
-                    // just because a previous UID was rejected by the native stack.
+                    return result;
+                }
+
+                if (cfg.uid == null) return chain.proceed();
+                String uidHex = normalizeUid(cfg.uid);
+
+                if (disabledAfterFailure) {
+                    boolean sameFailedAttempt = disabledFailureGeneration == cfg.generation
+                            && disabledFailureUid != null
+                            && disabledFailureUid.equals(uidHex);
+                    if (sameFailedAttempt) return chain.proceed();
+
+                    // Every new generation is an explicit new user attempt, including a retry
+                    // of the same UID. Do not require an NFC process restart just to retry it.
                     disabledAfterFailure = false;
                     disabledFailureUid = null;
-                    Log.i(TAG, "NFCID1 RETRY unlocked for changed uid=" + uidHex + " pid=" + pid);
+                    disabledFailureGeneration = Long.MIN_VALUE;
+                    Log.i(TAG, "NFCID1 RETRY unlocked generation=" + cfg.generation + " uid=" + uidHex + " pid=" + pid);
                 }
 
                 if (cfg.diagnostics) {
                     String caller = compactCallStack(24);
-                    Log.i(TAG, "RFPROBE: CHANGE_RF_CALLER pid=" + pid + " uid=" + uidHex + " stack=" + caller);
+                    Log.i(TAG, "RFPROBE: CHANGE_RF_CALLER pid=" + pid + " generation=" + cfg.generation + " uid=" + uidHex + " stack=" + caller);
                     persistRfCaller(pid, caller);
                 }
 
                 if (uidHex.length() != 8) {
-                    writeRfStatus("UID_INVALID", uidHex, "UID must be 4 bytes", "");
+                    failCommand(cfg, "UID_INVALID", uidHex, "UID must be 4 bytes", "");
                     return chain.proceed();
                 }
 
                 NfcStackAdapter.InjectionResult injected = adapter.inject((byte[]) args[0], hexToBytes(uidHex));
                 if (!injected.changed) {
-                    writeRfStatus("WAITING", uidHex, injected.reason, "");
+                    writeRfProgress(cfg, "WAITING", uidHex, injected.reason, "");
                     return chain.proceed();
                 }
 
-                Log.i(TAG, "NFCID1 APPLY adapter=" + adapter.id() + " pid=" + pid + " uid=" + uidHex +
+                Log.i(TAG, "NFCID1 APPLY adapter=" + adapter.id() + " pid=" + pid + " generation=" + cfg.generation + " uid=" + uidHex +
                         " payload=" + injected.oldPayloadLength + "->" + injected.newPayloadLength +
                         " params=" + injected.oldParamCount + "->" + injected.newParamCount);
-                writeRfStatus("APPLYING", uidHex, adapter.id(), "pending");
+                writeRfProgress(cfg, "APPLYING", uidHex, adapter.id(), "pending");
 
                 Object result = chain.proceed(new Object[]{injected.data});
-                boolean ok = result instanceof Number && ((Number) result).intValue() == 0;
-                if (ok) {
+                if (nativeOk(result)) {
                     disabledAfterFailure = false;
                     disabledFailureUid = null;
-                    Log.i(TAG, "NFCID1 ACCEPTED adapter=" + adapter.id() + " pid=" + pid + " uid=" + uidHex + " result=" + result);
-                    writeRfStatus("RF_UID_APPLIED", uidHex, adapter.id(), String.valueOf(result));
+                    disabledFailureGeneration = Long.MIN_VALUE;
+                    Log.i(TAG, "NFCID1 ACCEPTED adapter=" + adapter.id() + " pid=" + pid + " generation=" + cfg.generation + " uid=" + uidHex + " result=" + result);
+                    completeCommand(cfg, "RF_UID_APPLIED", uidHex, adapter.id(), String.valueOf(result), "UID applied by " + adapter.id());
                 } else {
                     disabledAfterFailure = true;
                     disabledFailureUid = uidHex;
-                    Log.e(TAG, "NFCID1 FAILED adapter=" + adapter.id() + " pid=" + pid + " uid=" + uidHex + " result=" + result);
-                    writeRfStatus("RF_UID_FAILED", uidHex, "native rejected; same UID injection disabled until config changes or NFC process restart", String.valueOf(result));
+                    disabledFailureGeneration = cfg.generation;
+                    Log.e(TAG, "NFCID1 FAILED adapter=" + adapter.id() + " pid=" + pid + " generation=" + cfg.generation + " uid=" + uidHex + " result=" + result);
+                    failCommand(cfg, "RF_UID_FAILED", uidHex, "native rejected; retry allowed on next generation", String.valueOf(result));
                 }
                 return result;
             });
 
             reportStatusWithRetry(pid, true, 1, "READY", "Adapter " + adapter.id() + " ready", adapter.id());
             Log.i(TAG, "PROD HOOK READY build=" + HOOK_BUILD + " adapter=" + adapter.id() + " pid=" + pid);
-            notifyAppHookReady(pid, adapter.id());
+            startCommandBridge(pid);
         } catch (Throwable t) {
             Log.e(TAG, "PROD HOOK FAILED build=" + HOOK_BUILD + " adapter=" + adapter.id() + " pid=" + pid + " " +
                     t.getClass().getSimpleName() + ": " + t.getMessage(), t);
@@ -141,22 +183,92 @@ public class NfcInjectionModule extends XposedModule {
         }
     }
 
-    private void notifyAppHookReady(int pid, String adapterId) {
-        Application app = currentApplication();
-        if (app == null) {
-            Log.w(TAG, "AUTO_RESTORE: currentApplication unavailable pid=" + pid);
-            return;
+    private void startCommandBridge(int pid) {
+        commandExecutor.execute(() -> {
+            for (int attempt = 0; attempt < 60 && !observerRegistered; attempt++) {
+                Application app = currentApplication();
+                if (app != null) {
+                    try {
+                        ContentObserver observer = new ContentObserver(null) {
+                            @Override
+                            public void onChange(boolean selfChange) {
+                                scheduleCommandRefresh("provider_change");
+                            }
+
+                            @Override
+                            public void onChange(boolean selfChange, Uri uri) {
+                                scheduleCommandRefresh("provider_change");
+                            }
+                        };
+                        app.getContentResolver().registerContentObserver(CONFIG_URI, true, observer);
+                        commandObserver = observer;
+                        observerRegistered = true;
+                        Log.i(TAG, "COMMAND BRIDGE ready pid=" + pid);
+                        refreshConfigAndProcess("startup");
+                        return;
+                    } catch (Throwable t) {
+                        Log.w(TAG, "command observer attempt=" + (attempt + 1) + " failed: " + t.getMessage());
+                    }
+                }
+                sleep(150L);
+            }
+            Log.e(TAG, "COMMAND BRIDGE unavailable pid=" + pid);
+            writeSimpleCommandState("OBSERVER_FAILED", "Cannot register ConfigProvider observer", 0L, "", false);
+        });
+    }
+
+    private void scheduleCommandRefresh(String reason) {
+        commandExecutor.execute(() -> refreshConfigAndProcess(reason));
+    }
+
+    private void refreshConfigAndProcess(String reason) {
+        SimConfig cfg = readConfig();
+        if (!cfg.initialized) return;
+        cachedConfig = cfg;
+
+        int pid = Process.myPid();
+        if (isGenerationCompleted(cfg.generation, pid)) return;
+        if (cfg.generation == lastTriggeredGeneration) return;
+
+        // Legacy persisted desired state (before generation protocol) is treated as generation 0
+        // and is restored once per NFC process. New UI builds always publish generation > 0.
+        lastTriggeredGeneration = cfg.generation;
+
+        String action = cfg.active ? "APPLY" : "STOP";
+        Log.i(TAG, "COMMAND " + action + " reason=" + reason + " generation=" + cfg.generation + " uid=" + cfg.uid + " pid=" + pid);
+        writeSimpleCommandState("RUNNING", "Executing " + action + " inside com.android.nfc", cfg.generation, action, false);
+
+        NfcProcessVendorController.Result trigger = vendorController.setShareMode(cfg.active);
+        if (trigger.success) {
+            writeSimpleCommandState(
+                    "TRIGGERED",
+                    trigger.detail + "; waiting for RF confirmation",
+                    cfg.generation,
+                    action,
+                    false
+            );
+        } else {
+            Log.e(TAG, "COMMAND trigger failed generation=" + cfg.generation + " stage=" + trigger.stage + " detail=" + trigger.detail);
+            writeSimpleCommandState(
+                    "TRIGGER_FAILED",
+                    trigger.stage + ": " + trigger.detail,
+                    cfg.generation,
+                    action,
+                    false
+            );
         }
-        try {
-            Intent intent = new Intent("com.example.nfcdoorcard.action.NFC_HOOK_READY");
-            intent.setPackage("com.example.nfcdoorcard");
-            intent.putExtra("nfc_pid", pid);
-            intent.putExtra("adapter", adapterId == null ? "" : adapterId);
-            app.sendBroadcast(intent);
-            Log.i(TAG, "AUTO_RESTORE: hook-ready broadcast sent pid=" + pid + " adapter=" + adapterId);
-        } catch (Throwable t) {
-            Log.w(TAG, "AUTO_RESTORE: broadcast failed " + t.getClass().getSimpleName() + ": " + t.getMessage());
-        }
+    }
+
+    private boolean isGenerationCompleted(long generation, int pid) {
+        return completedPid == pid && completedGeneration == generation;
+    }
+
+    private SimConfig currentConfig() {
+        SimConfig cfg = cachedConfig;
+        if (cfg.initialized) return cfg;
+        cfg = readConfig();
+        if (cfg.initialized) cachedConfig = cfg;
+        return cfg;
     }
 
     private String compactCallStack(int maxFrames) {
@@ -215,12 +327,69 @@ public class NfcInjectionModule extends XposedModule {
         writeValuesWithRetry(v, 20, 150L);
     }
 
-    private void writeRfStatus(String state, String uid, String detail, String result) {
-        final int pid = Process.myPid();
-        ContentValues v = new ContentValues();
+    private void writeRfProgress(SimConfig cfg, String state, String uid, String detail, String result) {
+        ContentValues v = baseHookState();
+        v.put("rf_status", state);
+        v.put("rf_uid", uid == null ? "" : uid);
+        v.put("rf_source", activeAdapter == null ? "" : activeAdapter.id());
+        v.put("rf_result", result == null ? "" : result);
+        v.put("rf_error", state.endsWith("FAILED") || state.equals("UID_INVALID") ? detail : "");
+        v.put("rf_pid", Process.myPid());
+        v.put("rf_generation", cfg.generation);
+        v.put("full_diag_stage", state);
+        v.put("full_diag_summary", detail == null ? "" : detail);
+        writeValuesWithRetry(v, 20, 100L);
+    }
 
-        // Reaching this method proves that the installed interceptor is executing in
-        // the current NFC process. Keep the hook/scope state aligned with RF evidence.
+    private void completeCommand(SimConfig cfg, String rfState, String uid, String source, String result, String detail) {
+        int pid = Process.myPid();
+        completedGeneration = cfg.generation;
+        completedPid = pid;
+
+        ContentValues v = baseHookState();
+        v.put("rf_status", rfState);
+        v.put("rf_uid", uid == null ? "" : uid);
+        v.put("rf_source", source == null ? "" : source);
+        v.put("rf_result", result == null ? "" : result);
+        v.put("rf_error", "");
+        v.put("rf_pid", pid);
+        v.put("rf_generation", cfg.generation);
+        v.put("command_handled_generation", cfg.generation);
+        v.put("command_action", cfg.active ? "APPLY" : "STOP");
+        v.put("command_status", "SUCCESS");
+        v.put("command_detail", detail == null ? "" : detail);
+        v.put("command_pid", pid);
+        v.put("full_diag_stage", rfState);
+        v.put("full_diag_summary", detail == null ? "" : detail);
+        writeValuesWithRetry(v, 20, 100L);
+    }
+
+    private void failCommand(SimConfig cfg, String rfState, String uid, String detail, String result) {
+        int pid = Process.myPid();
+        completedGeneration = cfg.generation;
+        completedPid = pid;
+
+        ContentValues v = baseHookState();
+        v.put("rf_status", rfState);
+        v.put("rf_uid", uid == null ? "" : uid);
+        v.put("rf_source", activeAdapter == null ? "" : activeAdapter.id());
+        v.put("rf_result", result == null ? "" : result);
+        v.put("rf_error", detail == null ? "" : detail);
+        v.put("rf_pid", pid);
+        v.put("rf_generation", cfg.generation);
+        v.put("command_handled_generation", cfg.generation);
+        v.put("command_action", cfg.active ? "APPLY" : "STOP");
+        v.put("command_status", "FAILED");
+        v.put("command_detail", detail == null ? "" : detail);
+        v.put("command_pid", pid);
+        v.put("full_diag_stage", rfState);
+        v.put("full_diag_summary", detail == null ? "" : detail);
+        writeValuesWithRetry(v, 20, 100L);
+    }
+
+    private ContentValues baseHookState() {
+        int pid = Process.myPid();
+        ContentValues v = new ContentValues();
         v.put("hook_build", HOOK_BUILD);
         v.put("scope_ok", true);
         v.put("scope_process", "com.android.nfc");
@@ -229,15 +398,16 @@ public class NfcInjectionModule extends XposedModule {
         v.put("hook_class", "NfcInjectionModule");
         v.put("hook_count", 1);
         v.put("hook_pid", pid);
+        return v;
+    }
 
-        v.put("rf_status", state);
-        v.put("rf_uid", uid == null ? "" : uid);
-        v.put("rf_source", activeAdapter == null ? "" : activeAdapter.id());
-        v.put("rf_result", result == null ? "" : result);
-        v.put("rf_error", state.endsWith("FAILED") || state.equals("UID_INVALID") ? detail : "");
-        v.put("rf_pid", pid);
-        v.put("full_diag_stage", state);
-        v.put("full_diag_summary", detail == null ? "" : detail);
+    private void writeSimpleCommandState(String status, String detail, long generation, String action, boolean handled) {
+        ContentValues v = baseHookState();
+        v.put("command_status", status);
+        v.put("command_detail", detail == null ? "" : detail);
+        v.put("command_pid", Process.myPid());
+        v.put("command_action", action == null ? "" : action);
+        if (handled) v.put("command_handled_generation", generation);
         writeValuesWithRetry(v, 20, 100L);
     }
 
@@ -254,12 +424,7 @@ public class NfcInjectionModule extends XposedModule {
                         Log.w(TAG, "status write attempt " + (i + 1) + " failed: " + e.getMessage());
                     }
                 }
-                try {
-                    Thread.sleep(delayMs);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    return;
-                }
+                sleep(delayMs);
             }
             Log.w(TAG, "status write gave up after " + attempts + " attempts");
         });
@@ -267,22 +432,37 @@ public class NfcInjectionModule extends XposedModule {
 
     private SimConfig readConfig() {
         Application app = currentApplication();
-        if (app == null) return new SimConfig(false, null, false);
+        if (app == null) return SimConfig.uninitialized();
+
         boolean active = false;
         String uid = null;
         boolean diagnostics = false;
+        long generation = 0L;
+        long handledGeneration = Long.MIN_VALUE;
+        String commandAction = "";
+        String commandStatus = "";
+        int commandPid = 0;
+
         try (Cursor c = app.getContentResolver().query(CONFIG_URI, null, null, null, null)) {
-            if (c != null) while (c.moveToNext()) {
+            if (c == null) return SimConfig.uninitialized();
+            while (c.moveToNext()) {
                 String key = c.getString(0);
                 String value = c.getString(1);
                 if ("simulation_enabled".equals(key)) active = Boolean.parseBoolean(value);
                 else if ("uid".equals(key)) uid = value;
                 else if ("diagnostic_logging_enabled".equals(key)) diagnostics = Boolean.parseBoolean(value);
+                else if ("command_generation".equals(key)) generation = parseLong(value, 0L);
+                else if ("command_handled_generation".equals(key)) handledGeneration = parseLong(value, Long.MIN_VALUE);
+                else if ("command_action".equals(key)) commandAction = value == null ? "" : value;
+                else if ("command_status".equals(key)) commandStatus = value == null ? "" : value;
+                else if ("command_pid".equals(key)) commandPid = (int) parseLong(value, 0L);
             }
+            if (commandAction.isEmpty()) commandAction = active ? "APPLY" : "STOP";
+            return new SimConfig(true, active, uid, diagnostics, generation, handledGeneration, commandAction, commandStatus, commandPid);
         } catch (Throwable t) {
             Log.w(TAG, "config read failed: " + t.getMessage());
+            return SimConfig.uninitialized();
         }
-        return new SimConfig(active, uid, diagnostics);
     }
 
     private static Application currentApplication() {
@@ -296,6 +476,14 @@ public class NfcInjectionModule extends XposedModule {
         }
     }
 
+    private static String normalizeUid(String uid) {
+        return uid == null ? "" : uid.replaceAll("[^0-9A-Fa-f]", "").toUpperCase(Locale.ROOT);
+    }
+
+    private static boolean nativeOk(Object result) {
+        return result instanceof Number && ((Number) result).intValue() == 0;
+    }
+
     private static byte[] hexToBytes(String hex) {
         byte[] out = new byte[hex.length() / 2];
         for (int i = 0; i < out.length; i++) {
@@ -304,15 +492,57 @@ public class NfcInjectionModule extends XposedModule {
         return out;
     }
 
+    private static long parseLong(String value, long fallback) {
+        try {
+            return Long.parseLong(value);
+        } catch (Throwable ignored) {
+            return fallback;
+        }
+    }
+
+    private static void sleep(long millis) {
+        try {
+            Thread.sleep(millis);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
     private static final class SimConfig {
+        final boolean initialized;
         final boolean active;
         final String uid;
         final boolean diagnostics;
+        final long generation;
+        final long handledGeneration;
+        final String commandAction;
+        final String commandStatus;
+        final int commandPid;
 
-        SimConfig(boolean active, String uid, boolean diagnostics) {
+        SimConfig(
+                boolean initialized,
+                boolean active,
+                String uid,
+                boolean diagnostics,
+                long generation,
+                long handledGeneration,
+                String commandAction,
+                String commandStatus,
+                int commandPid
+        ) {
+            this.initialized = initialized;
             this.active = active;
             this.uid = uid;
             this.diagnostics = diagnostics;
+            this.generation = generation;
+            this.handledGeneration = handledGeneration;
+            this.commandAction = commandAction;
+            this.commandStatus = commandStatus;
+            this.commandPid = commandPid;
+        }
+
+        static SimConfig uninitialized() {
+            return new SimConfig(false, false, null, false, 0L, Long.MIN_VALUE, "", "", 0);
         }
     }
 }
