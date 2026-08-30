@@ -109,3 +109,5 @@ t = t.replace('hook build 35; 1.0.48 makes real controller initialize/deinitiali
               'hook build 36; 1.0.49 replays the exact previously native-accepted RF invocation after controller READY, with share-mode only as fallback and same-epoch failure-loop suppression.', 1)
 t = t.replace('buildConfigField("int", "HOOK_BUILD", "35")', 'buildConfigField("int", "HOOK_BUILD", "36")', 1)
 b.write_text(t)
+
+# workflow trigger marker
