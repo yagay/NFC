@@ -12,11 +12,11 @@ android {
         applicationId = "com.example.nfcdoorcard"
         minSdk = 31
         targetSdk = 35
-        versionCode = 27
-        versionName = "1.0.26"
+        versionCode = 28
+        versionName = "1.0.27"
 
         // Hook/runtime state protocol v5 is validated together with this app build.
-        buildConfigField("int", "HOOK_BUILD", "21")
+        buildConfigField("int", "HOOK_BUILD", "22")
     }
 
     compileOptions {
