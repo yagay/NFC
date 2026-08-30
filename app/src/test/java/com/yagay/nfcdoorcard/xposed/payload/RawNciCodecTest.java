@@ -89,10 +89,38 @@ public class RawNciCodecTest {
         assertArrayEquals(concat(hex("20020A023201083304C1B0BC1B"), tail), r.data);
     }
 
+    @Test public void supportsSevenByteUidAppendAndResize() {
+        byte[] uid7 = hex("04112233445566");
+        RewriteResult appended = codec.rewrite(hex("20020401320108"), uid7);
+        assertTrue(appended.changed);
+        assertArrayEquals(hex("20020D02320108330704112233445566"), appended.data);
+        RewriteResult resized = codec.rewrite(hex("20020701330411223344"), uid7);
+        assertTrue(resized.changed);
+        assertEquals("RESIZED_EXISTING_LA_NFCID1", resized.reason);
+        assertArrayEquals(hex("20020A01330704112233445566"), resized.data);
+    }
+
+    @Test public void supportsTenByteUidAppendAndResize() {
+        byte[] uid10 = hex("0102030405060708090A");
+        RewriteResult appended = codec.rewrite(hex("20020401320108"), uid10);
+        assertTrue(appended.changed);
+        assertArrayEquals(hex("20021002320108330A0102030405060708090A"), appended.data);
+        RewriteResult resized = codec.rewrite(hex("20020A01330704112233445566"), uid10);
+        assertTrue(resized.changed);
+        assertArrayEquals(hex("20020D01330A0102030405060708090A"), resized.data);
+    }
+
+    @Test public void canShrinkLongUidWhenFrameIsFullyVerified() {
+        RewriteResult r = codec.rewrite(hex("20020D01330A0102030405060708090A"), UID);
+        assertTrue(r.changed);
+        assertEquals("RESIZED_EXISTING_LA_NFCID1", r.reason);
+        assertArrayEquals(hex("200207013304C1B0BC1B"), r.data);
+    }
+
     @Test public void invalidUidIsRejected() {
         RewriteResult r = codec.rewrite(hex("20020401320108"), new byte[] { 1, 2, 3 });
         assertFalse(r.changed);
-        assertEquals("UID_NOT_4_BYTES", r.reason);
+        assertEquals("UID_LENGTH_NOT_4_7_10_BYTES", r.reason);
     }
 
     @Test public void shortAndNullInputsAreSafe() {

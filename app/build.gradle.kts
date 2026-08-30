@@ -12,12 +12,12 @@ android {
         applicationId = "com.yagay.nfcdoorcard"
         minSdk = 31
         targetSdk = 35
-        versionCode = 40
-        versionName = "1.0.39"
+        versionCode = 41
+        versionName = "1.0.40"
 
-        // Runtime protocol v6; complete com.yagay.nfcdoorcard namespace migration; hook build 27.
+        // Runtime protocol v6; complete com.yagay.nfcdoorcard namespace migration; hook build 28; safe 4/7/10-byte NFCID1 and vendor-neutral NCI discovery.
         // Application ID, source namespace, Provider authority and LSPosed entry all use com.yagay.nfcdoorcard.
-        buildConfigField("int", "HOOK_BUILD", "27")
+        buildConfigField("int", "HOOK_BUILD", "28")
     }
 
     buildTypes {

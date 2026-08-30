@@ -30,7 +30,7 @@ public final class OplusTextConfigCodec implements RfPayloadCodec {
 
     @Override public RewriteResult rewrite(byte[] input, byte[] uid) {
         if (input == null || input.length == 0) return RewriteResult.skip(id(), "EMPTY_INPUT");
-        if (uid == null || uid.length != 4) return RewriteResult.skip(id(), "UID_NOT_4_BYTES");
+        if (!RawNciCodec.isSupportedUid(uid)) return RewriteResult.skip(id(), "UID_LENGTH_NOT_4_7_10_BYTES");
         String text = new String(input, StandardCharsets.UTF_8);
         Matcher matcher = OPLUS_BLOCK.matcher(text);
         if (!matcher.find()) return RewriteResult.skip(id(), "OPLUS_CONF_EXTN_NOT_FOUND");
@@ -56,19 +56,20 @@ public final class OplusTextConfigCodec implements RfPayloadCodec {
             int frameEnd = i + 3 + oldPayload;
             if (oldPayload < 1 || frameEnd > block.length) continue;
             int oldCount = block[i + 3] & 0xFF;
-            if (oldPayload + 6 > 0xFF || oldCount >= 0xFF) continue;
+            int added = 2 + uid.length;
+            if (oldPayload + added > 0xFF || oldCount >= 0xFF) continue;
 
-            byte[] out = new byte[block.length + 6];
+            byte[] out = new byte[block.length + added];
             System.arraycopy(block, 0, out, 0, frameEnd);
-            out[i + 2] = (byte) (oldPayload + 6);
+            out[i + 2] = (byte) (oldPayload + added);
             out[i + 3] = (byte) (oldCount + 1);
             int p = frameEnd;
             out[p++] = 0x33;
-            out[p++] = 0x04;
-            System.arraycopy(uid, 0, out, p, 4);
-            System.arraycopy(block, frameEnd, out, frameEnd + 6, block.length - frameEnd);
+            out[p++] = (byte) uid.length;
+            System.arraycopy(uid, 0, out, p, uid.length);
+            System.arraycopy(block, frameEnd, out, frameEnd + added, block.length - frameEnd);
             return RewriteResult.changed(id(), "OPLUS_PROVEN_APPEND_AFTER_" + strictReason, out,
-                    oldPayload, oldPayload + 6, oldCount, oldCount + 1);
+                    oldPayload, oldPayload + added, oldCount, oldCount + 1);
         }
         return RewriteResult.skip(id(), strictReason + "/CORE_SET_CONFIG_NOT_FOUND");
     }

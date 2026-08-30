@@ -4,19 +4,13 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 
-/**
- * Generic CORE_SET_CONFIG codec.
- *
- * It prefers in-place replacement of an existing LA_NFCID1 parameter because that leaves
- * the OEM frame shape untouched. Appending a new parameter is allowed only when the whole
- * parameter list is structurally verified.
- */
+/** Safe generic CORE_SET_CONFIG / LA_NFCID1 codec for 4, 7 and 10 byte UIDs. */
 public final class RawNciCodec implements RfPayloadCodec {
     private static final int CORE_SET_CONFIG_GID_OID_0 = 0x20;
     private static final int CORE_SET_CONFIG_GID_OID_1 = 0x02;
     private static final int LA_NFCID1 = 0x33;
 
-    @Override public String id() { return "raw-nci-core-set-config-v2"; }
+    @Override public String id() { return "raw-nci-core-set-config-v3"; }
 
     @Override public int inspect(byte[] input) {
         if (input == null || input.length < 4) return 0;
@@ -25,44 +19,61 @@ public final class RawNciCodec implements RfPayloadCodec {
 
     @Override public RewriteResult rewrite(byte[] input, byte[] uid) {
         if (input == null || input.length < 4) return RewriteResult.skip(id(), "INPUT_TOO_SHORT");
-        if (uid == null || uid.length != 4) return RewriteResult.skip(id(), "UID_NOT_4_BYTES");
+        if (!isSupportedUid(uid)) return RewriteResult.skip(id(), "UID_LENGTH_NOT_4_7_10_BYTES");
 
         List<Frame> frames = findFrames(input);
         if (frames.isEmpty()) return RewriteResult.skip(id(), "CORE_SET_CONFIG_NOT_FOUND");
 
-        // Best path: update an existing 33 04 value without changing any frame lengths.
         for (Frame frame : frames) {
             Parse parse = parseParams(input, frame);
-            if (parse.nfcid1ValueOffset >= 0) {
+            if (parse.nfcid1ValueOffset < 0) continue;
+            if (parse.nfcid1Length == uid.length) {
                 byte[] out = Arrays.copyOf(input, input.length);
-                System.arraycopy(uid, 0, out, parse.nfcid1ValueOffset, 4);
+                System.arraycopy(uid, 0, out, parse.nfcid1ValueOffset, uid.length);
                 return RewriteResult.changed(id(), "REPLACED_EXISTING_LA_NFCID1", out,
                         frame.payloadLength, frame.payloadLength, frame.paramCount, frame.paramCount);
             }
+            if (!parse.complete) continue;
+            int delta = uid.length - parse.nfcid1Length;
+            int newPayload = frame.payloadLength + delta;
+            if (newPayload < 1 || newPayload > 0xFF) continue;
+
+            byte[] out = new byte[input.length + delta];
+            System.arraycopy(input, 0, out, 0, parse.nfcid1ValueOffset);
+            out[parse.nfcid1LengthOffset] = (byte) uid.length;
+            System.arraycopy(uid, 0, out, parse.nfcid1ValueOffset, uid.length);
+            int oldTail = parse.nfcid1ValueOffset + parse.nfcid1Length;
+            int newTail = parse.nfcid1ValueOffset + uid.length;
+            System.arraycopy(input, oldTail, out, newTail, input.length - oldTail);
+            out[frame.start + 2] = (byte) newPayload;
+            return RewriteResult.changed(id(), "RESIZED_EXISTING_LA_NFCID1", out,
+                    frame.payloadLength, newPayload, frame.paramCount, frame.paramCount);
         }
 
-        // Append only to a fully verified standard parameter list. Unknown OEM tails are
-        // intentionally left untouched rather than guessed.
         for (Frame frame : frames) {
             Parse parse = parseParams(input, frame);
             if (!parse.complete) continue;
-            if (frame.payloadLength + 6 > 0xFF || frame.paramCount >= 0xFF) continue;
+            int added = 2 + uid.length;
+            if (frame.payloadLength + added > 0xFF || frame.paramCount >= 0xFF) continue;
 
-            byte[] out = new byte[input.length + 6];
+            byte[] out = new byte[input.length + added];
             System.arraycopy(input, 0, out, 0, frame.end);
-            out[frame.start + 2] = (byte) (frame.payloadLength + 6);
+            out[frame.start + 2] = (byte) (frame.payloadLength + added);
             out[frame.start + 3] = (byte) (frame.paramCount + 1);
             int p = frame.end;
             out[p++] = 0x33;
-            out[p++] = 0x04;
-            System.arraycopy(uid, 0, out, p, 4);
-            System.arraycopy(input, frame.end, out, frame.end + 6, input.length - frame.end);
+            out[p++] = (byte) uid.length;
+            System.arraycopy(uid, 0, out, p, uid.length);
+            System.arraycopy(input, frame.end, out, frame.end + added, input.length - frame.end);
             return RewriteResult.changed(id(), "APPENDED_LA_NFCID1", out,
-                    frame.payloadLength, frame.payloadLength + 6,
+                    frame.payloadLength, frame.payloadLength + added,
                     frame.paramCount, frame.paramCount + 1);
         }
-
         return RewriteResult.skip(id(), "NO_SAFE_REWRITE_TARGET");
+    }
+
+    static boolean isSupportedUid(byte[] uid) {
+        return uid != null && (uid.length == 4 || uid.length == 7 || uid.length == 10);
     }
 
     private static List<Frame> findFrames(byte[] data) {
@@ -81,46 +92,40 @@ public final class RawNciCodec implements RfPayloadCodec {
 
     private static Parse parseParams(byte[] data, Frame frame) {
         int pos = frame.start + 4;
-        int nfcid1Offset = -1;
+        int valueOffset = -1, lengthOffset = -1, nfcid1Length = -1;
         for (int n = 0; n < frame.paramCount; n++) {
-            if (pos >= frame.end) return new Parse(false, nfcid1Offset);
+            if (pos >= frame.end) return new Parse(false, valueOffset, lengthOffset, nfcid1Length);
             int first = data[pos] & 0xFF;
-            int id;
-            int lenPos;
+            int id, lenPos;
             if (first == 0xA0) {
-                if (pos + 2 >= frame.end) return new Parse(false, nfcid1Offset);
-                id = (first << 8) | (data[pos + 1] & 0xFF);
-                lenPos = pos + 2;
+                if (pos + 2 >= frame.end) return new Parse(false, valueOffset, lengthOffset, nfcid1Length);
+                id = (first << 8) | (data[pos + 1] & 0xFF); lenPos = pos + 2;
             } else {
-                if (pos + 1 >= frame.end) return new Parse(false, nfcid1Offset);
-                id = first;
-                lenPos = pos + 1;
+                if (pos + 1 >= frame.end) return new Parse(false, valueOffset, lengthOffset, nfcid1Length);
+                id = first; lenPos = pos + 1;
             }
             int len = data[lenPos] & 0xFF;
             int value = lenPos + 1;
-            if (value + len > frame.end) return new Parse(false, nfcid1Offset);
-            if (id == LA_NFCID1 && len == 4) nfcid1Offset = value;
+            if (value + len > frame.end) return new Parse(false, valueOffset, lengthOffset, nfcid1Length);
+            if (id == LA_NFCID1 && (len == 4 || len == 7 || len == 10)) {
+                valueOffset = value; lengthOffset = lenPos; nfcid1Length = len;
+            }
             pos = value + len;
         }
-        return new Parse(pos == frame.end, nfcid1Offset);
+        return new Parse(pos == frame.end, valueOffset, lengthOffset, nfcid1Length);
     }
 
     private static final class Frame {
         final int start, end, payloadLength, paramCount;
         Frame(int start, int end, int payloadLength, int paramCount) {
-            this.start = start;
-            this.end = end;
-            this.payloadLength = payloadLength;
-            this.paramCount = paramCount;
+            this.start = start; this.end = end; this.payloadLength = payloadLength; this.paramCount = paramCount;
         }
     }
-
     private static final class Parse {
-        final boolean complete;
-        final int nfcid1ValueOffset;
-        Parse(boolean complete, int nfcid1ValueOffset) {
-            this.complete = complete;
-            this.nfcid1ValueOffset = nfcid1ValueOffset;
+        final boolean complete; final int nfcid1ValueOffset, nfcid1LengthOffset, nfcid1Length;
+        Parse(boolean complete, int valueOffset, int lengthOffset, int length) {
+            this.complete = complete; this.nfcid1ValueOffset = valueOffset;
+            this.nfcid1LengthOffset = lengthOffset; this.nfcid1Length = length;
         }
     }
 }

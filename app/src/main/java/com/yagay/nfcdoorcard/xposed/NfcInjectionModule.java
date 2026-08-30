@@ -264,8 +264,8 @@ public class NfcInjectionModule extends XposedModule {
 
             if (cfg.uid == null) return chain.proceed();
             String uidHex = normalizeUid(cfg.uid);
-            if (uidHex.length() != 8) {
-                failCommand(cfg, "UID_INVALID", uidHex, "UID must be 4 bytes", NativeOutcome.notInvoked());
+            if (uidHex.length() != 8 && uidHex.length() != 14 && uidHex.length() != 20) {
+                failCommand(cfg, "UID_INVALID", uidHex, "UID must be 4, 7 or 10 bytes", NativeOutcome.notInvoked());
                 return chain.proceed();
             }
 

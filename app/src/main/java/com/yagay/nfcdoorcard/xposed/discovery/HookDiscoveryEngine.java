@@ -18,6 +18,8 @@ public final class HookDiscoveryEngine {
     private static final int MAX_RF_PARAMS = 4;
 
     private static final String[] PROVEN_RF_CLASSES = new String[] {
+            "com.android.nfc.dhimpl.NativeNfcManager",
+            "com.android.nfc.dhimpl.StNativeNfcManager",
             "com.android.nfc.dhimpl.NxpNativeNfcManager",
             "com.android.nfc.nxp.NxpNfcService$NxpNfcAdapterService",
             "com.android.nfc.nxp.NxpNfcService"
@@ -156,7 +158,7 @@ public final class HookDiscoveryEngine {
         String rt = m.getReturnType().getName();
         if (knownFamily) score += 80;
         if (cn.contains("nfc")) score += 20;
-        if (cn.contains("nxp")) score += 20;
+        if (containsKnownVendorToken(cn)) score += 20;
         if (cn.contains("native")) score += 60;
         if (cn.contains("dhimpl") || cn.contains("devicehost")) score += 20;
         if (cn.contains("adapterservice")) score -= 35;
@@ -183,7 +185,7 @@ public final class HookDiscoveryEngine {
         String rt = m.getReturnType().getName();
         if (knownFamily) score += 70;
         if (cn.contains("nfc")) score += 20;
-        if (cn.contains("vendor") || cn.contains("oplus") || cn.contains("nxp")) score += 15;
+        if (cn.contains("vendor") || cn.contains("oplus") || containsKnownVendorToken(cn)) score += 15;
         if (cn.contains("service") || cn.contains("adapter")) score += 10;
         if (mn.contains("share")) score += 45;
         if (mn.contains("rf")) score += 25;
@@ -196,8 +198,16 @@ public final class HookDiscoveryEngine {
 
     private boolean looksNfcRelated(String name) {
         String n = name.toLowerCase(Locale.ROOT);
-        return n.contains("nfc") || n.contains("nxp") || n.contains("oplus") || n.contains("rfconfig") ||
+        return n.contains("nfc") || containsKnownVendorToken(n) || n.contains("oplus") || n.contains("rfconfig") ||
                 n.contains("devicehost") || n.contains("nci") || n.contains("native") || n.contains("hal");
+    }
+
+    private static boolean containsKnownVendorToken(String value) {
+        if (value == null) return false;
+        String n = value.toLowerCase(Locale.ROOT);
+        return n.contains("nxp") || n.contains("st21") || n.contains("st54") || n.contains("stmicro") ||
+                n.contains("broadcom") || n.contains("brcm") || n.contains("bcm") ||
+                n.contains("tsingteng") || n.contains("tsing");
     }
 
     private List<String> enumerateClassNames(ClassLoader classLoader) {
