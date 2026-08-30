@@ -13,7 +13,7 @@ class ConfigProvider : ContentProvider() {
     companion object {
         const val AUTHORITY = "com.example.nfcdoorcard.config"
         const val PATH_SETTINGS = "settings"
-        const val APP_BUILD = 16
+        val APP_BUILD: Int = BuildConfig.VERSION_CODE
 
         const val KEY_APP_BUILD = "app_build"
         const val KEY_HOOK_BUILD = "hook_build"
@@ -76,6 +76,10 @@ class ConfigProvider : ContentProvider() {
         selectionArgs: Array<out String>?,
         sortOrder: String?
     ): Cursor {
+        if (!isTrustedCaller()) {
+            Log.w("NfcConfigProvider", "Rejected config read from uid=${Binder.getCallingUid()}")
+            return MatrixCursor(arrayOf("key", "value"))
+        }
         val prefs = context!!.getSharedPreferences("nfc_config", 0)
         val cursor = MatrixCursor(arrayOf("key", "value"))
         prefs.all.forEach { (key, value) ->
@@ -86,7 +90,7 @@ class ConfigProvider : ContentProvider() {
 
     override fun insert(uri: Uri, values: ContentValues?): Uri {
         if (values == null) return uri
-        if (!isTrustedWriter()) {
+        if (!isTrustedCaller()) {
             Log.w("NfcConfigProvider", "Rejected config write from uid=${Binder.getCallingUid()}")
             return uri
         }
@@ -113,13 +117,13 @@ class ConfigProvider : ContentProvider() {
         selection: String?,
         selectionArgs: Array<out String>?
     ): Int {
-        if (values == null || !isTrustedWriter()) return 0
+        if (values == null || !isTrustedCaller()) return 0
         insert(uri, values)
         return values.size()
     }
 
     override fun delete(uri: Uri, selection: String?, selectionArgs: Array<out String>?): Int {
-        if (!isTrustedWriter()) return 0
+        if (!isTrustedCaller()) return 0
         context!!.getSharedPreferences("nfc_config", 0)
             .edit()
             .clear()
@@ -129,7 +133,7 @@ class ConfigProvider : ContentProvider() {
         return 1
     }
 
-    private fun isTrustedWriter(): Boolean {
+    private fun isTrustedCaller(): Boolean {
         val callingUid = Binder.getCallingUid()
         if (callingUid == Process.myUid()) return true
         val packages = runCatching { context?.packageManager?.getPackagesForUid(callingUid) }.getOrNull()
