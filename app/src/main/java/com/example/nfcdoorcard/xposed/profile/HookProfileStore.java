@@ -7,19 +7,23 @@ import android.database.Cursor;
 import android.net.Uri;
 import android.os.Build;
 
+import com.example.nfcdoorcard.BuildConfig;
 import com.example.nfcdoorcard.xposed.discovery.Capability;
 import com.example.nfcdoorcard.xposed.discovery.HookTarget;
 
 import java.util.HashMap;
 import java.util.Map;
 
-/** Persists and validates the current verified hook target against the running NFC build. */
+/** Persists and validates the verified RF_CONFIG_WRITE target against the exact runtime. */
 public final class HookProfileStore {
     private static final Uri CONFIG_URI = Uri.parse("content://com.example.nfcdoorcard.config/settings");
+    private static final int PROFILE_SCHEMA = 2;
 
     public void save(Application app, HookTarget target, String status) {
         if (app == null || target == null) return;
         ContentValues v = new ContentValues();
+        v.put("profile_schema", PROFILE_SCHEMA);
+        v.put("profile_hook_build", BuildConfig.HOOK_BUILD);
         v.put("profile_status", status == null ? "DISCOVERED" : status);
         v.put("profile_system_fingerprint", Build.FINGERPRINT == null ? "" : Build.FINGERPRINT);
         v.put("profile_nfc_version", nfcVersion(app));
@@ -34,12 +38,14 @@ public final class HookProfileStore {
         try { app.getContentResolver().insert(CONFIG_URI, v); } catch (Throwable ignored) { }
     }
 
-    /** Returns only a verified target from the exact same system/NFC build and resolvable signature. */
+    /** Returns only a profile verified by this hook/profile schema on the same system/NFC build. */
     public HookTarget loadValid(Application app, ClassLoader classLoader) {
         if (app == null || classLoader == null) return null;
         Map<String, String> state = read(app);
         String status = state.get("profile_status");
         if (!("VERIFIED".equals(status) || "CACHED_VERIFIED".equals(status))) return null;
+        if (parseInt(state.get("profile_schema"), -1) != PROFILE_SCHEMA) return null;
+        if (parseInt(state.get("profile_hook_build"), -1) != BuildConfig.HOOK_BUILD) return null;
         if (!systemIdentityMatches(app,
                 state.get("profile_system_fingerprint"), state.get("profile_nfc_version"))) return null;
 
