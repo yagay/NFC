@@ -19,9 +19,9 @@ public class OplusTextConfigCodecTest {
         assertTrue(new String(r.data, StandardCharsets.UTF_8).replaceAll("\\s+", "").contains("33,0A,01,02,03,04,05,06,07,08,09,0A"));
     }
     @Test public void prefersBoundedExistingZeroLengthNfcid1BeforeAppend() {
-        // Deliberately make the parameter list impossible for the strict parser to fully prove,
-        // while keeping one unique bounded stock LA_NFCID1=33 00 inside the declared frame.
-        String input = "OPLUS_CONF_EXTN = { 20,02,08,02,33,00,FE,03,11,22,33 }";
+        // paramCount=3 while only two complete params are present: strict full-list parsing must
+        // reject the frame, but the bounded OPLUS fallback can still prove one unique 33 00 target.
+        String input = "OPLUS_CONF_EXTN = { 20,02,08,03,33,00,FE,03,11,22,33 }";
         RewriteResult r = codec.rewrite(input.getBytes(StandardCharsets.UTF_8), hex("C1B0BC1B"));
         assertTrue(r.changed);
         assertTrue(r.reason.contains("BOUNDED_RESIZED_EXISTING_LA_NFCID1"));
