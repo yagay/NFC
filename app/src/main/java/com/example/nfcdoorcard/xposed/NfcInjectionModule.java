@@ -386,7 +386,7 @@ public class NfcInjectionModule extends XposedModule {
     private void reapplyAfterAdapterOn(String reason) {
         sleep(350L);
         SimConfig cfg = readConfig();
-        if (!cfg.initialized || !cfg.active || cfg.uid == null) return;
+        if (!cfg.initialized || !cfg.active || cfg.uid == null || lifecycleReapplyPending) return;
         cachedConfig = cfg;
         String uidHex = normalizeUid(cfg.uid);
         if (uidHex.length() != 8) return;
@@ -441,6 +441,29 @@ public class NfcInjectionModule extends XposedModule {
         if (!cfg.initialized) return;
         cachedConfig = cfg;
         int pid = Process.myPid();
+
+        // Provider is the durable command authority. A new com.android.nfc process must not replay
+        // an already handled generation just because this Java instance lost its in-memory cache.
+        // STOP needs no hardware replay: process/controller startup with simulation_enabled=false
+        // is the lifecycle proof for stock RF. APPLY is different: injected RF is process/controller
+        // state, so a successful persisted APPLY is re-applied once as a lifecycle operation and
+        // must receive a fresh native success before RF evidence moves to the new PID.
+        boolean persistedTerminal = cfg.generation > 0L && cfg.handledGeneration == cfg.generation &&
+                ("SUCCESS".equals(cfg.commandStatus) || "FAILED".equals(cfg.commandStatus));
+        if (persistedTerminal) {
+            completedGeneration = cfg.generation;
+            completedPid = pid;
+            lastTriggeredGeneration = cfg.generation;
+            if ("SUCCESS".equals(cfg.commandStatus) && cfg.active && "startup".equals(reason)) {
+                Log.i(TAG, "LIFECYCLE APPLY adoption generation=" + cfg.generation + " uid=" + cfg.uid + " pid=" + pid);
+                reapplyAfterAdapterOn("process_start");
+            } else {
+                Log.i(TAG, "COMMAND terminal adopted without replay status=" + cfg.commandStatus +
+                        " action=" + cfg.commandAction + " generation=" + cfg.generation + " pid=" + pid);
+            }
+            return;
+        }
+
         if ("RESTART_REQUIRED".equals(cfg.commandStatus) &&
                 cfg.consumedGeneration == cfg.generation && cfg.handledGeneration != cfg.generation) {
             return;
