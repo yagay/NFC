@@ -2,7 +2,6 @@ package com.example.nfcdoorcard.xposed.payload;
 
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
 import java.util.regex.Matcher;
@@ -12,9 +11,9 @@ import java.util.regex.Pattern;
  * Handles textual OPLUS_CONF_EXTN wrappers.
  *
  * First use the generic structural NCI codec. If an OEM-private parameter layout prevents
- * full parsing, fall back to the boundary-only append algorithm that is already proven on
- * the target OxygenOS/NXP stack. The fallback is limited to an explicit OPLUS_CONF_EXTN
- * block and a length-bounded CORE_SET_CONFIG frame; native result=0 remains final proof.
+ * full parsing, fall back to the boundary-only append algorithm already proven on the
+ * target OxygenOS/NXP stack. The fallback is limited to an explicit OPLUS_CONF_EXTN block
+ * and a length-bounded CORE_SET_CONFIG frame; native result=0 remains final proof.
  */
 public final class OplusTextConfigCodec implements RfPayloadCodec {
     private static final Pattern OPLUS_BLOCK = Pattern.compile("(?ms)(OPLUS_CONF_EXTN\\s*=\\s*\\{)(.*?)(\\})");
@@ -59,15 +58,6 @@ public final class OplusTextConfigCodec implements RfPayloadCodec {
             int oldCount = block[i + 3] & 0xFF;
             if (oldPayload + 6 > 0xFF || oldCount >= 0xFF) continue;
 
-            byte[] frame = Arrays.copyOfRange(block, i, frameEnd);
-            int existing = findLiteralNfcid1(frame);
-            if (existing >= 0) {
-                byte[] out = Arrays.copyOf(block, block.length);
-                System.arraycopy(uid, 0, out, i + existing + 2, 4);
-                return RewriteResult.changed(id(), "OPLUS_PROVEN_REPLACE_AFTER_" + strictReason, out,
-                        oldPayload, oldPayload, oldCount, oldCount);
-            }
-
             byte[] out = new byte[block.length + 6];
             System.arraycopy(block, 0, out, 0, frameEnd);
             out[i + 2] = (byte) (oldPayload + 6);
@@ -81,13 +71,6 @@ public final class OplusTextConfigCodec implements RfPayloadCodec {
                     oldPayload, oldPayload + 6, oldCount, oldCount + 1);
         }
         return RewriteResult.skip(id(), strictReason + "/CORE_SET_CONFIG_NOT_FOUND");
-    }
-
-    private int findLiteralNfcid1(byte[] frame) {
-        for (int i = 4; i + 5 < frame.length; i++) {
-            if ((frame[i] & 0xFF) == 0x33 && (frame[i + 1] & 0xFF) == 0x04) return i;
-        }
-        return -1;
     }
 
     private static byte[] parseHexTokens(String body) {
