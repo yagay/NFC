@@ -15,7 +15,7 @@ android {
         versionCode = 29
         versionName = "1.0.28"
 
-        // Hook/runtime state protocol v5 + NFC lifecycle reapply validated with this build.
+        // Runtime protocol v5; NFC lifecycle hook build 22 is validated with this app build.
         buildConfigField("int", "HOOK_BUILD", "22")
     }
 
