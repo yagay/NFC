@@ -15,7 +15,7 @@ android {
         versionCode = 32
         versionName = "1.0.31"
 
-        // Runtime protocol v6; trigger-closed-loop hook build 24 is validated with this app build.
+        // Runtime protocol v6; trigger-closed-loop hook build 24 is verified with this app build.
         // App architecture is split into runtime repository, NFC dispatcher, system service and UI components.
         buildConfigField("int", "HOOK_BUILD", "24")
     }
