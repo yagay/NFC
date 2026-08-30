@@ -5,19 +5,19 @@ plugins {
 }
 
 android {
-    namespace = "com.example.nfcdoorcard"
+    namespace = "com.yagay.nfcdoorcard"
     compileSdk = 35
 
     defaultConfig {
         applicationId = "com.yagay.nfcdoorcard"
         minSdk = 31
         targetSdk = 35
-        versionCode = 38
-        versionName = "1.0.37"
+        versionCode = 39
+        versionName = "1.0.38"
 
-        // Runtime protocol v6; closed-loop startup lifecycle recovery hook build 26 is verified with this app build.
-        // The Android applicationId is com.yagay.nfcdoorcard; internal source namespace remains stable for Hook compatibility.
-        buildConfigField("int", "HOOK_BUILD", "26")
+        // Runtime protocol v6; complete com.yagay.nfcdoorcard namespace migration; hook build 27.
+        // Application ID, source namespace, Provider authority and LSPosed entry all use com.yagay.nfcdoorcard.
+        buildConfigField("int", "HOOK_BUILD", "27")
     }
 
     buildTypes {
