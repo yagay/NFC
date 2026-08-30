@@ -6,15 +6,14 @@ import androidx.lifecycle.viewModelScope
 import com.yagay.nfcdoorcard.system.NfcSystemService
 import com.yagay.nfcdoorcard.system.RootShell
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collectLatest
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
+/** Provider changes are the single normal-runtime source of truth for UI status. */
 class RuntimeStatusViewModel(application: Application) : AndroidViewModel(application) {
     private val repository = RuntimeStatusRepository(
         application,
@@ -26,18 +25,10 @@ class RuntimeStatusViewModel(application: Application) : AndroidViewModel(applic
     init {
         viewModelScope.launch {
             repository.observeChanges().collectLatest {
-                _status.value = withContext(Dispatchers.IO) { repository.read(includeRootPid = false) }
+                _status.value = withContext(Dispatchers.IO) {
+                    repository.read(includeRootPid = false)
+                }
             }
         }
-        viewModelScope.launch {
-            while (isActive) {
-                _status.value = withContext(Dispatchers.IO) { repository.read(includeRootPid = true) }
-                delay(20_000)
-            }
-        }
-    }
-
-    fun update(value: RuntimeStatus) {
-        _status.value = value
     }
 }
