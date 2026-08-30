@@ -9,11 +9,14 @@ import android.os.Process;
 import android.util.Log;
 
 import com.example.nfcdoorcard.BuildConfig;
-import com.example.nfcdoorcard.xposed.adapter.GenericNxpAdapter;
-import com.example.nfcdoorcard.xposed.adapter.NfcStackAdapter;
-import com.example.nfcdoorcard.xposed.adapter.OplusNxpAdapter;
+import com.example.nfcdoorcard.xposed.discovery.HookDiscoveryEngine;
+import com.example.nfcdoorcard.xposed.discovery.HookTarget;
+import com.example.nfcdoorcard.xposed.payload.RewriteResult;
+import com.example.nfcdoorcard.xposed.payload.RfPayloadEngine;
+import com.example.nfcdoorcard.xposed.profile.HookProfileStore;
 
 import java.lang.reflect.Method;
+import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -22,22 +25,19 @@ import io.github.libxposed.api.XposedModule;
 import io.github.libxposed.api.XposedModuleInterface;
 
 /**
- * LSPosed NFC execution engine.
+ * Capability-oriented LSPosed NFC execution engine.
  *
- * The UI publishes desired state to ConfigProvider. This module observes that state from
- * inside com.android.nfc, triggers the OEM share-mode refresh in the same NFC process,
- * injects LA_NFCID1 into the verified RF config call, and publishes generation-bound
- * completion state back to the UI.
+ * The UI publishes desired state to ConfigProvider. Inside com.android.nfc this module:
+ *  1) discovers RF_CONFIG_WRITE by structural capability instead of one permanent name,
+ *  2) hooks the best production target,
+ *  3) classifies each byte[] payload independently,
+ *  4) rewrites only a recognized/safe RF representation,
+ *  5) treats native result=0 as runtime verification and persists the verified profile.
  */
 public class NfcInjectionModule extends XposedModule {
     private static final String TAG = "NfcUIDSim";
     private static final int HOOK_BUILD = BuildConfig.HOOK_BUILD;
     private static final Uri CONFIG_URI = Uri.parse("content://com.example.nfcdoorcard.config/settings");
-
-    private final NfcStackAdapter[] adapters = new NfcStackAdapter[]{
-            new OplusNxpAdapter(),
-            new GenericNxpAdapter()
-    };
 
     private final ExecutorService stateSyncExecutor = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(r, "NfcUIDSim-StateSync");
@@ -51,9 +51,13 @@ public class NfcInjectionModule extends XposedModule {
         return t;
     });
 
+    private final HookDiscoveryEngine discoveryEngine = new HookDiscoveryEngine();
+    private final RfPayloadEngine payloadEngine = new RfPayloadEngine();
+    private final HookProfileStore profileStore = new HookProfileStore();
     private final NfcProcessVendorController vendorController = new NfcProcessVendorController();
 
-    private volatile NfcStackAdapter activeAdapter;
+    private volatile HookTarget activeTarget;
+    private volatile String activeCodec = "";
     private volatile SimConfig cachedConfig = SimConfig.uninitialized();
     private volatile ContentObserver commandObserver;
     private volatile boolean observerRegistered;
@@ -77,37 +81,34 @@ public class NfcInjectionModule extends XposedModule {
 
         final int pid = Process.myPid();
         final ClassLoader cl = lp.getDefaultClassLoader();
-        reportStatusWithRetry(pid, false, 0, "DETECTING", "Detecting NFC stack adapter", null);
+        reportStatusWithRetry(pid, false, 0, "DISCOVERING", "Discovering RF_CONFIG_WRITE capability", null);
 
-        NfcStackAdapter adapter = selectAdapter(cl, pid);
-        if (adapter == null) {
-            Log.e(TAG, "ADAPTER UNSUPPORTED pid=" + pid);
-            reportStatusWithRetry(pid, false, 0, "UNSUPPORTED", "No compatible NFC stack adapter", null);
+        List<HookTarget> candidates = discoveryEngine.discoverRfCandidates(cl);
+        persistDiscoveryCandidates(pid, candidates);
+        if (candidates.isEmpty()) {
+            Log.e(TAG, "RF_CONFIG_WRITE UNSUPPORTED pid=" + pid);
+            reportStatusWithRetry(pid, false, 0, "UNSUPPORTED", "No RF_CONFIG_WRITE candidate discovered", null);
             return;
         }
-        activeAdapter = adapter;
 
+        HookTarget target = candidates.get(0);
+        activeTarget = target;
         try {
-            Method method = adapter.resolveInjectionMethod(cl);
+            Method method = target.resolve(cl);
             hook(method).intercept(chain -> {
                 Object[] args = chain.getArgs().toArray();
                 if (args.length != 1 || !(args[0] instanceof byte[])) return chain.proceed();
 
                 SimConfig cfg = currentConfig();
-
                 if (!cfg.active) {
                     Object result = chain.proceed();
                     if (cfg.initialized && "STOP".equals(cfg.commandAction) && nativeOk(result)
                             && !isGenerationCompleted(cfg.generation, pid)) {
-                        Log.i(TAG, "STOCK RF ACCEPTED pid=" + pid + " generation=" + cfg.generation + " result=" + result);
-                        completeCommand(
-                                cfg,
-                                "RF_STOCK_RESTORED",
-                                "",
-                                activeAdapter == null ? "" : activeAdapter.id(),
-                                String.valueOf(result),
-                                "Stock RF config accepted in NFC process"
-                        );
+                        Log.i(TAG, "STOCK RF ACCEPTED target=" + target.fingerprint() + " pid=" + pid +
+                                " generation=" + cfg.generation + " result=" + result);
+                        markTargetVerified(target);
+                        completeCommand(cfg, "RF_STOCK_RESTORED", "", target.fingerprint(),
+                                String.valueOf(result), "Stock RF config accepted by verified RF_CONFIG_WRITE target");
                     }
                     return result;
                 }
@@ -128,7 +129,8 @@ public class NfcInjectionModule extends XposedModule {
 
                 if (cfg.diagnostics) {
                     String caller = compactCallStack(24);
-                    Log.i(TAG, "RFPROBE: CHANGE_RF_CALLER pid=" + pid + " generation=" + cfg.generation + " uid=" + uidHex + " stack=" + caller);
+                    Log.i(TAG, "RFPROBE target=" + target.fingerprint() + " pid=" + pid +
+                            " generation=" + cfg.generation + " uid=" + uidHex + " stack=" + caller);
                     persistRfCaller(pid, caller);
                 }
 
@@ -137,41 +139,52 @@ public class NfcInjectionModule extends XposedModule {
                     return chain.proceed();
                 }
 
-                NfcStackAdapter.InjectionResult injected = adapter.inject((byte[]) args[0], hexToBytes(uidHex));
-                if (!injected.changed) {
-                    writeRfProgress(cfg, "WAITING", uidHex, injected.reason, "");
+                RewriteResult rewritten = payloadEngine.rewrite((byte[]) args[0], hexToBytes(uidHex));
+                if (!rewritten.changed) {
+                    writeRfProgress(cfg, "WAITING", uidHex, rewritten.reason, "", rewritten.codecId);
                     return chain.proceed();
                 }
 
-                Log.i(TAG, "NFCID1 APPLY adapter=" + adapter.id() + " pid=" + pid + " generation=" + cfg.generation + " uid=" + uidHex +
-                        " payload=" + injected.oldPayloadLength + "->" + injected.newPayloadLength +
-                        " params=" + injected.oldParamCount + "->" + injected.newParamCount);
-                writeRfProgress(cfg, "APPLYING", uidHex, adapter.id(), "pending");
+                activeCodec = rewritten.codecId;
+                Log.i(TAG, "NFCID1 APPLY target=" + target.fingerprint() + " codec=" + rewritten.codecId +
+                        " reason=" + rewritten.reason + " pid=" + pid + " generation=" + cfg.generation +
+                        " uid=" + uidHex + " payload=" + rewritten.oldPayloadLength + "->" + rewritten.newPayloadLength +
+                        " params=" + rewritten.oldParamCount + "->" + rewritten.newParamCount);
+                writeRfProgress(cfg, "APPLYING", uidHex, rewritten.reason, "pending", rewritten.codecId);
 
-                Object result = chain.proceed(new Object[]{injected.data});
+                Object result = chain.proceed(new Object[]{rewritten.data});
                 if (nativeOk(result)) {
                     disabledAfterFailure = false;
                     disabledFailureUid = null;
                     disabledFailureGeneration = Long.MIN_VALUE;
-                    Log.i(TAG, "NFCID1 ACCEPTED adapter=" + adapter.id() + " pid=" + pid + " generation=" + cfg.generation + " uid=" + uidHex + " result=" + result);
-                    completeCommand(cfg, "RF_UID_APPLIED", uidHex, adapter.id(), String.valueOf(result), "UID applied by " + adapter.id());
+                    markTargetVerified(target);
+                    Log.i(TAG, "NFCID1 ACCEPTED target=" + target.fingerprint() + " codec=" + rewritten.codecId +
+                            " pid=" + pid + " generation=" + cfg.generation + " uid=" + uidHex + " result=" + result);
+                    completeCommand(cfg, "RF_UID_APPLIED", uidHex, rewritten.codecId,
+                            String.valueOf(result), "UID applied by verified RF_CONFIG_WRITE target using " + rewritten.codecId);
                 } else {
                     disabledAfterFailure = true;
                     disabledFailureUid = uidHex;
                     disabledFailureGeneration = cfg.generation;
-                    Log.e(TAG, "NFCID1 FAILED adapter=" + adapter.id() + " pid=" + pid + " generation=" + cfg.generation + " uid=" + uidHex + " result=" + result);
-                    failCommand(cfg, "RF_UID_FAILED", uidHex, "native rejected; retry allowed on next generation", String.valueOf(result));
+                    Log.e(TAG, "NFCID1 FAILED target=" + target.fingerprint() + " codec=" + rewritten.codecId +
+                            " pid=" + pid + " generation=" + cfg.generation + " uid=" + uidHex + " result=" + result);
+                    failCommand(cfg, "RF_UID_FAILED", uidHex,
+                            "native rejected payload from " + rewritten.codecId + "; retry allowed on next generation",
+                            String.valueOf(result));
                 }
                 return result;
             });
 
-            reportStatusWithRetry(pid, true, 1, "READY", "Adapter " + adapter.id() + " ready", adapter.id());
-            Log.i(TAG, "PROD HOOK READY build=" + HOOK_BUILD + " adapter=" + adapter.id() + " pid=" + pid);
+            reportStatusWithRetry(pid, true, 1, "READY",
+                    "RF_CONFIG_WRITE target ready score=" + target.score + " source=" + target.source,
+                    target.fingerprint());
+            Log.i(TAG, "PROD HOOK READY build=" + HOOK_BUILD + " target=" + target + " pid=" + pid);
             startCommandBridge(pid);
         } catch (Throwable t) {
-            Log.e(TAG, "PROD HOOK FAILED build=" + HOOK_BUILD + " adapter=" + adapter.id() + " pid=" + pid + " " +
+            Log.e(TAG, "PROD HOOK FAILED build=" + HOOK_BUILD + " target=" + target + " pid=" + pid + " " +
                     t.getClass().getSimpleName() + ": " + t.getMessage(), t);
-            reportStatusWithRetry(pid, false, 0, "HOOK_FAILED", t.getClass().getSimpleName() + ": " + t.getMessage(), adapter.id());
+            reportStatusWithRetry(pid, false, 0, "HOOK_FAILED",
+                    t.getClass().getSimpleName() + ": " + t.getMessage(), target.fingerprint());
         }
     }
 
@@ -181,16 +194,10 @@ public class NfcInjectionModule extends XposedModule {
                 Application app = currentApplication();
                 if (app != null) {
                     try {
+                        if (activeTarget != null) profileStore.save(app, activeTarget, "DISCOVERED");
                         ContentObserver observer = new ContentObserver(null) {
-                            @Override
-                            public void onChange(boolean selfChange) {
-                                scheduleCommandRefresh("provider_change");
-                            }
-
-                            @Override
-                            public void onChange(boolean selfChange, Uri uri) {
-                                scheduleCommandRefresh("provider_change");
-                            }
+                            @Override public void onChange(boolean selfChange) { scheduleCommandRefresh("provider_change"); }
+                            @Override public void onChange(boolean selfChange, Uri uri) { scheduleCommandRefresh("provider_change"); }
                         };
                         app.getContentResolver().registerContentObserver(CONFIG_URI, true, observer);
                         commandObserver = observer;
@@ -221,7 +228,6 @@ public class NfcInjectionModule extends XposedModule {
         int pid = Process.myPid();
         if (isGenerationCompleted(cfg.generation, pid)) return;
         if (cfg.generation == lastTriggeredGeneration) return;
-
         lastTriggeredGeneration = cfg.generation;
 
         String action = cfg.active ? "APPLY" : "STOP";
@@ -229,32 +235,18 @@ public class NfcInjectionModule extends XposedModule {
         writeSimpleCommandState("RUNNING", "Executing " + action + " inside com.android.nfc", cfg.generation, action, false);
 
         NfcProcessVendorController.Result trigger = vendorController.setShareMode(cfg.active);
-
-        // transaction 15 may synchronously execute changeRfParamsByConfig in this same
-        // process. In that case the RF interceptor has already published SUCCESS/FAILED.
-        // Never enqueue TRIGGERED/TRIGGER_FAILED afterward and regress the terminal state.
         if (isGenerationCompleted(cfg.generation, pid)) {
             Log.i(TAG, "COMMAND terminal RF result already recorded generation=" + cfg.generation + " pid=" + pid);
             return;
         }
 
         if (trigger.success) {
-            writeSimpleCommandState(
-                    "TRIGGERED",
-                    trigger.detail + "; waiting for RF confirmation",
-                    cfg.generation,
-                    action,
-                    false
-            );
+            writeSimpleCommandState("TRIGGERED", trigger.detail + "; waiting for RF confirmation",
+                    cfg.generation, action, false);
         } else {
             Log.e(TAG, "COMMAND trigger failed generation=" + cfg.generation + " stage=" + trigger.stage + " detail=" + trigger.detail);
-            writeSimpleCommandState(
-                    "TRIGGER_FAILED",
-                    trigger.stage + ": " + trigger.detail,
-                    cfg.generation,
-                    action,
-                    false
-            );
+            writeSimpleCommandState("TRIGGER_FAILED", trigger.stage + ": " + trigger.detail,
+                    cfg.generation, action, false);
         }
     }
 
@@ -291,26 +283,41 @@ public class NfcInjectionModule extends XposedModule {
         writeValuesWithRetry(v, 8, 100L);
     }
 
-    private NfcStackAdapter selectAdapter(ClassLoader cl, int pid) {
-        for (NfcStackAdapter adapter : adapters) {
-            NfcStackAdapter.Detection detection = adapter.detect(cl);
-            Log.i(TAG, "ADAPTER DETECT id=" + adapter.id() + " supported=" + detection.supported + " detail=" + detection.detail);
-            persistAdapterState(pid, adapter.id(), detection.supported, detection.detail);
-            if (detection.supported) return adapter;
-        }
-        return null;
-    }
-
-    private void persistAdapterState(int pid, String adapterId, boolean supported, String detail) {
+    private void persistDiscoveryCandidates(int pid, List<HookTarget> candidates) {
         ContentValues v = new ContentValues();
-        v.put("adapter_id", adapterId == null ? "" : adapterId);
-        v.put("adapter_supported", supported);
-        v.put("adapter_detail", detail == null ? "" : detail);
-        v.put("adapter_pid", pid);
-        writeValuesWithRetry(v, 20, 150L);
+        StringBuilder report = new StringBuilder();
+        for (int i = 0; i < candidates.size(); i++) {
+            if (i > 0) report.append(" | ");
+            report.append('#').append(i + 1).append(' ').append(candidates.get(i));
+        }
+        String text = report.toString();
+        if (text.length() > 6000) text = text.substring(0, 6000);
+        v.put("rf_hook_candidates", text);
+        v.put("rf_hook_candidate_count", candidates.size());
+        v.put("rf_hook_discovery_pid", pid);
+        if (!candidates.isEmpty()) {
+            HookTarget t = candidates.get(0);
+            v.put("rf_hook_class", t.className);
+            v.put("rf_hook_method", t.methodName);
+            v.put("rf_hook_signature", t.parameterSignature + "->" + t.returnType);
+            v.put("rf_hook_score", t.score);
+            v.put("rf_hook_source", t.source);
+            v.put("rf_hook_fingerprint", t.fingerprint());
+            v.put("profile_status", "DISCOVERED");
+        }
+        writeValuesWithRetry(v, 20, 100L);
     }
 
-    private void reportStatusWithRetry(int pid, boolean ready, int count, String stage, String summary, String adapterId) {
+    private void markTargetVerified(HookTarget target) {
+        Application app = currentApplication();
+        if (app != null) profileStore.save(app, target, "VERIFIED");
+        ContentValues v = new ContentValues();
+        v.put("profile_status", "VERIFIED");
+        v.put("rf_hook_fingerprint", target.fingerprint());
+        writeValuesWithRetry(v, 8, 75L);
+    }
+
+    private void reportStatusWithRetry(int pid, boolean ready, int count, String stage, String summary, String targetId) {
         ContentValues v = new ContentValues();
         v.put("hook_build", HOOK_BUILD);
         v.put("scope_ok", true);
@@ -322,15 +329,15 @@ public class NfcInjectionModule extends XposedModule {
         v.put("hook_pid", pid);
         v.put("full_diag_stage", stage);
         v.put("full_diag_summary", summary);
-        if (adapterId != null) v.put("adapter_id", adapterId);
+        if (targetId != null) v.put("rf_hook_fingerprint", targetId);
         writeValuesWithRetry(v, 20, 150L);
     }
 
-    private void writeRfProgress(SimConfig cfg, String state, String uid, String detail, String result) {
+    private void writeRfProgress(SimConfig cfg, String state, String uid, String detail, String result, String codecId) {
         ContentValues v = baseHookState();
         v.put("rf_status", state);
         v.put("rf_uid", uid == null ? "" : uid);
-        v.put("rf_source", activeAdapter == null ? "" : activeAdapter.id());
+        v.put("rf_source", codecId == null ? "" : codecId);
         v.put("rf_result", result == null ? "" : result);
         v.put("rf_error", state.endsWith("FAILED") || state.equals("UID_INVALID") ? detail : "");
         v.put("rf_pid", Process.myPid());
@@ -371,7 +378,7 @@ public class NfcInjectionModule extends XposedModule {
         ContentValues v = baseHookState();
         v.put("rf_status", rfState);
         v.put("rf_uid", uid == null ? "" : uid);
-        v.put("rf_source", activeAdapter == null ? "" : activeAdapter.id());
+        v.put("rf_source", activeCodec == null ? "" : activeCodec);
         v.put("rf_result", result == null ? "" : result);
         v.put("rf_error", detail == null ? "" : detail);
         v.put("rf_pid", pid);
@@ -397,6 +404,7 @@ public class NfcInjectionModule extends XposedModule {
         v.put("hook_class", "NfcInjectionModule");
         v.put("hook_count", 1);
         v.put("hook_pid", pid);
+        if (activeTarget != null) v.put("rf_hook_fingerprint", activeTarget.fingerprint());
         return v;
     }
 
@@ -457,7 +465,8 @@ public class NfcInjectionModule extends XposedModule {
                 else if ("command_pid".equals(key)) commandPid = (int) parseLong(value, 0L);
             }
             if (commandAction.isEmpty()) commandAction = active ? "APPLY" : "STOP";
-            return new SimConfig(true, active, uid, diagnostics, generation, handledGeneration, commandAction, commandStatus, commandPid);
+            return new SimConfig(true, active, uid, diagnostics, generation, handledGeneration,
+                    commandAction, commandStatus, commandPid);
         } catch (Throwable t) {
             Log.w(TAG, "config read failed: " + t.getMessage());
             return SimConfig.uninitialized();
@@ -492,19 +501,13 @@ public class NfcInjectionModule extends XposedModule {
     }
 
     private static long parseLong(String value, long fallback) {
-        try {
-            return Long.parseLong(value);
-        } catch (Throwable ignored) {
-            return fallback;
-        }
+        try { return Long.parseLong(value); }
+        catch (Throwable ignored) { return fallback; }
     }
 
     private static void sleep(long millis) {
-        try {
-            Thread.sleep(millis);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
+        try { Thread.sleep(millis); }
+        catch (InterruptedException e) { Thread.currentThread().interrupt(); }
     }
 
     private static final class SimConfig {
@@ -518,17 +521,9 @@ public class NfcInjectionModule extends XposedModule {
         final String commandStatus;
         final int commandPid;
 
-        SimConfig(
-                boolean initialized,
-                boolean active,
-                String uid,
-                boolean diagnostics,
-                long generation,
-                long handledGeneration,
-                String commandAction,
-                String commandStatus,
-                int commandPid
-        ) {
+        SimConfig(boolean initialized, boolean active, String uid, boolean diagnostics,
+                  long generation, long handledGeneration, String commandAction,
+                  String commandStatus, int commandPid) {
             this.initialized = initialized;
             this.active = active;
             this.uid = uid;
