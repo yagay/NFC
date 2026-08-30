@@ -7,6 +7,7 @@ import android.provider.MediaStore
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -56,7 +57,19 @@ class MainActivity : ComponentActivity() {
         diagnosticsCollector = DiagnosticsCollector(this, rootShell, nfcSystemService, runtimeRepository, cardRepository)
         savedCardsState = cardRepository.load()
         AppLogger.i("NFC controller started; LSPosed in-process command engine enabled")
-        setContent { MaterialTheme { Surface(Modifier.fillMaxSize()) { NfcAppContent() } } }
+        enableEdgeToEdge()
+        setContent {
+            val darkTheme = isSystemInDarkTheme()
+            val colorScheme = if (darkTheme) darkColorScheme() else lightColorScheme()
+            MaterialTheme(colorScheme = colorScheme) {
+                Surface(
+                    modifier = Modifier.fillMaxSize(),
+                    color = MaterialTheme.colorScheme.background
+                ) {
+                    NfcAppContent()
+                }
+            }
+        }
     }
 
     override fun onResume() { super.onResume(); if (readModeEnabled) enableReadDispatch() }
