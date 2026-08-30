@@ -10,14 +10,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Set;
 
-/**
- * Capability-oriented hook discovery.
- *
- * Production fast path first checks proven targets. If those disappear after an OTA,
- * a bounded Dex scan ranks byte[] NFC methods by structural features instead of relying
- * on one permanent class/method name. The scan only discovers candidates; runtime RF
- * payload verification remains the authoritative proof that a target is correct.
- */
+/** Capability-oriented hook discovery for RF writes and refresh triggers. */
 public final class HookDiscoveryEngine {
     private static final int MAX_CLASSES = 1500;
     private static final int MAX_RESULTS = 12;
@@ -28,6 +21,11 @@ public final class HookDiscoveryEngine {
             "com.android.nfc.nxp.NxpNfcService"
     };
 
+    private static final String[] PROVEN_TRIGGER_CLASSES = new String[] {
+            "com.android.nfc.VendorNfcService$VendorNfcAdapterService",
+            "com.android.nfc.nxp.NxpNfcService$NxpNfcAdapterService"
+    };
+
     public HookTarget discoverRfConfigWrite(ClassLoader classLoader) {
         List<HookTarget> ranked = discoverRfCandidates(classLoader);
         return ranked.isEmpty() ? null : ranked.get(0);
@@ -36,66 +34,105 @@ public final class HookDiscoveryEngine {
     public List<HookTarget> discoverRfCandidates(ClassLoader classLoader) {
         List<HookTarget> out = new ArrayList<>();
         Set<String> seen = new HashSet<>();
+        for (String name : PROVEN_RF_CLASSES) inspectRfClass(classLoader, name, "known-family", out, seen, true);
 
-        // Fast path for known-good families. These names are hints, not the architecture.
-        for (String name : PROVEN_RF_CLASSES) {
-            inspectClass(classLoader, name, "known-family", out, seen, true);
-        }
-
-        // OTA fallback: enumerate NFC-related dex classes and score methods by shape.
         int inspected = 0;
         for (String name : enumerateClassNames(classLoader)) {
             if (inspected >= MAX_CLASSES) break;
             if (!looksNfcRelated(name)) continue;
             inspected++;
-            inspectClass(classLoader, name, "dex-scan", out, seen, false);
+            inspectRfClass(classLoader, name, "dex-scan", out, seen, false);
         }
+        return top(out);
+    }
 
+    /** Diagnostic-only candidates used to recover the refresh trigger after an OTA. */
+    public List<HookTarget> discoverTriggerCandidates(ClassLoader classLoader) {
+        List<HookTarget> out = new ArrayList<>();
+        Set<String> seen = new HashSet<>();
+        for (String name : PROVEN_TRIGGER_CLASSES) inspectTriggerClass(classLoader, name, "known-family", out, seen, true);
+
+        int inspected = 0;
+        for (String name : enumerateClassNames(classLoader)) {
+            if (inspected >= MAX_CLASSES) break;
+            if (!looksNfcRelated(name)) continue;
+            inspected++;
+            inspectTriggerClass(classLoader, name, "dex-scan", out, seen, false);
+        }
+        return top(out);
+    }
+
+    private List<HookTarget> top(List<HookTarget> out) {
         out.sort(Comparator.comparingInt((HookTarget t) -> t.score).reversed());
         if (out.size() > MAX_RESULTS) return new ArrayList<>(out.subList(0, MAX_RESULTS));
         return out;
     }
 
-    private void inspectClass(ClassLoader cl, String className, String source,
-                              List<HookTarget> out, Set<String> seen, boolean knownFamily) {
+    private void inspectRfClass(ClassLoader cl, String className, String source,
+                                List<HookTarget> out, Set<String> seen, boolean knownFamily) {
         try {
             Class<?> c = Class.forName(className, false, cl);
             for (Method m : c.getDeclaredMethods()) {
                 Class<?>[] p = m.getParameterTypes();
-                if (p.length != 1 || p[0] != byte[].class) continue;
-                if (m.getReturnType() == Void.TYPE) continue;
-
+                if (p.length != 1 || p[0] != byte[].class || m.getReturnType() == Void.TYPE) continue;
                 int score = scoreRfMethod(c, m, knownFamily);
                 if (score < 40) continue;
                 HookTarget target = HookTarget.fromMethod(Capability.RF_CONFIG_WRITE, m, score, source);
                 if (seen.add(target.fingerprint())) out.add(target);
             }
-        } catch (Throwable ignored) {
-        }
+        } catch (Throwable ignored) { }
+    }
+
+    private void inspectTriggerClass(ClassLoader cl, String className, String source,
+                                     List<HookTarget> out, Set<String> seen, boolean knownFamily) {
+        try {
+            Class<?> c = Class.forName(className, false, cl);
+            for (Method m : c.getDeclaredMethods()) {
+                Class<?>[] p = m.getParameterTypes();
+                if (p.length != 1 || (p[0] != boolean.class && p[0] != Boolean.class)) continue;
+                int score = scoreTriggerMethod(c, m, knownFamily);
+                if (score < 45) continue;
+                HookTarget target = HookTarget.fromMethod(Capability.RF_REFRESH_TRIGGER, m, score, source);
+                if (seen.add(target.fingerprint())) out.add(target);
+            }
+        } catch (Throwable ignored) { }
     }
 
     private int scoreRfMethod(Class<?> c, Method m, boolean knownFamily) {
-        int score = 35; // one byte[] parameter + non-void return already matched
+        int score = 35;
         String cn = c.getName().toLowerCase(Locale.ROOT);
         String mn = m.getName().toLowerCase(Locale.ROOT);
         String rt = m.getReturnType().getName();
-
         if (knownFamily) score += 80;
         if (cn.contains("nfc")) score += 20;
         if (cn.contains("nxp")) score += 20;
         if (cn.contains("oplus") || cn.contains("native")) score += 10;
         if (cn.contains("manager") || cn.contains("service")) score += 5;
-
         if (mn.contains("rf")) score += 25;
         if (mn.contains("config")) score += 30;
         if (mn.contains("param")) score += 20;
         if (mn.contains("change") || mn.contains("set") || mn.contains("apply") || mn.contains("update")) score += 10;
         if ("int".equals(rt) || "java.lang.Integer".equals(rt)) score += 15;
         if ("boolean".equals(rt) || "java.lang.Boolean".equals(rt)) score += 5;
-
-        // Current proven point gets the highest fast-path score without making the
-        // framework depend on it when it disappears after an OTA.
         if ("changeRfParamsByConfig".equals(m.getName())) score += 100;
+        return score;
+    }
+
+    private int scoreTriggerMethod(Class<?> c, Method m, boolean knownFamily) {
+        int score = 25;
+        String cn = c.getName().toLowerCase(Locale.ROOT);
+        String mn = m.getName().toLowerCase(Locale.ROOT);
+        String rt = m.getReturnType().getName();
+        if (knownFamily) score += 70;
+        if (cn.contains("nfc")) score += 20;
+        if (cn.contains("vendor") || cn.contains("oplus") || cn.contains("nxp")) score += 15;
+        if (cn.contains("service") || cn.contains("adapter")) score += 10;
+        if (mn.contains("share")) score += 45;
+        if (mn.contains("rf")) score += 25;
+        if (mn.contains("refresh") || mn.contains("reload")) score += 25;
+        if (mn.contains("enable") || mn.contains("set") || mn.contains("apply")) score += 15;
+        if ("boolean".equals(rt) || "java.lang.Boolean".equals(rt)) score += 15;
+        if ("enableNfcShareMode".equals(m.getName())) score += 100;
         return score;
     }
 
@@ -135,8 +172,7 @@ public final class HookDiscoveryEngine {
                     if (name != null && unique.add(name)) names.add(name);
                 }
             }
-        } catch (Throwable ignored) {
-        }
+        } catch (Throwable ignored) { }
         return names;
     }
 
