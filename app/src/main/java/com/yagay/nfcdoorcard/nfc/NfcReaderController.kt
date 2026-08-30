@@ -9,8 +9,11 @@ import com.yagay.nfcdoorcard.CardModel
 /** Purpose-built NFC-A reader mode for the app's explicit one-card scan flow. */
 class NfcReaderController(private val activity: Activity) {
     private val adapter: NfcAdapter? = NfcAdapter.getDefaultAdapter(activity)
+    @Volatile private var readerEnabled = false
 
+    @Synchronized
     fun enable(onCard: (CardModel) -> Unit): Result<Unit> = runCatching {
+        if (readerEnabled) return@runCatching
         val nfc = adapter ?: error("NFC adapter unavailable")
         nfc.enableReaderMode(
             activity,
@@ -20,10 +23,14 @@ class NfcReaderController(private val activity: Activity) {
             NfcAdapter.FLAG_READER_NFC_A or NfcAdapter.FLAG_READER_SKIP_NDEF_CHECK,
             null
         )
+        readerEnabled = true
     }
 
+    @Synchronized
     fun disable() {
+        if (!readerEnabled) return
         runCatching { adapter?.disableReaderMode(activity) }
+        readerEnabled = false
     }
 
     private fun parse(tag: Tag): CardModel? {
