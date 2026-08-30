@@ -11,6 +11,14 @@ public final class RfPayloadEngine {
             new RawNciCodec()
     };
 
+    public int inspectScore(byte[] input) {
+        int best = 0;
+        for (RfPayloadCodec codec : codecs) {
+            try { best = Math.max(best, codec.inspect(input)); } catch (Throwable ignored) { }
+        }
+        return best;
+    }
+
     public RewriteResult rewrite(byte[] input, byte[] uid) {
         List<Entry> ranked = new ArrayList<>();
         for (RfPayloadCodec codec : codecs) {
