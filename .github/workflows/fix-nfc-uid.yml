@@ -1,0 +1,35 @@
+name: Fix NFC UID compile error
+
+on: [push]
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Fix Android NFC UID constant
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('app/src/main/java/com/yagay/nfcdoorcard/ConfigProvider.kt')
+          s = p.read_text()
+          marker = '        private const val PREFS_NAME = "nfc_config"\n'
+          if 'private const val ANDROID_NFC_UID' not in s:
+              if marker not in s:
+                  raise SystemExit('PREFS_NAME marker not found')
+              s = s.replace(marker, marker + '        private const val ANDROID_NFC_UID = 1027\n', 1)
+          s = s.replace('Process.NFC_UID', 'ANDROID_NFC_UID')
+          p.write_text(s)
+          PY
+      - name: Commit fix
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app/src/main/java/com/yagay/nfcdoorcard/ConfigProvider.kt
+          git commit -m "fix: use explicit Android NFC UID constant" || exit 0
+          git push
