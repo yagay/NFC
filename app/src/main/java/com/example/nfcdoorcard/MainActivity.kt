@@ -38,6 +38,8 @@ enum class LogSource(val label: String) {
     NFC("NFC"), HAL("HAL"), PROVIDER("Provider"), APP("App")
 }
 
+enum class StatusTone { OK, IDLE, BUSY, WARNING, ERROR }
+
 data class RuntimeStatus(
     val appBuild: Int = 0,
     val hookBuild: Int = 0,
@@ -320,16 +322,96 @@ class MainActivity : ComponentActivity() {
 
     @Composable
     private fun RuntimeStatusPanel(status: RuntimeStatus, operationMessage: String?) {
+        val hookReady = status.currentPid > 0 && status.scopeOk && status.hookInstalled && status.hookBuild == EXPECTED_HOOK_BUILD
+        val commandTone = when (status.commandStatus) {
+            "SUCCESS" -> StatusTone.OK
+            "PENDING", "RUNNING", "TRIGGERED" -> StatusTone.BUSY
+            "FAILED", "TRIGGER_FAILED", "OBSERVER_FAILED" -> StatusTone.ERROR
+            "IDLE", "" -> StatusTone.IDLE
+            else -> StatusTone.WARNING
+        }
+
+        val applyVerified = status.simulationEnabled &&
+            status.rfStatus == "RF_UID_APPLIED" &&
+            status.rfResult == "0" &&
+            status.rfVerification == "NATIVE_RESULT" &&
+            status.rfUid.equals(status.selectedUid, ignoreCase = true)
+
+        val simulationTone: StatusTone
+        val simulationDetail: String
+        if (status.simulationEnabled) {
+            when {
+                applyVerified -> {
+                    simulationTone = StatusTone.OK
+                    simulationDetail = "模拟已生效 · UID=${status.selectedUid ?: "-"}"
+                }
+                status.commandStatus == "FAILED" || status.commandStatus == "TRIGGER_FAILED" -> {
+                    simulationTone = StatusTone.ERROR
+                    simulationDetail = "模拟失败 · ${status.commandStatus}"
+                }
+                status.rfStatus.startsWith("STALE") -> {
+                    simulationTone = StatusTone.WARNING
+                    simulationDetail = "模拟已请求，但 RF 状态来自旧 NFC 进程"
+                }
+                else -> {
+                    simulationTone = StatusTone.BUSY
+                    simulationDetail = "正在应用 · UID=${status.selectedUid ?: "-"}"
+                }
+            }
+        } else {
+            when {
+                status.rfStatus == "RF_STOCK_RESTORED" && status.rfResult == "0" && status.rfVerification == "NATIVE_RESULT" -> {
+                    simulationTone = StatusTone.OK
+                    simulationDetail = "模拟已停止 · 原厂 RF 已由 native 确认恢复"
+                }
+                status.rfStatus == "RF_STOCK_RESTORED_BY_RESTART" && status.rfVerification == "PROCESS_RESTART" -> {
+                    simulationTone = StatusTone.WARNING
+                    simulationDetail = "模拟已停止 · 原厂 RF 通过 NFC 进程重启恢复"
+                }
+                status.rfStatus == "STOPPING" || (status.commandAction == "STOP" && status.commandStatus in setOf("PENDING", "RUNNING", "TRIGGERED")) -> {
+                    simulationTone = StatusTone.BUSY
+                    simulationDetail = "正在停止模拟并恢复原厂 RF"
+                }
+                status.rfStatus.startsWith("STALE") -> {
+                    simulationTone = StatusTone.WARNING
+                    simulationDetail = "模拟未启用 · 检测到旧 NFC 进程遗留 RF 状态"
+                }
+                else -> {
+                    simulationTone = StatusTone.IDLE
+                    simulationDetail = "未启用模拟"
+                }
+            }
+        }
+
+        val rfTone = when {
+            status.rfStatus == "RF_UID_APPLIED" && status.rfResult == "0" && status.rfVerification == "NATIVE_RESULT" -> StatusTone.OK
+            status.rfStatus == "RF_STOCK_RESTORED" && status.rfResult == "0" && status.rfVerification == "NATIVE_RESULT" -> StatusTone.OK
+            status.rfStatus == "RF_STOCK_RESTORED_BY_RESTART" && status.rfVerification == "PROCESS_RESTART" -> StatusTone.WARNING
+            status.rfStatus in setOf("WAITING", "APPLYING", "STOPPING") -> StatusTone.BUSY
+            status.rfStatus == "IDLE" -> StatusTone.IDLE
+            status.rfStatus.startsWith("STALE") -> StatusTone.WARNING
+            status.rfStatus.contains("FAILED") || !status.rfError.isNullOrBlank() -> StatusTone.ERROR
+            else -> StatusTone.WARNING
+        }
+
         Card(Modifier.fillMaxWidth().padding(8.dp)) {
             Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Text("运行状态", fontWeight = FontWeight.Bold)
-                StatusRow("NFC / Hook", status.currentPid > 0 && status.hookInstalled, "pid=${status.currentPid} · hookBuild=${status.hookBuild} · hookPid=${status.hookPid}")
-                StatusRow("模拟配置", status.simulationEnabled, if (status.simulationEnabled) "UID=${status.selectedUid ?: "-"}" else "IDLE")
-                StatusRow("命令", status.commandStatus == "SUCCESS", "gen=${status.commandGeneration}/${status.handledGeneration} · ${status.commandAction} · ${status.commandStatus} · pid=${status.commandPid}")
                 StatusRow(
-                    "RF UID",
-                    status.rfStatus == "RF_UID_APPLIED" && status.rfResult == "0" || status.rfStatus.startsWith("RF_STOCK_RESTORED"),
-                    "${status.rfStatus} · gen=${status.rfGeneration} · uid=${status.rfUid ?: "-"} · result=${status.rfResult ?: "-"} · verify=${status.rfVerification ?: "-"}"
+                    "NFC / Hook",
+                    if (hookReady) StatusTone.OK else StatusTone.ERROR,
+                    "pid=${status.currentPid} · hookBuild=${status.hookBuild}/$EXPECTED_HOOK_BUILD · hookPid=${status.hookPid}"
+                )
+                StatusRow("模拟状态", simulationTone, simulationDetail)
+                StatusRow(
+                    "命令",
+                    commandTone,
+                    "gen=${status.commandGeneration}/${status.handledGeneration} · ${status.commandAction.ifBlank { "IDLE" }} · ${status.commandStatus} · pid=${status.commandPid}"
+                )
+                StatusRow(
+                    "RF 状态",
+                    rfTone,
+                    "${status.rfStatus} · gen=${status.rfGeneration} · pid=${status.rfPid} · uid=${status.rfUid ?: "-"} · result=${status.rfResult ?: "-"} · verify=${status.rfVerification ?: "-"}"
                 )
                 Text("触发方式: LSPosed · com.android.nfc 进程内控制", fontSize = 11.sp)
                 Text("读卡模式: ${if (readModeEnabled) "开启" else "关闭"}", fontSize = 11.sp)
@@ -376,9 +458,23 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun StatusRow(label: String, ok: Boolean, detail: String) {
+    private fun StatusRow(label: String, tone: StatusTone, detail: String) {
+        val symbol = when (tone) {
+            StatusTone.OK -> "●"
+            StatusTone.IDLE -> "●"
+            StatusTone.BUSY -> "●"
+            StatusTone.WARNING -> "▲"
+            StatusTone.ERROR -> "●"
+        }
+        val color = when (tone) {
+            StatusTone.OK -> Color(0xFF2E7D32)
+            StatusTone.IDLE -> Color.Gray
+            StatusTone.BUSY -> Color(0xFF1565C0)
+            StatusTone.WARNING -> Color(0xFFF9A825)
+            StatusTone.ERROR -> Color(0xFFC62828)
+        }
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Text(if (ok) "●" else "○", color = if (ok) Color(0xFF2E7D32) else Color(0xFFC62828), fontSize = 18.sp)
+            Text(symbol, color = color, fontSize = 18.sp)
             Spacer(Modifier.width(8.dp))
             Column { Text(label, fontWeight = FontWeight.SemiBold, fontSize = 13.sp); Text(detail, fontSize = 11.sp) }
         }
@@ -594,6 +690,14 @@ class MainActivity : ComponentActivity() {
         val currentPid = if (includeRootPid) currentNfcPid().toIntOrNull() ?: 0
         else hookPid.takeIf { it > 0 } ?: commandPid.takeIf { it > 0 } ?: scopePid.takeIf { it > 0 } ?: rfPid
         val hookBuild = map[ConfigProvider.KEY_HOOK_BUILD]?.toIntOrNull() ?: 0
+        val rawRfStatus = map[ConfigProvider.KEY_RF_STATUS] ?: "IDLE"
+        val rfFresh = currentPid > 0 && rfPid > 0 && rfPid == currentPid
+        val visibleRfStatus = when {
+            rawRfStatus == "IDLE" -> "IDLE"
+            rfFresh -> rawRfStatus
+            rfPid == 0 && rawRfStatus in setOf("WAITING", "APPLYING", "STOPPING") -> rawRfStatus
+            else -> "STALE($rawRfStatus)"
+        }
         return RuntimeStatus(
             appBuild = map[ConfigProvider.KEY_APP_BUILD]?.toIntOrNull() ?: 0,
             hookBuild = hookBuild,
@@ -610,14 +714,14 @@ class MainActivity : ComponentActivity() {
             commandStatus = map[ConfigProvider.KEY_COMMAND_STATUS] ?: "IDLE",
             commandDetail = map[ConfigProvider.KEY_COMMAND_DETAIL]?.takeIf { it.isNotBlank() },
             commandPid = commandPid,
-            rfStatus = if (rfPid == currentPid && currentPid > 0) map[ConfigProvider.KEY_RF_STATUS] ?: "WAITING" else if (map[ConfigProvider.KEY_RF_STATUS] == "IDLE") "IDLE" else map[ConfigProvider.KEY_RF_STATUS] ?: "STALE",
-            rfUid = if (rfPid == currentPid) map[ConfigProvider.KEY_RF_UID]?.takeIf { it.isNotBlank() } else null,
-            rfSource = if (rfPid == currentPid) map[ConfigProvider.KEY_RF_SOURCE]?.takeIf { it.isNotBlank() } else null,
-            rfResult = if (rfPid == currentPid) map[ConfigProvider.KEY_RF_RESULT]?.takeIf { it.isNotBlank() } else null,
-            rfError = if (rfPid == currentPid) map[ConfigProvider.KEY_RF_ERROR]?.takeIf { it.isNotBlank() } else null,
+            rfStatus = visibleRfStatus,
+            rfUid = if (rfFresh) map[ConfigProvider.KEY_RF_UID]?.takeIf { it.isNotBlank() } else null,
+            rfSource = if (rfFresh) map[ConfigProvider.KEY_RF_SOURCE]?.takeIf { it.isNotBlank() } else null,
+            rfResult = if (rfFresh) map[ConfigProvider.KEY_RF_RESULT]?.takeIf { it.isNotBlank() } else null,
+            rfError = if (rfFresh) map[ConfigProvider.KEY_RF_ERROR]?.takeIf { it.isNotBlank() } else null,
             rfPid = rfPid,
             rfGeneration = map[ConfigProvider.KEY_RF_GENERATION]?.toLongOrNull() ?: 0L,
-            rfVerification = if (rfPid == currentPid) map[ConfigProvider.KEY_RF_VERIFICATION]?.takeIf { it.isNotBlank() } else null,
+            rfVerification = if (rfFresh) map[ConfigProvider.KEY_RF_VERIFICATION]?.takeIf { it.isNotBlank() } else null,
             fullDiagStage = map[ConfigProvider.KEY_FULL_DIAG_STAGE]?.takeIf { it.isNotBlank() },
             fullDiagSummary = map[ConfigProvider.KEY_FULL_DIAG_SUMMARY]?.takeIf { it.isNotBlank() }
         )
