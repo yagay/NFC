@@ -23,9 +23,10 @@ import com.yagay.nfcdoorcard.xposed.profile.HookProfileStore;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+
+import static com.yagay.nfcdoorcard.xposed.NfcHookUtils.*;
 
 import io.github.libxposed.api.XposedModule;
 import io.github.libxposed.api.XposedModuleInterface;
@@ -1574,110 +1575,4 @@ public class NfcInjectionModule extends XposedModule {
         }
     }
 
-    private static Context currentContext() {
-        Application app = currentApplication();
-        if (app != null) return app;
-        try {
-            Class<?> at = Class.forName("android.app.ActivityThread");
-            Method current = at.getDeclaredMethod("currentActivityThread");
-            current.setAccessible(true);
-            Object thread = current.invoke(null);
-            if (thread == null) return null;
-            Method systemContext = at.getDeclaredMethod("getSystemContext");
-            systemContext.setAccessible(true);
-            Object ctx = systemContext.invoke(thread);
-            return ctx instanceof Context ? (Context) ctx : null;
-        } catch (Throwable ignored) { return null; }
-    }
-
-    private static Application currentApplication() {
-        try {
-            Class<?> at = Class.forName("android.app.ActivityThread");
-            Method m = at.getDeclaredMethod("currentApplication");
-            m.setAccessible(true);
-            return (Application) m.invoke(null);
-        } catch (Throwable ignored) { return null; }
-    }
-
-    private static Thread daemon(Runnable r, String name) {
-        Thread t = new Thread(r, name); t.setDaemon(true); return t;
-    }
-
-    private static String normalizeUid(String uid) {
-        return uid == null ? "" : uid.replaceAll("[^0-9A-Fa-f]", "").toUpperCase(Locale.ROOT);
-    }
-
-    private static int findSingleByteArrayArg(Object[] args) {
-        if (args == null || args.length == 0) return -1;
-        int index = -1;
-        for (int i = 0; i < args.length; i++) {
-            if (args[i] instanceof byte[]) {
-                if (index >= 0) return -1;
-                index = i;
-            }
-        }
-        return index;
-    }
-
-    private static NativeOutcome interpretNativeResult(Method method, Object result) {
-        Class<?> type = method == null ? null : method.getReturnType();
-        if (type == Void.TYPE) return new NativeOutcome(true, "null", "void");
-        if (type == Boolean.TYPE || type == Boolean.class) {
-            boolean ok = Boolean.TRUE.equals(result);
-            return new NativeOutcome(ok, String.valueOf(result), "boolean");
-        }
-        if (result instanceof Number) {
-            boolean ok = ((Number) result).intValue() == 0;
-            return new NativeOutcome(ok, String.valueOf(result), type == null ? result.getClass().getName() : type.getName());
-        }
-        return new NativeOutcome(false, String.valueOf(result), type == null ? "unknown" : type.getName());
-    }
-
-    private static byte[] hexToBytes(String hex) {
-        byte[] out = new byte[hex.length() / 2];
-        for (int i = 0; i < out.length; i++) out[i] = (byte) Integer.parseInt(hex.substring(i * 2, i * 2 + 2), 16);
-        return out;
-    }
-
-    private static long parseLong(String value, long fallback) {
-        try { return Long.parseLong(value); } catch (Throwable ignored) { return fallback; }
-    }
-
-    private static void sleep(long millis) {
-        try { Thread.sleep(millis); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
-    }
-
-    private static final class NativeOutcome {
-        final boolean accepted;
-        final String rawValue;
-        final String resultType;
-
-        NativeOutcome(boolean accepted, String rawValue, String resultType) {
-            this.accepted = accepted;
-            this.rawValue = rawValue == null ? "" : rawValue;
-            this.resultType = resultType == null ? "unknown" : resultType;
-        }
-
-        static NativeOutcome notInvoked() { return new NativeOutcome(false, "", "not-invoked"); }
-        static NativeOutcome lifecycleAccepted(String source) { return new NativeOutcome(true, source, "lifecycle"); }
-    }
-
-    private static final class SimConfig {
-        final boolean initialized, active, diagnostics;
-        final String uid, commandAction, commandStatus;
-        final long generation, consumedGeneration, handledGeneration, controllerEpoch;
-        final int commandPid;
-        SimConfig(boolean initialized, boolean active, String uid, boolean diagnostics, long generation,
-                  long consumedGeneration, long handledGeneration, String commandAction, String commandStatus, int commandPid, long controllerEpoch) {
-            this.initialized = initialized; this.active = active; this.uid = uid; this.diagnostics = diagnostics;
-            this.generation = generation; this.consumedGeneration = consumedGeneration; this.handledGeneration = handledGeneration;
-            this.commandAction = commandAction; this.commandStatus = commandStatus; this.commandPid = commandPid;
-            this.controllerEpoch = controllerEpoch;
-        }
-        SimConfig withControllerEpoch(long epoch) {
-            return new SimConfig(initialized, active, uid, diagnostics, generation, consumedGeneration, handledGeneration,
-                    commandAction, commandStatus, commandPid, epoch);
-        }
-        static SimConfig uninitialized() { return new SimConfig(false, false, null, false, 0L, Long.MIN_VALUE, Long.MIN_VALUE, "", "", 0, 0L); }
-    }
 }

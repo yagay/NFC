@@ -1,9 +1,6 @@
 package com.yagay.nfcdoorcard
 
-import android.content.ContentValues
 import android.os.Bundle
-import android.os.Environment
-import android.provider.MediaStore
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -30,7 +27,6 @@ import com.yagay.nfcdoorcard.nfc.NfcReaderController
 import com.yagay.nfcdoorcard.system.NfcSystemService
 import com.yagay.nfcdoorcard.system.RootShell
 import com.yagay.nfcdoorcard.ui.*
-import java.util.concurrent.Executors
 
 class MainActivity : ComponentActivity() {
     companion object { private const val EXPECTED_HOOK_BUILD = BuildConfig.HOOK_BUILD }
@@ -41,8 +37,8 @@ class MainActivity : ComponentActivity() {
     private lateinit var runtimeRepository: RuntimeStatusRepository
     private lateinit var configClient: ConfigClient
     private lateinit var diagnosticsCollector: DiagnosticsCollector
-    private val operationExecutor = Executors.newSingleThreadExecutor()
-    private val diagnosticExecutor = Executors.newSingleThreadExecutor()
+    private lateinit var diagnosticExporter: DiagnosticExporter
+    private lateinit var simulationCoordinator: SimulationCoordinator
     private var scannedCardState by mutableStateOf<CardModel?>(null)
     private var savedCardsState by mutableStateOf<List<CardModel>>(emptyList())
     private var readModeEnabled by mutableStateOf(false)
@@ -56,6 +52,8 @@ class MainActivity : ComponentActivity() {
         runtimeRepository = RuntimeStatusRepository(this, nfcSystemService)
         configClient = ConfigClient(contentResolver)
         diagnosticsCollector = DiagnosticsCollector(this, rootShell, nfcSystemService, runtimeRepository, cardRepository)
+        diagnosticExporter = DiagnosticExporter(this, diagnosticsCollector)
+        simulationCoordinator = SimulationCoordinator(configClient, runtimeRepository, nfcSystemService, EXPECTED_HOOK_BUILD)
         savedCardsState = cardRepository.load()
         AppLogger.i("NFC controller started; LSPosed in-process command engine enabled")
         enableEdgeToEdge()
@@ -77,8 +75,8 @@ class MainActivity : ComponentActivity() {
     override fun onPause() { disableReadDispatch(); super.onPause() }
     override fun onDestroy() {
         disableReadDispatch()
-        operationExecutor.shutdownNow()
-        diagnosticExecutor.shutdownNow()
+        simulationCoordinator.close()
+        diagnosticExporter.close()
         super.onDestroy()
     }
 
@@ -147,9 +145,9 @@ class MainActivity : ComponentActivity() {
                     val logStatus = readRuntimeStatus(includeRootPid = false)
                     val raw = diagnosticsCollector.fetchLogs(selectedSource)
                     val text = if (selectedSource == LogSource.STATUS) buildStatusSummary(logStatus) + "\n\n" + raw else raw
-                    boundedLogLines(text)
+                    RuntimeText.boundedLines(text)
                 }
-                updateLogWindow(logLines, incoming)
+                RuntimeText.updateWindow(logLines, incoming)
                 kotlinx.coroutines.delay(2000)
             }
         }
@@ -283,109 +281,13 @@ class MainActivity : ComponentActivity() {
 
     private fun simulateCard(card: CardModel, onDone: (RuntimeStatus, String) -> Unit) {
         stopReadMode("simulation_start")
-        val generation = publishCommand(enabled = true, card = card)
-        AppLogger.i("SIMULATION: COMMAND APPLY published generation=$generation uid=${card.uid} sak=${card.sak} atqa=${card.atqa}")
-        operationExecutor.execute {
-            var state = readRuntimeStatus(includeRootPid = true)
-            if (!state.hookInstalled || state.hookBuild != EXPECTED_HOOK_BUILD) {
-                val restart = restartNfcProcessKeepingEnabled("load_hook_build_$EXPECTED_HOOK_BUILD")
-                AppLogger.i("SIMULATION: restarting stale/unavailable hook for command generation=$generation\n$restart")
-                state = waitForHookOnly(12_000)
-            }
-            state = waitForCommandCompletion(generation, card.uid, apply = true, timeoutMs = 12_000)
-            val applied = isApplySuccess(state, generation, card.uid)
-            val message = when {
-                applied -> "模拟成功 · UID=${card.uid} · NFC进程内确认"
-                !state.hookInstalled -> "模拟请求已保存，但 Hook 未就绪"
-                state.commandGeneration != generation -> "模拟请求被更新的命令替代"
-                state.commandStatus == "FAILED" || state.commandStatus == "TRIGGER_FAILED" -> "模拟失败 · ${state.commandStatus}: ${state.commandDetail ?: state.rfError ?: "unknown"}"
-                else -> "模拟请求已发送 · 等待 RF UID 确认"
-            }
-            AppLogger.i("SIMULATION: COMMAND result generation=$generation message=$message\n${buildStatusSummary(state)}")
-            onDone(state, message)
-        }
+        simulationCoordinator.simulate(card, onDone)
     }
 
     private fun stopSimulation(onDone: (RuntimeStatus, String) -> Unit) {
         stopReadMode("simulation_stop")
-        val generation = publishCommand(enabled = false, card = null)
-        AppLogger.i("SIMULATION: COMMAND STOP published generation=$generation")
-        operationExecutor.execute {
-            var state = waitForCommandCompletion(generation, null, apply = false, timeoutMs = 6_000)
-            if (isStopSuccess(state, generation)) {
-                AppLogger.i("SIMULATION: STOP success without restart generation=$generation\n${buildStatusSummary(state)}")
-                onDone(state, "模拟已停止 · 原厂 RF 已由 NFC 进程恢复")
-                return@execute
-            }
-
-            AppLogger.i("SIMULATION: STOP handoff snapshot before fallback generation=$generation\n${buildStatusSummary(state)}\nPROVIDER=${readProviderMap().toSortedMap()}")
-            if (!isCurrentCommandGeneration(generation)) {
-                state = readRuntimeStatus(includeRootPid = true)
-                AppLogger.i("SIMULATION: STOP fallback cancelled because generation=$generation is no longer current")
-                onDone(state, "停止请求已被更新的命令替代")
-                return@execute
-            }
-            val restart = restartNfcProcessKeepingEnabled("stop_command_fallback_generation_$generation")
-            AppLogger.i("SIMULATION: STOP fallback NFC restart generation=$generation\n$restart")
-            waitForHookOnly(12_000)
-            state = waitForCommandCompletion(generation, null, apply = false, timeoutMs = 6_000)
-
-            if (!isStopSuccess(state, generation) && isCurrentCommandGeneration(generation)) {
-                val currentPid = currentNfcPid().toIntOrNull() ?: state.currentPid
-                configClient.confirmStockRestart(generation, currentPid)
-                state = readRuntimeStatus(includeRootPid = true)
-            }
-
-            val message = if (isStopSuccess(state, generation)) "模拟已停止 · 已恢复原厂 RF" else "模拟已停止 · NFC 已重启，但状态确认未完成"
-            onDone(state, message)
-        }
+        simulationCoordinator.stop(onDone)
     }
-
-    private fun publishCommand(enabled: Boolean, card: CardModel?): Long =
-        configClient.publishCommand(enabled, card)
-
-    private fun restartNfcProcessKeepingEnabled(reason: String): String =
-        nfcSystemService.restartNfcProcessKeepingEnabled(reason)
-
-    private fun waitForCommandCompletion(generation: Long, uid: String?, apply: Boolean, timeoutMs: Long): RuntimeStatus {
-        val end = System.currentTimeMillis() + timeoutMs
-        var state = RuntimeStatus()
-        while (System.currentTimeMillis() < end) {
-            state = readRuntimeStatus(includeRootPid = true)
-            if (if (apply) isApplySuccess(state, generation, uid.orEmpty()) else isStopSuccess(state, generation)) return state
-            if (state.commandGeneration == generation && state.commandStatus == "RESTART_REQUIRED" && state.consumedGeneration == generation) return state
-            if (state.commandGeneration == generation && state.handledGeneration == generation && state.commandStatus == "FAILED") return state
-            Thread.sleep(100)
-        }
-        return state
-    }
-
-    private fun isApplySuccess(state: RuntimeStatus, generation: Long, uid: String): Boolean =
-        state.commandGeneration == generation && state.handledGeneration == generation && state.commandStatus == "SUCCESS" &&
-            state.currentPid > 0 && state.commandPid == state.currentPid && state.rfGeneration == generation &&
-            state.rfPid == state.currentPid && state.operationState == "IDLE" && state.effectiveState == "ACTIVE" &&
-            state.verificationConfidence == "VERIFIED" && state.rfAccepted && state.rfUid.equals(uid, ignoreCase = true)
-
-    private fun isStopSuccess(state: RuntimeStatus, generation: Long): Boolean {
-        val common = state.commandGeneration == generation && state.handledGeneration == generation &&
-            state.commandStatus == "SUCCESS" && state.currentPid > 0 && state.commandPid == state.currentPid &&
-            state.rfGeneration == generation && state.rfPid == state.currentPid
-        return common && state.operationState == "IDLE" && state.effectiveState == "STOCK" &&
-            state.verificationConfidence == "VERIFIED" && state.rfAccepted
-    }
-
-    private fun waitForHookOnly(timeoutMs: Long): RuntimeStatus {
-        val end = System.currentTimeMillis() + timeoutMs
-        var state = RuntimeStatus()
-        while (System.currentTimeMillis() < end) {
-            state = readRuntimeStatus(includeRootPid = true)
-            if (state.hookInstalled && state.hookBuild == EXPECTED_HOOK_BUILD) return state
-            Thread.sleep(200)
-        }
-        return state
-    }
-
-    private fun isCurrentCommandGeneration(generation: Long): Boolean = runtimeRepository.isCurrentCommandGeneration(generation)
 
     private fun getSimulationEnabled(): Boolean = runtimeRepository.simulationEnabled()
 
@@ -397,71 +299,19 @@ class MainActivity : ComponentActivity() {
     private fun readRuntimeStatus(includeRootPid: Boolean = false): RuntimeStatus =
         runtimeRepository.read(includeRootPid)
 
-    private fun buildStatusSummary(s: RuntimeStatus): String = buildString {
-        appendLine("=== CURRENT STATUS ===")
-        appendLine("BUILD: app=${s.appBuild} hook=${s.hookBuild} expectedHook=$EXPECTED_HOOK_BUILD")
-        appendLine("PID: current=${s.currentPid} runtime=${s.runtimePid} scope=${s.scopePid} hook=${s.hookPid} command=${s.commandPid} rf=${s.rfPid}")
-        appendLine("SCOPE: ${if (s.scopeOk) "SUCCESS" else "NOT DETECTED/STALE"}")
-        appendLine("HOOK: ${if (s.hookInstalled) "SUCCESS" else "NOT INSTALLED/STALE"}")
-        appendLine("CONFIG: ${if (s.simulationEnabled) "ENABLED" else "IDLE"} uid=${s.selectedUid}")
-        appendLine("SEMANTIC: operation=${s.operationState} effective=${s.effectiveState} confidence=${s.verificationConfidence} accepted=${s.rfAccepted}")
-        appendLine("COMMAND: generation=${s.commandGeneration} consumed=${s.consumedGeneration} completed=${s.handledGeneration} action=${s.commandAction} status=${s.commandStatus} detail=${s.commandDetail}")
-        appendLine("READ_MODE: ${if (readModeEnabled) "ENABLED" else "IDLE"}")
-        appendLine("RF: generation=${s.rfGeneration} ${s.rfStatus} uid=${s.rfUid} source=${s.rfSource} result=${s.rfResult} raw=${s.rfNativeResult}/${s.rfNativeResultType} verification=${s.rfVerification} error=${s.rfError}")
-        append("FINAL: stage=${s.fullDiagStage} summary=${s.fullDiagSummary}")
-    }
-
-    private fun currentNfcPid(): String = nfcSystemService.currentNfcPid()
-
-    private fun boundedLogLines(text: String, maxLines: Int = 1800): List<String> {
-        if (text.isEmpty()) return emptyList()
-        val lines = text.lineSequence().toList()
-        return if (lines.size <= maxLines) lines else lines.takeLast(maxLines)
-    }
-
-    /**
-     * Applies the smallest prefix/suffix diff possible to the Compose state list instead of
-     * replacing/splitting the entire log inside composition every refresh. The window is bounded
-     * by boundedLogLines(), so memory and recomposition cost stay predictable.
-     */
-    private fun updateLogWindow(target: MutableList<String>, incoming: List<String>) {
-        var prefix = 0
-        val commonLimit = minOf(target.size, incoming.size)
-        while (prefix < commonLimit && target[prefix] == incoming[prefix]) prefix++
-
-        var suffix = 0
-        while (suffix < commonLimit - prefix &&
-            target[target.size - 1 - suffix] == incoming[incoming.size - 1 - suffix]) {
-            suffix++
-        }
-
-        val removeUntil = target.size - suffix
-        for (i in removeUntil - 1 downTo prefix) target.removeAt(i)
-        val addUntil = incoming.size - suffix
-        if (prefix < addUntil) target.addAll(prefix, incoming.subList(prefix, addUntil))
-    }
+    private fun buildStatusSummary(s: RuntimeStatus): String =
+        RuntimeText.statusSummary(s, EXPECTED_HOOK_BUILD, readModeEnabled)
 
     private fun saveDiagnosticWithoutSharing(onDone: () -> Unit) {
         stopReadMode("diagnostic_save")
-        diagnosticExecutor.execute {
-            var createdUri: android.net.Uri? = null
-            try {
-                val fileName = "nfc_fullcheck_${BuildConfig.VERSION_NAME}_${System.currentTimeMillis()}.txt"
-                val values = ContentValues().apply {
-                    put(MediaStore.MediaColumns.DISPLAY_NAME, fileName); put(MediaStore.MediaColumns.MIME_TYPE, "text/plain")
-                    put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS); put(MediaStore.MediaColumns.IS_PENDING, 1)
+        diagnosticExporter.export(::buildStatusSummary) { result ->
+            runOnUiThread {
+                onDone()
+                result.onSuccess { fileName ->
+                    Toast.makeText(this, "日志已保存到 Download/$fileName", Toast.LENGTH_LONG).show()
+                }.onFailure { error ->
+                    Toast.makeText(this, "检测失败: ${error.message}", Toast.LENGTH_LONG).show()
                 }
-                createdUri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values) ?: error("无法在 Download 创建日志文件")
-                contentResolver.openOutputStream(createdUri, "w")?.bufferedWriter()?.use {
-                    it.write(diagnosticsCollector.buildFullReport(::buildStatusSummary))
-                } ?: error("无法写入日志文件")
-                contentResolver.update(createdUri, ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }, null, null)
-                AppLogger.i("Diagnostics saved to public Downloads: $fileName uri=$createdUri")
-                runOnUiThread { onDone(); Toast.makeText(this@MainActivity, "日志已保存到 Download/$fileName", Toast.LENGTH_LONG).show() }
-            } catch (e: Exception) {
-                createdUri?.let { runCatching { contentResolver.delete(it, null, null) } }
-                AppLogger.i("Diagnostics failed ${e.javaClass.simpleName}: ${e.message}")
-                runOnUiThread { onDone(); Toast.makeText(this@MainActivity, "检测失败: ${e.message}", Toast.LENGTH_LONG).show() }
             }
         }
     }
