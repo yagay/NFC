@@ -22,7 +22,7 @@ class RootShell(context: Context) {
         if (!ensureRootAccess(showToast)) return "ROOT_UNAVAILABLE"
         return try {
             val process = ProcessBuilder("su", "-c", command).redirectErrorStream(true).start()
-            val output = StringBuilder()
+            val output = StringBuffer()
             val reader = Thread({
                 runCatching {
                     process.inputStream.bufferedReader().useLines { lines ->
@@ -58,6 +58,7 @@ class RootShell(context: Context) {
         rootCacheCheckedAt = 0L
     }
 
+    @Synchronized
     private fun ensureRootAccess(showToast: Boolean): Boolean {
         val now = SystemClock.elapsedRealtime()
         rootAvailableCache?.let { cached ->
