@@ -12,8 +12,8 @@ android {
         applicationId = "com.example.nfcdoorcard"
         minSdk = 31
         targetSdk = 35
-        versionCode = 33
-        versionName = "1.0.32"
+        versionCode = 34
+        versionName = "1.0.33"
 
         // Runtime protocol v6; trigger-closed-loop hook build 24 is verified with this app build.
         // App architecture is split into runtime repository, NFC dispatcher, system service and UI components.
