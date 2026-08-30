@@ -6,7 +6,7 @@
     <uses-feature android:name="android.hardware.nfc" android:required="true" />
 
     <application
-        android:allowBackup="true"
+        android:allowBackup="false"
         android:description="@string/module_description"
         android:label="@string/app_name"
         android:supportsRtl="true"
