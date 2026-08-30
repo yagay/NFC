@@ -187,7 +187,7 @@ class MainActivity : ComponentActivity() {
         LaunchedEffect(selectedSource, logsEnabled) {
             while (true) {
                 val snapshot = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-                    val newStatus = readRuntimeStatus(includeRootPid = logsEnabled)
+                    val newStatus = readRuntimeStatus(includeRootPid = true)
                     val logs = if (logsEnabled) fetchLogsSync(selectedSource) else ""
                     newStatus to logs
                 }
@@ -323,12 +323,20 @@ class MainActivity : ComponentActivity() {
     @Composable
     private fun RuntimeStatusPanel(status: RuntimeStatus, operationMessage: String?) {
         val hookReady = status.currentPid > 0 && status.scopeOk && status.hookInstalled && status.hookBuild == EXPECTED_HOOK_BUILD
-        val commandTone = when (status.commandStatus) {
-            "SUCCESS" -> StatusTone.OK
-            "PENDING", "RUNNING", "TRIGGERED" -> StatusTone.BUSY
-            "FAILED", "TRIGGER_FAILED", "OBSERVER_FAILED" -> StatusTone.ERROR
-            "IDLE", "" -> StatusTone.IDLE
-            else -> StatusTone.WARNING
+        val commandInFlight = status.commandStatus in setOf("PENDING", "RUNNING", "TRIGGERED") &&
+            status.commandGeneration != status.handledGeneration
+        val commandTone = when {
+            commandInFlight -> StatusTone.BUSY
+            status.commandStatus in setOf("FAILED", "TRIGGER_FAILED", "OBSERVER_FAILED") -> StatusTone.ERROR
+            else -> StatusTone.IDLE
+        }
+        val commandDisplay = when {
+            commandInFlight -> "执行中 · gen=${status.commandGeneration}/${status.handledGeneration} · ${status.commandAction.ifBlank { "UNKNOWN" }} · ${status.commandStatus} · pid=${status.commandPid}"
+            status.commandStatus == "SUCCESS" && status.commandGeneration == status.handledGeneration ->
+                "当前空闲 · 最近操作 ${status.commandAction.ifBlank { "UNKNOWN" }} 成功 · gen=${status.commandGeneration} · pid=${status.commandPid}"
+            status.commandStatus in setOf("FAILED", "TRIGGER_FAILED", "OBSERVER_FAILED") ->
+                "最近操作 ${status.commandAction.ifBlank { "UNKNOWN" }} 失败 · ${status.commandStatus} · gen=${status.commandGeneration} · pid=${status.commandPid}"
+            else -> "当前空闲 · 暂无命令"
         }
 
         val applyVerified = status.simulationEnabled &&
@@ -368,7 +376,7 @@ class MainActivity : ComponentActivity() {
                     simulationTone = StatusTone.WARNING
                     simulationDetail = "模拟已停止 · 原厂 RF 通过 NFC 进程重启恢复"
                 }
-                status.rfStatus == "STOPPING" || (status.commandAction == "STOP" && status.commandStatus in setOf("PENDING", "RUNNING", "TRIGGERED")) -> {
+                status.rfStatus == "STOPPING" || (status.commandAction == "STOP" && commandInFlight) -> {
                     simulationTone = StatusTone.BUSY
                     simulationDetail = "正在停止模拟并恢复原厂 RF"
                 }
@@ -403,11 +411,7 @@ class MainActivity : ComponentActivity() {
                     "pid=${status.currentPid} · hookBuild=${status.hookBuild}/$EXPECTED_HOOK_BUILD · hookPid=${status.hookPid}"
                 )
                 StatusRow("模拟状态", simulationTone, simulationDetail)
-                StatusRow(
-                    "命令",
-                    commandTone,
-                    "gen=${status.commandGeneration}/${status.handledGeneration} · ${status.commandAction.ifBlank { "IDLE" }} · ${status.commandStatus} · pid=${status.commandPid}"
-                )
+                StatusRow("命令", commandTone, commandDisplay)
                 StatusRow(
                     "RF 状态",
                     rfTone,
@@ -416,7 +420,7 @@ class MainActivity : ComponentActivity() {
                 Text("触发方式: LSPosed · com.android.nfc 进程内控制", fontSize = 11.sp)
                 Text("读卡模式: ${if (readModeEnabled) "开启" else "关闭"}", fontSize = 11.sp)
                 operationMessage?.let { Text(it, fontSize = 11.sp, color = Color.Gray) }
-                status.commandDetail?.takeIf { it.isNotBlank() }?.let { Text("Command: $it", fontSize = 10.sp, color = Color.Gray) }
+                status.commandDetail?.takeIf { it.isNotBlank() }?.let { Text("最近命令: $it", fontSize = 10.sp, color = Color.Gray) }
                 status.rfError?.takeIf { it.isNotBlank() }?.let { Text("RF error: $it", fontSize = 10.sp, color = Color.Red) }
             }
         }
@@ -818,7 +822,6 @@ class MainActivity : ComponentActivity() {
         appendLine("--- ROOT ---"); appendLine(runRootCmd("id; su -v 2>/dev/null || true"))
         appendLine("--- NFC PROCESS / HAL ---"); appendLine(runRootCmd("pm path com.android.nfc; pidof com.android.nfc; ps -A | grep -E 'android.hardware.nfc|vendor.oplus.hardware.nfc|com.android.nfc|$packageName'"))
         appendLine("--- NFC SERVICE FULL ---")
-        // Do not pipe dumpsys into head: closing the pipe early makes NfcService log EPIPE.
         appendLine(runRootCmd("dumpsys nfc 2>/dev/null", 25, 300_000))
         LogSource.entries.forEach { source -> appendLine(); appendLine("=== LOG SOURCE: ${source.name} / ${source.label} ==="); appendLine(fetchLogsSync(source)) }
     }
