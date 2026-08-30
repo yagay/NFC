@@ -102,7 +102,10 @@ public class NfcInjectionModule extends XposedModule {
     // readable, capture that exact in-process invocation and replay it once durable desired
     // state becomes available. This avoids depending on share-mode/Binder triggers for recovery.
     private volatile EarlyRfInvocation pendingEarlyRfInvocation;
+    private volatile EarlyRfInvocation lastVerifiedRfInvocation;
     private volatile boolean earlyReplayWorkerScheduled;
+    private volatile long lifecycleFailureGeneration = Long.MIN_VALUE;
+    private volatile long lifecycleFailureControllerEpoch = Long.MIN_VALUE;
 
     private volatile byte[] reversibleStockPayload;
     private volatile String reversibleTargetFingerprint;
@@ -233,6 +236,8 @@ public class NfcInjectionModule extends XposedModule {
             if (firstInvalid) lastControllerInvalidAt = now;
         }
         if (!firstInvalid) return;
+        lifecycleFailureGeneration = Long.MIN_VALUE;
+        lifecycleFailureControllerEpoch = Long.MIN_VALUE;
         invalidateRfEvidenceForControllerReset(reason);
         persistControllerLifecycle("INVALID", reason, "pid=" + Process.myPid());
         finishLifecycleRecovery(lifecycleRecoveryGeneration);
@@ -536,6 +541,7 @@ public class NfcInjectionModule extends XposedModule {
                     }
                 }
                 persistRestoreState();
+                captureVerifiedRfInvocation(method, chain.getThisObject(), args, target, pid);
                 clearEarlyRfInvocation(target.fingerprint());
                 if (lifecycleReapplyPending) {
                     if (isFinalReapplyWrite(cfg.generation, observedRfSequence)) {
@@ -771,6 +777,38 @@ public class NfcInjectionModule extends XposedModule {
                     " sequence=" + rfWriteSequence + " lastRfWriteAt=" + lastRfWriteAt);
 
             String lastFailure = settled ? "No final RF_CONFIG_WRITE observed" : "RF startup did not become quiet before final trigger";
+
+            // Primary recovery path: replay the exact native-accepted OEM RF invocation captured
+            // before the controller reset. This is especially reliable for adapter OFF -> ON where
+            // com.android.nfc stays in the same process. The reflected call re-enters this module's
+            // RF hook, so current UID rewrite, sequence proof and native result validation remain
+            // exactly the same as for a natural OEM call.
+            long replayBaseline;
+            synchronized (this) {
+                replayBaseline = rfWriteSequence;
+                finalReapplyBaselineSequence = replayBaseline;
+                finalReapplyArmed = true;
+            }
+            persistRfSequenceState("EXACT_REPLAY_ARMED", cfg.generation, replayBaseline, lastRfWriteAt);
+            if (replayVerifiedRfInvocation(cfg, uidHex, replayBaseline)) {
+                long replayRemaining = Math.max(0L, deadline - System.currentTimeMillis());
+                long replayWait = Math.min(LIFECYCLE_TRIGGER_WAIT_MS, replayRemaining);
+                if (replayWait > 0L && waitForLifecycleVerified(cfg.generation, pid, uidHex, replayWait)) {
+                    lifecycleFailureGeneration = Long.MIN_VALUE;
+                    lifecycleFailureControllerEpoch = Long.MIN_VALUE;
+                    return;
+                }
+                lastFailure = "Exact RF replay invoked but produced no FINAL verified RF_CONFIG_WRITE";
+            } else {
+                lastFailure = "Exact RF replay unavailable/failed";
+            }
+            synchronized (this) {
+                if (finalReapplyBaselineSequence == replayBaseline) finalReapplyArmed = false;
+            }
+
+            // Fallback only: some fresh processes do not yet have an exact replay template. Keep
+            // the existing share-mode/vendor trigger for those cases, but never treat its boolean
+            // return as RF success without a strictly newer accepted RF write.
             for (int attempt = 1; attempt <= LIFECYCLE_MAX_TRIGGER_ATTEMPTS && System.currentTimeMillis() < deadline; attempt++) {
                 SimConfig latest = readConfig();
                 if (!latest.initialized || !latest.active || latest.generation != cfg.generation) {
@@ -909,6 +947,8 @@ public class NfcInjectionModule extends XposedModule {
         v.put("rf_verification", "LIFECYCLE_REAPPLY_FAILED");
         v.put("full_diag_stage", "LIFECYCLE_REAPPLY_FAILED");
         v.put("full_diag_summary", detail == null ? "" : detail);
+        lifecycleFailureGeneration = cfg.generation;
+        lifecycleFailureControllerEpoch = cfg.controllerEpoch;
         writeValuesWithRetry(v, 8, 75L);
         Log.w(TAG, "LIFECYCLE RECOVERY failed generation=" + cfg.generation + " uid=" + uid + " detail=" + detail);
     }
@@ -933,8 +973,16 @@ public class NfcInjectionModule extends XposedModule {
             lastTriggeredGeneration = cfg.generation;
             if ("SUCCESS".equals(cfg.commandStatus) && cfg.active) {
                 if (!isLifecycleVerified(cfg.generation, pid, cfg.uid)) {
-                    Log.i(TAG, "LIFECYCLE APPLY adoption generation=" + cfg.generation + " uid=" + cfg.uid + " pid=" + pid + " reason=" + reason);
-                    scheduleLifecycleRecovery("process_" + reason);
+                    boolean suppressSelfRetry = "provider_change".equals(reason) &&
+                            lifecycleFailureGeneration == cfg.generation &&
+                            lifecycleFailureControllerEpoch == cfg.controllerEpoch;
+                    if (suppressSelfRetry) {
+                        Log.i(TAG, "LIFECYCLE APPLY self-retry suppressed generation=" + cfg.generation +
+                                " epoch=" + cfg.controllerEpoch + " pid=" + pid);
+                    } else {
+                        Log.i(TAG, "LIFECYCLE APPLY adoption generation=" + cfg.generation + " uid=" + cfg.uid + " pid=" + pid + " reason=" + reason);
+                        scheduleLifecycleRecovery("process_" + reason);
+                    }
                 }
             } else {
                 Log.i(TAG, "COMMAND terminal adopted without replay status=" + cfg.commandStatus +
@@ -1102,6 +1150,58 @@ public class NfcInjectionModule extends XposedModule {
         // Never monopolize the lifecycle executor. If the exact OEM invocation could not produce
         // fresh native proof, fall back to the existing natural-wait -> Java trigger -> vendor path.
         if (shouldFallback) scheduleLifecycleRecovery("early_rf_replay_fallback");
+    }
+
+    private void captureVerifiedRfInvocation(Method method, Object receiver, Object[] args,
+                                             HookTarget target, int pid) {
+        if (method == null || args == null || target == null) return;
+        EarlyRfInvocation snapshot = new EarlyRfInvocation(
+                method, receiver, cloneInvocationArgs(args), target.fingerprint(),
+                System.currentTimeMillis(), pid);
+        lastVerifiedRfInvocation = snapshot;
+        ContentValues v = baseHookState();
+        SimConfig cfg = cachedConfig;
+        if (cfg.initialized && cfg.generation > 0L) v.put("state_generation", cfg.generation);
+        v.put("rf_replay_status", "CAPTURED");
+        v.put("rf_replay_target", target.fingerprint());
+        v.put("rf_replay_captured_at", snapshot.capturedAt);
+        v.put("rf_replay_pid", pid);
+        writeValuesWithRetry(v, 8, 75L);
+        Log.i(TAG, "RF EXACT REPLAY captured target=" + target.fingerprint() + " pid=" + pid);
+    }
+
+    private boolean replayVerifiedRfInvocation(SimConfig cfg, String uidHex, long baseline) {
+        EarlyRfInvocation snapshot = lastVerifiedRfInvocation;
+        if (snapshot == null || snapshot.capturedPid != Process.myPid()) {
+            Log.i(TAG, "RF EXACT REPLAY unavailable generation=" + cfg.generation + " pid=" + Process.myPid());
+            return false;
+        }
+        try {
+            snapshot.method.setAccessible(true);
+            ContentValues v = baseHookState();
+            v.put("state_generation", cfg.generation);
+            v.put("rf_replay_status", "INVOKING");
+            v.put("rf_replay_target", snapshot.targetFingerprint);
+            v.put("rf_replay_captured_at", snapshot.capturedAt);
+            v.put("rf_replay_pid", snapshot.capturedPid);
+            writeValuesWithRetry(v, 8, 75L);
+            Log.i(TAG, "RF EXACT REPLAY invoke target=" + snapshot.targetFingerprint +
+                    " generation=" + cfg.generation + " uid=" + uidHex + " baselineSequence=" + baseline +
+                    " pid=" + Process.myPid());
+            snapshot.method.invoke(snapshot.receiver, cloneInvocationArgs(snapshot.args));
+            return true;
+        } catch (Throwable t) {
+            Throwable cause = t.getCause() == null ? t : t.getCause();
+            ContentValues v = baseHookState();
+            v.put("state_generation", cfg.generation);
+            v.put("rf_replay_status", "INVOKE_FAILED");
+            v.put("rf_replay_target", snapshot.targetFingerprint);
+            v.put("rf_replay_error", cause.getClass().getSimpleName() + ": " + cause.getMessage());
+            writeValuesWithRetry(v, 8, 75L);
+            Log.w(TAG, "RF EXACT REPLAY failed target=" + snapshot.targetFingerprint + " " +
+                    cause.getClass().getSimpleName() + ": " + cause.getMessage());
+            return false;
+        }
     }
 
     private synchronized void clearEarlyRfInvocation(String targetFingerprint) {

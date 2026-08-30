@@ -12,12 +12,12 @@ android {
         applicationId = "com.yagay.nfcdoorcard"
         minSdk = 31
         targetSdk = 35
-        versionCode = 49
-        versionName = "1.0.48"
+        versionCode = 50
+        versionName = "1.0.49"
 
         // Runtime protocol v7; hook build 35; 1.0.48 uses controller initialize/deinitialize and NfcService enable/disable as primary lifecycle recovery signals, with adapter broadcasts as fallback.
         // Application ID, source namespace, Provider authority and LSPosed entry all use com.yagay.nfcdoorcard.
-        buildConfigField("int", "HOOK_BUILD", "35")
+        buildConfigField("int", "HOOK_BUILD", "36")
     }
 
     buildTypes {
