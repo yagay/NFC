@@ -15,7 +15,7 @@ android {
         versionCode = 48
         versionName = "1.0.47"
 
-        // Runtime protocol v7; hook build 34; diagnostic-only 1.0.47 adds high-retention correlated NCI TX/RX + Oplus SuperCard/routing/boot timelines without changing NFC injection behaviour.
+        // Runtime protocol v7; hook build 34; diagnostic-only 1.0.47 adds high-retention correlated NCI TX/RX + Oplus SuperCard/routing/boot trace capture without changing NFC injection behaviour.
         // Application ID, source namespace, Provider authority and LSPosed entry all use com.yagay.nfcdoorcard.
         buildConfigField("int", "HOOK_BUILD", "34")
     }
