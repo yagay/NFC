@@ -39,7 +39,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git rm .github/workflows/state-finalization.yml .github/scripts/state_finalize.py .github/scripts/state_finalize_fix.py
+          git rm -f .github/workflows/state-finalization.yml .github/scripts/state_finalize.py .github/scripts/state_finalize_fix.py
           git add app/build.gradle.kts app/src/main/java/com/example/nfcdoorcard/ConfigProvider.kt app/src/main/java/com/example/nfcdoorcard/MainActivity.kt app/src/main/java/com/example/nfcdoorcard/xposed/NfcInjectionModule.java
           git commit -m "Finalize restart handoff and diagnostic snapshots"
           git push origin HEAD:main
