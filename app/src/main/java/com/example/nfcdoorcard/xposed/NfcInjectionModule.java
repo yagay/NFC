@@ -24,7 +24,6 @@ public class NfcInjectionModule extends XposedModule {
     private static final int HOOK_BUILD = 10;
     private static final Uri CONFIG_URI = Uri.parse("content://com.example.nfcdoorcard.config/settings");
 
-
     private final NfcStackAdapter[] adapters = new NfcStackAdapter[]{
             // Prefer the proven vendor-specific implementation, then fall back to
             // a strictly validated raw CORE_SET_CONFIG NXP implementation.
@@ -188,13 +187,28 @@ public class NfcInjectionModule extends XposedModule {
     }
 
     private void writeRfStatus(String state, String uid, String detail, String result) {
+        final int pid = Process.myPid();
         ContentValues v = new ContentValues();
+
+        // Reaching this method proves that the installed interceptor is executing in
+        // the current NFC process. Reassert the hook/scope state together with every
+        // RF status update so an older asynchronous DETECTING write cannot leave the
+        // UI showing "Hook not installed" after a successful interception.
+        v.put("hook_build", HOOK_BUILD);
+        v.put("scope_ok", true);
+        v.put("scope_process", "com.android.nfc");
+        v.put("scope_pid", pid);
+        v.put("hook_installed", true);
+        v.put("hook_class", "NfcInjectionModule");
+        v.put("hook_count", 1);
+        v.put("hook_pid", pid);
+
         v.put("rf_status", state);
         v.put("rf_uid", uid == null ? "" : uid);
         v.put("rf_source", activeAdapter == null ? "" : activeAdapter.id());
         v.put("rf_result", result == null ? "" : result);
         v.put("rf_error", state.endsWith("FAILED") || state.equals("UID_INVALID") ? detail : "");
-        v.put("rf_pid", Process.myPid());
+        v.put("rf_pid", pid);
         v.put("full_diag_stage", state);
         v.put("full_diag_summary", detail == null ? "" : detail);
         writeValuesWithRetry(v, 30, 200L);
