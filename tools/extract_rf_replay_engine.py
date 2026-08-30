@@ -63,8 +63,7 @@ def main():
 
     text = text.replace("RfInvocationSnapshot snapshot = null;", "RfReplayEngine.Snapshot snapshot = null;")
     text = text.replace("snapshot = pendingRfInvocationSnapshot;", "snapshot = replayEngine.pending();")
-    text = text.replace("if (pendingRfInvocationSnapshot != null) {\n                snapshot = pendingRfInvocationSnapshot;",
-                        "if (replayEngine.pending() != null) {\n                snapshot = replayEngine.pending();")
+    text = text.replace("if (pendingRfInvocationSnapshot != null) {", "if (replayEngine.pending() != null) {")
     text = text.replace("clearRfInvocationSnapshot(", "replayEngine.clearPending(")
 
     old_early_invoke = '''                try {
