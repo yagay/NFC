@@ -1,0 +1,185 @@
+name: Generation Ownership Fix
+
+on:
+  push:
+    paths:
+      - '.github/workflows/generation-ownership-fix.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Apply source fixes
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          def rep(s, old, new, label):
+              if old not in s:
+                  raise SystemExit(f'patch target not found: {label}')
+              return s.replace(old, new, 1)
+
+          # NfcInjectionModule: generation-tagged runtime writes + process restart recovery.
+          p = Path('app/src/main/java/com/example/nfcdoorcard/xposed/NfcInjectionModule.java')
+          s = p.read_text()
+          old = '''        if (!cfg.active && controllerReinitRequired) {
+            NfcProcessVendorController.Result stopTrigger = vendorController.setShareMode(false);
+            writeRfProgress(cfg, "STOPPING", "",
+                    stopTrigger.detail + "; reinitializing NFC controller because LA_NFCID1 was appended", "controller-lifecycle");
+            writeSemanticState("RESETTING_CONTROLLER", "UNKNOWN", "LIFECYCLE_PENDING", false, null);
+            NfcProcessVendorController.Result reset = vendorController.reinitializeController();
+            if (reset.success) {
+                clearRestoreState();
+                completeControllerReinit(cfg, reset.detail);
+            } else {
+                failCommand(cfg, "RF_CONTROLLER_RESET_FAILED", "", reset.stage + ": " + reset.detail, NativeOutcome.notInvoked());
+            }
+            return;
+        }
+'''
+          new = '''        if (!cfg.active && controllerReinitRequired) {
+            NfcProcessVendorController.Result stopTrigger = vendorController.setShareMode(false);
+            writeRfProgress(cfg, "STOPPING", "",
+                    stopTrigger.detail + "; appended LA_NFCID1 requires NFC process/controller restart", "controller-lifecycle");
+            // OxygenOS 16 rejects raw INfcAdapter disable/enable Binder calls from UID 1027 when
+            // the generated attribution/package identity is absent. Do not retry a path that is
+            // structurally rejected. Ask the app to perform the proven process-level lifecycle reset.
+            failCommand(cfg, "RF_CONTROLLER_RESTART_REQUIRED", "",
+                    "CONTROLLER_RESTART_REQUIRED: appended LA_NFCID1 cannot be deleted in-place; restart com.android.nfc to reinitialize controller",
+                    NativeOutcome.notInvoked());
+            return;
+        }
+'''
+          s = rep(s, old, new, 'controller reinit branch')
+
+          s = rep(s,
+              '''        v.put("rf_status", state);\n''',
+              '''        v.put("state_generation", cfg.generation);\n        v.put("rf_status", state);\n''',
+              'rf progress generation')
+
+          # First complete/fail blocks each have rf_status immediately after baseHookState.
+          marker = '''        ContentValues v = baseHookState();
+        v.put("rf_status", rfState);
+'''
+          s = rep(s, marker,
+              '''        ContentValues v = baseHookState();
+        v.put("state_generation", cfg.generation);
+        v.put("rf_status", rfState);
+''', 'complete generation')
+          s = rep(s, marker,
+              '''        ContentValues v = baseHookState();
+        v.put("state_generation", cfg.generation);
+        v.put("rf_status", rfState);
+''', 'fail generation')
+
+          s = rep(s,
+              '''        ContentValues v = baseHookState();
+        v.put("command_status", status);
+''',
+              '''        ContentValues v = baseHookState();
+        if (generation > 0L) v.put("state_generation", generation);
+        v.put("command_status", status);
+''',
+              'simple command generation')
+
+          s = rep(s,
+              '''        ContentValues v = baseHookState();
+        v.put("operation_state", operation);
+''',
+              '''        ContentValues v = baseHookState();
+        SimConfig cfg = cachedConfig;
+        if (cfg.initialized && cfg.generation > 0L) v.put("state_generation", cfg.generation);
+        v.put("operation_state", operation);
+''',
+              'semantic generation')
+
+          s = rep(s,
+              '''    private void persistRestoreState() {
+        ContentValues v = new ContentValues();
+''',
+              '''    private void persistRestoreState() {
+        ContentValues v = new ContentValues();
+        SimConfig cfg = cachedConfig;
+        if (cfg.initialized && cfg.generation > 0L) v.put("state_generation", cfg.generation);
+''',
+              'restore state generation')
+          p.write_text(s)
+
+          # MainActivity: command publication owns the generation; stale STOP fallback must abort.
+          p = Path('app/src/main/java/com/example/nfcdoorcard/MainActivity.kt')
+          s = p.read_text()
+          s = rep(s,
+              '''        contentResolver.insert(ConfigProvider.URI, ContentValues().apply {
+            put(ConfigProvider.KEY_APP_BUILD, ConfigProvider.APP_BUILD)
+            put(ConfigProvider.KEY_SIMULATION_ENABLED, enabled)
+''',
+              '''        contentResolver.insert(ConfigProvider.URI, ContentValues().apply {
+            put(ConfigProvider.KEY_APP_BUILD, ConfigProvider.APP_BUILD)
+            put(ConfigProvider.KEY_STATE_GENERATION, generation)
+            put(ConfigProvider.KEY_SIMULATION_ENABLED, enabled)
+''',
+              'publish generation')
+
+          s = rep(s,
+              '''            AppLogger.i("SIMULATION: STOP timeout snapshot before fallback generation=$generation\\n${buildStatusSummary(state)}\\nPROVIDER=${readProviderMap().toSortedMap()}")
+            val restart = restartNfcProcessKeepingEnabled("stop_command_fallback_generation_$generation")
+''',
+              '''            AppLogger.i("SIMULATION: STOP timeout snapshot before fallback generation=$generation\\n${buildStatusSummary(state)}\\nPROVIDER=${readProviderMap().toSortedMap()}")
+            if (!isCurrentCommandGeneration(generation)) {
+                state = readRuntimeStatus(includeRootPid = true)
+                AppLogger.i("SIMULATION: STOP fallback cancelled because generation=$generation is no longer current")
+                onDone(state, "停止请求已被更新的命令替代")
+                return@execute
+            }
+            val restart = restartNfcProcessKeepingEnabled("stop_command_fallback_generation_$generation")
+''',
+              'pre-restart generation guard')
+
+          s = rep(s,
+              '''            if (!isStopSuccess(state, generation)) {
+                val currentPid = currentNfcPid().toIntOrNull() ?: state.currentPid
+                contentResolver.insert(ConfigProvider.URI, ContentValues().apply {
+                    put(ConfigProvider.KEY_COMMAND_HANDLED_GENERATION, generation)
+''',
+              '''            if (!isStopSuccess(state, generation) && isCurrentCommandGeneration(generation)) {
+                val currentPid = currentNfcPid().toIntOrNull() ?: state.currentPid
+                contentResolver.insert(ConfigProvider.URI, ContentValues().apply {
+                    put(ConfigProvider.KEY_STATE_GENERATION, generation)
+                    put(ConfigProvider.KEY_COMMAND_HANDLED_GENERATION, generation)
+''',
+              'fallback state generation guard')
+
+          anchor = '''    private fun getSimulationEnabled(): Boolean = readProviderMap()[ConfigProvider.KEY_SIMULATION_ENABLED].toBoolean()
+'''
+          s = rep(s, anchor,
+              '''    private fun isCurrentCommandGeneration(generation: Long): Boolean =
+        readProviderMap()[ConfigProvider.KEY_COMMAND_GENERATION]?.toLongOrNull() == generation
+
+    private fun getSimulationEnabled(): Boolean = readProviderMap()[ConfigProvider.KEY_SIMULATION_ENABLED].toBoolean()
+''',
+              'current generation helper')
+          p.write_text(s)
+
+          # Version bump forces the NFC process to load the new Hook behavior.
+          p = Path('app/build.gradle.kts')
+          s = p.read_text()
+          s = s.replace('versionCode = 25', 'versionCode = 26', 1)
+          s = s.replace('versionName = "1.0.24"', 'versionName = "1.0.25"', 1)
+          s = s.replace('buildConfigField("int", "HOOK_BUILD", "19")', 'buildConfigField("int", "HOOK_BUILD", "20")', 1)
+          p.write_text(s)
+          PY
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add app/src/main/java/com/example/nfcdoorcard/xposed/NfcInjectionModule.java app/src/main/java/com/example/nfcdoorcard/MainActivity.kt app/build.gradle.kts
+          git commit -m 'Fix stale generation writes and controller stop recovery'
+          git rm .github/workflows/generation-ownership-fix.yml
+          git commit -m 'Remove temporary generation fix workflow'
+          git push origin HEAD:main
