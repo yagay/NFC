@@ -25,7 +25,7 @@ import java.util.concurrent.Executors;
 import io.github.libxposed.api.XposedModule;
 import io.github.libxposed.api.XposedModuleInterface;
 
-/** Capability-based, self-learning LSPosed NFC execution engine. */
+/** Capability-based NFC RF override engine with controller lifecycle restoration. */
 public class NfcInjectionModule extends XposedModule {
     private static final String TAG = "NfcUIDSim";
     private static final int HOOK_BUILD = BuildConfig.HOOK_BUILD;
@@ -49,16 +49,18 @@ public class NfcInjectionModule extends XposedModule {
     private volatile int completedPid;
     private volatile int installedHookCount;
     private volatile boolean learningMode;
-    private volatile String learningOwnerFingerprint;
     private volatile boolean disabledAfterFailure;
     private volatile String disabledFailureUid;
     private volatile long disabledFailureGeneration = Long.MIN_VALUE;
 
-    // Exact pre-injection RF payload captured from the verified APPLY call. STOP must restore
-    // this snapshot instead of trusting an arbitrary OEM callback that merely returns 0.
-    private volatile byte[] stockPayloadSnapshot;
-    private volatile String stockPayloadTargetFingerprint;
-    private volatile long stockPayloadCapturedGeneration = Long.MIN_VALUE;
+    // Restoration state. If APPLY replaced an existing LA_NFCID1, its exact pre-APPLY
+    // payload is reversible. If APPLY appended LA_NFCID1 to a payload where 0x33 was absent,
+    // CORE_SET_CONFIG replay cannot delete it; the NFC controller must be reinitialized.
+    private volatile byte[] reversibleStockPayload;
+    private volatile String reversibleTargetFingerprint;
+    private volatile long reversibleCapturedGeneration = Long.MIN_VALUE;
+    private volatile boolean controllerReinitRequired;
+    private volatile String restoreMode = "NONE";
 
     @Override public void onModuleLoaded(XposedModuleInterface.ModuleLoadedParam param) {
         super.onModuleLoaded(param);
@@ -82,7 +84,6 @@ public class NfcInjectionModule extends XposedModule {
         }
 
         persistTriggerCandidates(pid, discoveryEngine.discoverTriggerCandidates(cl));
-
         List<HookTarget> installTargets = new ArrayList<>();
         HookTarget cached = profileStore.loadValid(app, cl);
         if (cached != null) {
@@ -93,7 +94,7 @@ public class NfcInjectionModule extends XposedModule {
             Log.i(TAG, "PROFILE HIT target=" + cached + " pid=" + pid);
         } else {
             learningMode = true;
-            reportStatusWithRetry(pid, false, 0, "DISCOVERING", "Profile invalid/missing; learning RF_CONFIG_WRITE", null);
+            reportStatusWithRetry(pid, false, 0, "DISCOVERING", "Profile invalid/missing; learning deepest RF_CONFIG_WRITE", null);
             List<HookTarget> candidates = discoveryEngine.discoverRfCandidates(cl);
             persistDiscoveryCandidates(pid, candidates);
             if (candidates.isEmpty()) {
@@ -102,9 +103,12 @@ public class NfcInjectionModule extends XposedModule {
             }
             int hookCount = Math.min(MAX_LEARNING_HOOKS, candidates.size());
             installTargets.addAll(candidates.subList(0, hookCount));
+            // The highest static/runtime-family score owns mutation during learning. Lower
+            // wrapper candidates are observation-only so they cannot pollute the payload
+            // before the deeper Native target receives it.
             activeTarget = installTargets.get(0);
             profileStore.save(app, activeTarget, "LEARNING");
-            Log.i(TAG, "LEARNING installCount=" + hookCount + " top=" + activeTarget + " pid=" + pid);
+            Log.i(TAG, "LEARNING installCount=" + hookCount + " mutationOwner=" + activeTarget + " pid=" + pid);
         }
 
         int installed = 0;
@@ -123,9 +127,8 @@ public class NfcInjectionModule extends XposedModule {
         }
 
         reportStatusWithRetry(pid, true, installed, "READY",
-                learningMode ? "RF_CONFIG_WRITE learning mode hooks=" + installed : "RF_CONFIG_WRITE verified profile ready",
+                learningMode ? "RF_CONFIG_WRITE learning mode; highest-score target owns mutation" : "RF_CONFIG_WRITE verified profile ready",
                 activeTarget == null ? null : activeTarget.fingerprint());
-        Log.i(TAG, "PROD HOOK READY build=" + HOOK_BUILD + " hooks=" + installed + " learning=" + learningMode + " pid=" + pid);
         startCommandBridge(app, pid);
     }
 
@@ -138,59 +141,43 @@ public class NfcInjectionModule extends XposedModule {
             int payloadScore = payloadEngine.inspectScore(original);
             if (payloadScore <= 0) return chain.proceed();
 
-            HookTarget verified = activeTarget;
-            if (!learningMode && verified != null && !verified.fingerprint().equals(target.fingerprint())) {
+            HookTarget owner = activeTarget;
+            if (owner != null && !owner.fingerprint().equals(target.fingerprint())) {
+                if (currentConfig().diagnostics) {
+                    Log.i(TAG, "RFPROBE PASSIVE target=" + target.fingerprint() + " owner=" + owner.fingerprint() +
+                            " payloadScore=" + payloadScore + " pid=" + pid);
+                }
                 return chain.proceed();
             }
 
             SimConfig cfg = currentConfig();
             if (cfg.diagnostics) {
                 String caller = compactCallStack(24);
-                Log.i(TAG, "RFPROBE target=" + target.fingerprint() + " targetScore=" + target.score +
+                Log.i(TAG, "RFPROBE ACTIVE target=" + target.fingerprint() + " targetScore=" + target.score +
                         " payloadScore=" + payloadScore + " pid=" + pid + " generation=" + cfg.generation + " stack=" + caller);
                 persistRfCaller(pid, caller);
             }
 
             if (!cfg.active) {
+                // Reversible case only: APPLY replaced an existing 0x33, so replaying the
+                // exact pre-APPLY payload really writes the previous LA_NFCID1 value back.
                 if (cfg.initialized && "STOP".equals(cfg.commandAction) && !isGenerationCompleted(cfg.generation, pid)) {
-                    byte[] stock = stockPayloadSnapshot;
-                    String stockTarget = stockPayloadTargetFingerprint;
-                    if (stock != null && target.fingerprint().equals(stockTarget)) {
-                        byte[] restorePayload = stock.clone();
-                        Log.i(TAG, "STOCK SNAPSHOT RESTORE target=" + target.fingerprint() + " pid=" + pid +
-                                " generation=" + cfg.generation + " capturedGeneration=" + stockPayloadCapturedGeneration +
-                                " bytes=" + restorePayload.length);
-                        Object result = chain.proceed(new Object[]{restorePayload});
+                    byte[] stock = reversibleStockPayload;
+                    if (stock != null && target.fingerprint().equals(reversibleTargetFingerprint)) {
+                        Object result = chain.proceed(new Object[]{stock.clone()});
                         if (nativeOk(result)) {
-                            synchronized (this) {
-                                stockPayloadSnapshot = null;
-                                stockPayloadTargetFingerprint = null;
-                                stockPayloadCapturedGeneration = Long.MIN_VALUE;
-                            }
-                            Log.i(TAG, "STOCK SNAPSHOT RESTORED target=" + target.fingerprint() + " pid=" + pid +
-                                    " generation=" + cfg.generation + " result=" + result);
-                            completeCommand(cfg, "RF_STOCK_RESTORED", "", "stock-snapshot|" + target.fingerprint(),
-                                    String.valueOf(result), "Original stock RF snapshot restored by verified RF_CONFIG_WRITE target");
+                            clearRestoreState();
+                            completeCommand(cfg, "RF_STOCK_RESTORED", "", "explicit-stock-nfcid1|" + target.fingerprint(),
+                                    String.valueOf(result), "Original LA_NFCID1 explicitly restored by verified RF_CONFIG_WRITE target");
                         } else {
-                            failCommand(cfg, "RF_STOCK_FAILED", "",
-                                    "Native rejected saved stock RF snapshot; NFC restart required", String.valueOf(result));
+                            failCommand(cfg, "RF_STOCK_FAILED", "", "Native rejected explicit stock LA_NFCID1 restore", String.valueOf(result));
                         }
                         return result;
                     }
                 }
-
-                Object result = chain.proceed();
-                if (cfg.initialized && "STOP".equals(cfg.commandAction) && nativeOk(result)
-                        && !isGenerationCompleted(cfg.generation, pid)) {
-                    // A return value of 0 alone is not proof that the emulated UID was removed.
-                    // Without the exact pre-APPLY snapshot, force the app's NFC-process restart fallback.
-                    Log.w(TAG, "STOCK RESTORE UNVERIFIED target=" + target.fingerprint() + " pid=" + pid +
-                            " generation=" + cfg.generation + " result=" + result + " snapshotMissing=true");
-                    failCommand(cfg, "RF_STOCK_FAILED", "",
-                            "OEM stock callback returned 0 but no saved pre-APPLY RF snapshot is available; restart required",
-                            String.valueOf(result));
-                }
-                return result;
+                // APPENDED_LA_NFCID1 cannot be undone by replaying a payload that omits 0x33.
+                // The command thread performs a controller close/init lifecycle instead.
+                return chain.proceed();
             }
 
             if (cfg.uid == null) return chain.proceed();
@@ -199,8 +186,6 @@ public class NfcInjectionModule extends XposedModule {
                 failCommand(cfg, "UID_INVALID", uidHex, "UID must be 4 bytes", "");
                 return chain.proceed();
             }
-
-            if (learningMode && !claimLearningOwner(target)) return chain.proceed();
 
             if (disabledAfterFailure) {
                 boolean same = disabledFailureGeneration == cfg.generation && uidHex.equals(disabledFailureUid);
@@ -217,36 +202,41 @@ public class NfcInjectionModule extends XposedModule {
             }
 
             activeCodec = rewritten.codecId;
+            writeRfProgress(cfg, "APPLYING", uidHex, rewritten.reason, "pending", rewritten.codecId);
             Log.i(TAG, "NFCID1 APPLY target=" + target.fingerprint() + " codec=" + rewritten.codecId +
                     " reason=" + rewritten.reason + " pid=" + pid + " generation=" + cfg.generation + " uid=" + uidHex);
-            writeRfProgress(cfg, "APPLYING", uidHex, rewritten.reason, "pending", rewritten.codecId);
 
             Object result = chain.proceed(new Object[]{rewritten.data});
             if (nativeOk(result)) {
                 disabledAfterFailure = false;
                 disabledFailureUid = null;
                 disabledFailureGeneration = Long.MIN_VALUE;
+
+                boolean replacedExisting = rewritten.reason != null && rewritten.reason.contains("REPLACED_EXISTING_LA_NFCID1");
                 synchronized (this) {
                     if (learningMode) {
-                        activeTarget = target;
                         markTargetVerified(target);
                         learningMode = false;
-                        learningOwnerFingerprint = target.fingerprint();
                     }
-                    // Preserve the first known-good stock payload until a verified STOP restores it.
-                    // A card-to-card APPLY must not replace the original stock snapshot.
-                    if (stockPayloadSnapshot == null ||
-                            !target.fingerprint().equals(stockPayloadTargetFingerprint)) {
-                        stockPayloadSnapshot = original.clone();
-                        stockPayloadTargetFingerprint = target.fingerprint();
-                        stockPayloadCapturedGeneration = cfg.generation;
-                        Log.i(TAG, "STOCK SNAPSHOT CAPTURED target=" + target.fingerprint() + " pid=" + pid +
-                                " generation=" + cfg.generation + " bytes=" + original.length);
+                    if (replacedExisting) {
+                        reversibleStockPayload = original.clone();
+                        reversibleTargetFingerprint = target.fingerprint();
+                        reversibleCapturedGeneration = cfg.generation;
+                        controllerReinitRequired = false;
+                        restoreMode = "EXPLICIT_LA_NFCID1";
+                    } else {
+                        reversibleStockPayload = null;
+                        reversibleTargetFingerprint = null;
+                        reversibleCapturedGeneration = Long.MIN_VALUE;
+                        controllerReinitRequired = true;
+                        restoreMode = "CONTROLLER_REINIT";
                     }
                 }
+                persistRestoreState();
                 if (!isGenerationCompleted(cfg.generation, pid)) {
                     completeCommand(cfg, "RF_UID_APPLIED", uidHex, rewritten.codecId, String.valueOf(result),
-                            "UID applied by verified target " + target.className + "#" + target.methodName);
+                            "UID applied by verified target " + target.className + "#" + target.methodName +
+                                    "; stopMode=" + restoreMode);
                 }
             } else if (!isGenerationCompleted(cfg.generation, pid)) {
                 disabledAfterFailure = true;
@@ -258,20 +248,6 @@ public class NfcInjectionModule extends XposedModule {
             }
             return result;
         });
-    }
-
-    private synchronized boolean claimLearningOwner(HookTarget target) {
-        if (!learningMode) {
-            return activeTarget == null || activeTarget.fingerprint().equals(target.fingerprint());
-        }
-        String fp = target.fingerprint();
-        if (learningOwnerFingerprint == null) {
-            learningOwnerFingerprint = fp;
-            persistProfileStatus("PROBING", target);
-            Log.i(TAG, "LEARNING OWNER target=" + fp + " pid=" + Process.myPid());
-            return true;
-        }
-        return learningOwnerFingerprint.equals(fp);
     }
 
     private void startCommandBridge(Application app, int pid) {
@@ -302,8 +278,26 @@ public class NfcInjectionModule extends XposedModule {
         lastTriggeredGeneration = cfg.generation;
 
         String action = cfg.active ? "APPLY" : "STOP";
-        Log.i(TAG, "COMMAND " + action + " reason=" + reason + " generation=" + cfg.generation + " uid=" + cfg.uid + " pid=" + pid);
         writeSimpleCommandState("RUNNING", "Executing " + action + " inside com.android.nfc", cfg.generation, action, false);
+        Log.i(TAG, "COMMAND " + action + " reason=" + reason + " generation=" + cfg.generation + " uid=" + cfg.uid + " pid=" + pid +
+                " restoreMode=" + restoreMode);
+
+        if (!cfg.active && controllerReinitRequired) {
+            // First tell the OEM stack that share mode is off. Its callback is allowed to run,
+            // but it is not considered restoration proof. Then force an actual controller
+            // close/init so the previously appended LA_NFCID1 disappears from controller state.
+            NfcProcessVendorController.Result stopTrigger = vendorController.setShareMode(false);
+            writeRfProgress(cfg, "RESETTING_CONTROLLER", "",
+                    stopTrigger.detail + "; reinitializing NFC controller because LA_NFCID1 was appended", "", "controller-lifecycle");
+            NfcProcessVendorController.Result reset = vendorController.reinitializeController();
+            if (reset.success) {
+                clearRestoreState();
+                completeControllerReinit(cfg, reset.detail);
+            } else {
+                failCommand(cfg, "RF_CONTROLLER_RESET_FAILED", "", reset.stage + ": " + reset.detail, "");
+            }
+            return;
+        }
 
         NfcProcessVendorController.Result trigger = vendorController.setShareMode(cfg.active);
         if (isGenerationCompleted(cfg.generation, pid)) return;
@@ -312,6 +306,25 @@ public class NfcInjectionModule extends XposedModule {
         } else {
             writeSimpleCommandState("TRIGGER_FAILED", trigger.stage + ": " + trigger.detail, cfg.generation, action, false);
         }
+    }
+
+    private synchronized void clearRestoreState() {
+        reversibleStockPayload = null;
+        reversibleTargetFingerprint = null;
+        reversibleCapturedGeneration = Long.MIN_VALUE;
+        controllerReinitRequired = false;
+        restoreMode = "NONE";
+        persistRestoreState();
+    }
+
+    private void persistRestoreState() {
+        ContentValues v = new ContentValues();
+        v.put("rf_restore_mode", restoreMode);
+        v.put("rf_controller_reinit_required", controllerReinitRequired);
+        v.put("stock_snapshot_available", reversibleStockPayload != null);
+        v.put("stock_snapshot_generation", reversibleCapturedGeneration == Long.MIN_VALUE ? 0L : reversibleCapturedGeneration);
+        v.put("stock_snapshot_target", reversibleTargetFingerprint == null ? "" : reversibleTargetFingerprint);
+        writeValuesWithRetry(v, 8, 75L);
     }
 
     private boolean isGenerationCompleted(long generation, int pid) {
@@ -396,12 +409,13 @@ public class NfcInjectionModule extends XposedModule {
         ContentValues v = new ContentValues();
         v.put("profile_status", status);
         v.put("profile_hook_build", HOOK_BUILD);
-        v.put("profile_schema", 2);
+        v.put("profile_schema", 3);
         if (target != null) putTarget(v, target);
         writeValuesWithRetry(v, 8, 75L);
     }
 
     private void markTargetVerified(HookTarget target) {
+        activeTarget = target;
         Application app = currentApplication();
         if (app != null) profileStore.save(app, target, "VERIFIED");
         persistProfileStatus("VERIFIED", target);
@@ -429,16 +443,26 @@ public class NfcInjectionModule extends XposedModule {
         v.put("rf_uid", uid == null ? "" : uid);
         v.put("rf_source", codecId == null ? "" : codecId);
         v.put("rf_result", result == null ? "" : result);
-        v.put("rf_error", state.endsWith("FAILED") || state.equals("UID_INVALID") ? detail : "");
+        v.put("rf_error", state.contains("FAILED") ? detail : "");
         v.put("rf_pid", Process.myPid());
         v.put("rf_generation", cfg.generation);
-        v.put("rf_verification", "NATIVE_RESULT");
+        v.put("rf_verification", state.equals("APPLYING") ? "CONFIG_WRITE_PENDING" : "LIFECYCLE_PENDING");
         v.put("full_diag_stage", state);
         v.put("full_diag_summary", detail == null ? "" : detail);
         writeValuesWithRetry(v, 20, 100L);
     }
 
     private void completeCommand(SimConfig cfg, String rfState, String uid, String source, String result, String detail) {
+        completeCommandWithVerification(cfg, rfState, uid, source, result, detail, "NATIVE_RESULT");
+    }
+
+    private void completeControllerReinit(SimConfig cfg, String detail) {
+        completeCommandWithVerification(cfg, "RF_STOCK_RESTORED_BY_RESTART", "", "controller-reinit", "",
+                detail + "; appended LA_NFCID1 cleared by NFC controller close/init", "PROCESS_RESTART");
+    }
+
+    private void completeCommandWithVerification(SimConfig cfg, String rfState, String uid, String source,
+                                                 String result, String detail, String verification) {
         int pid = Process.myPid();
         completedGeneration = cfg.generation;
         completedPid = pid;
@@ -450,7 +474,7 @@ public class NfcInjectionModule extends XposedModule {
         v.put("rf_error", "");
         v.put("rf_pid", pid);
         v.put("rf_generation", cfg.generation);
-        v.put("rf_verification", "NATIVE_RESULT");
+        v.put("rf_verification", verification);
         v.put("command_handled_generation", cfg.generation);
         v.put("command_action", cfg.active ? "APPLY" : "STOP");
         v.put("command_status", "SUCCESS");
@@ -473,7 +497,7 @@ public class NfcInjectionModule extends XposedModule {
         v.put("rf_error", detail == null ? "" : detail);
         v.put("rf_pid", pid);
         v.put("rf_generation", cfg.generation);
-        v.put("rf_verification", "NATIVE_RESULT");
+        v.put("rf_verification", "FAILED");
         v.put("command_handled_generation", cfg.generation);
         v.put("command_action", cfg.active ? "APPLY" : "STOP");
         v.put("command_status", "FAILED");
@@ -496,9 +520,11 @@ public class NfcInjectionModule extends XposedModule {
         v.put("hook_count", installedHookCount);
         v.put("hook_pid", pid);
         if (activeTarget != null) putTarget(v, activeTarget);
-        v.put("stock_snapshot_available", stockPayloadSnapshot != null);
-        v.put("stock_snapshot_generation", stockPayloadCapturedGeneration == Long.MIN_VALUE ? 0L : stockPayloadCapturedGeneration);
-        v.put("stock_snapshot_target", stockPayloadTargetFingerprint == null ? "" : stockPayloadTargetFingerprint);
+        v.put("rf_restore_mode", restoreMode);
+        v.put("rf_controller_reinit_required", controllerReinitRequired);
+        v.put("stock_snapshot_available", reversibleStockPayload != null);
+        v.put("stock_snapshot_generation", reversibleCapturedGeneration == Long.MIN_VALUE ? 0L : reversibleCapturedGeneration);
+        v.put("stock_snapshot_target", reversibleTargetFingerprint == null ? "" : reversibleTargetFingerprint);
         return v;
     }
 
