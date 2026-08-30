@@ -9,11 +9,16 @@ import java.util.concurrent.atomic.AtomicBoolean
 /**
  * Re-applies the persisted desired simulation state after a phone reboot or an NFC process restart.
  * The receiver runs in the app process, so Vendor Binder calls keep the app's caller UID.
+ *
+ * Retry policy intentionally stays small: VendorNfcController already retries stale Binder handles
+ * and waits for authoritative RF_UID_APPLIED evidence, so multiplying retries here only causes
+ * redundant NFC traffic and very long restore jobs.
  */
 class AutoRestoreReceiver : BroadcastReceiver() {
     companion object {
         const val ACTION_NFC_HOOK_READY = "com.example.nfcdoorcard.action.NFC_HOOK_READY"
         private const val TAG = "NfcAutoRestore"
+        private const val MAX_RESTORE_ATTEMPTS = 2
         private val restoreRunning = AtomicBoolean(false)
     }
 
@@ -37,22 +42,22 @@ class AutoRestoreReceiver : BroadcastReceiver() {
                 Log.i(TAG, "restore requested action=${intent?.action} uid=$desiredUid")
                 var last: VendorNfcController.Result? = null
 
-                repeat(10) { attempt ->
+                repeat(MAX_RESTORE_ATTEMPTS) { attempt ->
                     val current = readDesiredState(context)
                     if (!current.enabled || !current.uid.equals(desiredUid, true)) {
                         Log.i(TAG, "restore cancelled: desired state changed")
                         return@Thread
                     }
 
-                    if (attempt > 0) Thread.sleep(700L)
+                    if (attempt > 0) Thread.sleep(600L)
                     last = VendorNfcController().setShareMode(true)
                     if (last?.success == true) {
-                        Log.i(TAG, "binder accepted attempt=${attempt + 1} uid=$desiredUid; waiting RF confirmation")
-                        if (waitForRfApplied(context, desiredUid, 5_000L)) {
+                        Log.i(TAG, "restore trigger accepted attempt=${attempt + 1} stage=${last?.stage} uid=$desiredUid")
+                        if (waitForRfApplied(context, desiredUid, 4_000L)) {
                             Log.i(TAG, "restore confirmed RF_UID_APPLIED uid=$desiredUid attempt=${attempt + 1}")
                             return@Thread
                         }
-                        Log.w(TAG, "binder accepted but RF UID not confirmed; retrying uid=$desiredUid")
+                        Log.w(TAG, "restore trigger returned success but RF UID not confirmed; retrying uid=$desiredUid")
                     } else {
                         Log.i(TAG, "restore retry attempt=${attempt + 1} stage=${last?.stage} detail=${last?.detail}")
                     }
