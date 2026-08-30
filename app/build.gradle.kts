@@ -12,10 +12,10 @@ android {
         applicationId = "com.yagay.nfcdoorcard"
         minSdk = 31
         targetSdk = 35
-        versionCode = 47
-        versionName = "1.0.46"
+        versionCode = 48
+        versionName = "1.0.47"
 
-        // Runtime protocol v7; hook build 34; RF-sequence quiet-period settling + strictly-new final reapply after NFC lifecycle, with generic Java capability discovery, controller epochs, bounded OPLUS rewrite and 4/7/10-byte NFCID1 support.
+        // Runtime protocol v7; hook build 34; diagnostic-only 1.0.47 adds high-retention correlated NCI TX/RX + Oplus SuperCard/routing/boot timelines without changing NFC injection behaviour.
         // Application ID, source namespace, Provider authority and LSPosed entry all use com.yagay.nfcdoorcard.
         buildConfigField("int", "HOOK_BUILD", "34")
     }
