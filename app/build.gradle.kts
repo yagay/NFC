@@ -12,10 +12,10 @@ android {
         applicationId = "com.example.nfcdoorcard"
         minSdk = 31
         targetSdk = 35
-        versionCode = 18
-        versionName = "1.0.17"
+        versionCode = 19
+        versionName = "1.0.18"
 
-        buildConfigField("int", "HOOK_BUILD", "12")
+        buildConfigField("int", "HOOK_BUILD", "13")
     }
 
     compileOptions {
