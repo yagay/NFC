@@ -4,12 +4,20 @@
 
 Keep the app maintainable across OxygenOS/NFC stack upgrades without tying production behavior to one permanent vendor class or method name.
 
-The runtime is split into four independent concerns:
+The Hook runtime is split into four independent concerns:
 
 1. **Command protocol** — app publishes desired simulation state and a generation number.
 2. **Hook discovery** — finds methods capable of `RF_CONFIG_WRITE` by structural scoring.
 3. **Payload codecs** — classify and safely rewrite the actual `byte[]` seen at runtime.
 4. **Runtime verification/profile** — native result `0` verifies a target and caches it for the exact system/NFC build.
+
+The app process keeps its responsibilities separate as well:
+
+- `NfcAppScreen` renders Compose state and forwards user intent.
+- `SimulationCoordinator` owns APPLY/STOP orchestration and timeouts.
+- `DiagnosticExporter` builds support bundles.
+- `HookConfigStore` and `HookStateWriter` isolate Provider reads and writes.
+- `SimulationResultPolicy` decides whether an RF result belongs to the active request.
 
 ## Production startup
 
@@ -68,7 +76,7 @@ Rules:
 
 Every APPLY/STOP request has a monotonically changing generation.
 
-A terminal RF result belongs to one generation and NFC PID. Old asynchronous writes must never be interpreted as the result of a newer request.
+A terminal RF result belongs to one generation, NFC PID, and controller epoch. Old asynchronous writes or results from a replaced controller must never be interpreted as the result of a newer request.
 
 Important states:
 
@@ -77,6 +85,10 @@ Important states:
 - `rf_generation`
 - `command_pid`
 - `rf_pid`
+- `controller_epoch`
+- `rf_controller_epoch`
+
+Lifecycle recovery can complete just before the exact RF callback is observed. In that narrow case the coordinator enters `WAIT_FOR_REPLAY` for at most 1.2 seconds. Success still requires the matching generation, PID, epoch, recognized RF payload, and native result `0`; the grace period only accommodates callback ordering.
 
 ## Hook profile fields
 
@@ -121,3 +133,5 @@ This separation is the main maintenance rule: **hook location changes belong to 
 Never mark simulation successful from Binder/trigger success alone.
 
 Production success requires generation-bound RF confirmation with native result `0`. STOP success similarly requires stock RF confirmation from a recognized RF payload path.
+
+Keep Hook installation, lifecycle recovery, and early RF replay together unless device evidence supports a new boundary. Their ordering is correctness-critical, so reducing file size alone is not sufficient justification for a split.
