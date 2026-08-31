@@ -24,7 +24,7 @@ internal class SimulationCoordinator(
             }
             state = waitForCommandCompletion(generation, card.uid, apply = true, timeoutMs = 12_000)
             val message = when {
-                isApplySuccess(state, generation, card.uid) -> "模拟成功 · UID=${card.uid} · NFC进程内确认"
+                SimulationResultPolicy.isApplySuccess(state, generation, card.uid) -> "模拟成功 · UID=${card.uid} · NFC进程内确认"
                 !state.hookInstalled -> "模拟请求已保存，但 Hook 未就绪"
                 state.commandGeneration != generation -> "模拟请求被更新的命令替代"
                 state.commandStatus == "FAILED" || state.commandStatus == "TRIGGER_FAILED" ->
@@ -41,7 +41,7 @@ internal class SimulationCoordinator(
         AppLogger.i("SIMULATION: COMMAND STOP published generation=$generation")
         executor.execute {
             var state = waitForCommandCompletion(generation, null, apply = false, timeoutMs = 6_000)
-            if (isStopSuccess(state, generation)) {
+            if (SimulationResultPolicy.isStopSuccess(state, generation)) {
                 AppLogger.i("SIMULATION: STOP success without restart generation=$generation\n${statusSummary(state)}")
                 onDone(state, "模拟已停止 · 原厂 RF 已由 NFC 进程恢复")
                 return@execute
@@ -59,13 +59,13 @@ internal class SimulationCoordinator(
             waitForHookOnly(12_000)
             state = waitForCommandCompletion(generation, null, apply = false, timeoutMs = 6_000)
 
-            if (!isStopSuccess(state, generation) && runtimeRepository.isCurrentCommandGeneration(generation)) {
+            if (!SimulationResultPolicy.isStopSuccess(state, generation) && runtimeRepository.isCurrentCommandGeneration(generation)) {
                 val currentPid = nfcSystemService.currentNfcPid().toIntOrNull() ?: state.currentPid
                 configClient.confirmStockRestart(generation, currentPid)
                 state = runtimeRepository.read(includeRootPid = true)
             }
 
-            val message = if (isStopSuccess(state, generation)) {
+            val message = if (SimulationResultPolicy.isStopSuccess(state, generation)) {
                 "模拟已停止 · 已恢复原厂 RF"
             } else {
                 "模拟已停止 · NFC 已重启，但状态确认未完成"
@@ -84,7 +84,8 @@ internal class SimulationCoordinator(
         var state = RuntimeStatus()
         while (System.currentTimeMillis() < end) {
             state = runtimeRepository.read(includeRootPid = true)
-            if (if (apply) isApplySuccess(state, generation, uid.orEmpty()) else isStopSuccess(state, generation)) return state
+            if (if (apply) SimulationResultPolicy.isApplySuccess(state, generation, uid.orEmpty())
+                else SimulationResultPolicy.isStopSuccess(state, generation)) return state
             if (state.commandGeneration == generation && state.commandStatus == "RESTART_REQUIRED" &&
                 state.consumedGeneration == generation) return state
             if (state.commandGeneration == generation && state.handledGeneration == generation &&
@@ -92,21 +93,6 @@ internal class SimulationCoordinator(
             Thread.sleep(100)
         }
         return state
-    }
-
-    private fun isApplySuccess(state: RuntimeStatus, generation: Long, uid: String): Boolean =
-        state.commandGeneration == generation && state.handledGeneration == generation &&
-            state.commandStatus == "SUCCESS" && state.currentPid > 0 && state.commandPid == state.currentPid &&
-            state.rfGeneration == generation && state.rfPid == state.currentPid && state.operationState == "IDLE" &&
-            state.effectiveState == "ACTIVE" && state.verificationConfidence == "VERIFIED" &&
-            state.rfAccepted && state.rfUid.equals(uid, ignoreCase = true)
-
-    private fun isStopSuccess(state: RuntimeStatus, generation: Long): Boolean {
-        val common = state.commandGeneration == generation && state.handledGeneration == generation &&
-            state.commandStatus == "SUCCESS" && state.currentPid > 0 && state.commandPid == state.currentPid &&
-            state.rfGeneration == generation && state.rfPid == state.currentPid
-        return common && state.operationState == "IDLE" && state.effectiveState == "STOCK" &&
-            state.verificationConfidence == "VERIFIED" && state.rfAccepted
     }
 
     private fun waitForHookOnly(timeoutMs: Long): RuntimeStatus {

@@ -51,13 +51,14 @@ public class NfcInjectionModule extends XposedModule {
     private static final long EARLY_REPLAY_RETRY_MS = 50L;
     private static final long CONTROLLER_LIFECYCLE_DEBOUNCE_MS = 1_200L;
 
-    private final ExecutorService stateSyncExecutor = Executors.newSingleThreadExecutor(r -> daemon(r, "NfcUIDSim-StateSync"));
     private final ExecutorService commandExecutor = Executors.newSingleThreadExecutor(r -> daemon(r, "NfcUIDSim-Command"));
     private final ExecutorService lifecycleExecutor = Executors.newSingleThreadExecutor(r -> daemon(r, "NfcUIDSim-Lifecycle"));
     private final ExecutorService earlyReplayExecutor = Executors.newSingleThreadExecutor(r -> daemon(r, "NfcUIDSim-EarlyReplay"));
     private final HookDiscoveryEngine discoveryEngine = new HookDiscoveryEngine();
     private final RfPayloadEngine payloadEngine = new RfPayloadEngine();
     private final HookProfileStore profileStore = new HookProfileStore();
+    private final HookConfigStore configStore = new HookConfigStore();
+    private final HookStateWriter stateWriter = new HookStateWriter();
     private final NfcProcessVendorController vendorController = new NfcProcessVendorController();
     private final RefreshTriggerEngine refreshTriggerEngine = new RefreshTriggerEngine();
     private final RfReplayEngine replayEngine = new RfReplayEngine();
@@ -1513,66 +1514,15 @@ public class NfcInjectionModule extends XposedModule {
     }
 
     private void writeValuesWithRetry(ContentValues values, int attempts, long delayMs) {
-        final ContentValues copy = new ContentValues(values);
-        stateSyncExecutor.execute(() -> {
-            for (int i = 0; i < attempts; i++) {
-                Context ctx = currentContext();
-                if (ctx != null) {
-                    try { ctx.getContentResolver().insert(CONFIG_URI, copy); return; }
-                    catch (Throwable e) { Log.w(TAG, "status write attempt " + (i + 1) + " failed: " + e.getMessage()); }
-                }
-                sleep(delayMs);
-            }
-        });
+        stateWriter.writeAsync(values, attempts, delayMs);
     }
 
     private boolean writeValuesSynchronously(ContentValues values, int attempts, long delayMs) {
-        ContentValues copy = new ContentValues(values);
-        for (int i = 0; i < attempts; i++) {
-            Context ctx = currentContext();
-            if (ctx != null) {
-                try {
-                    ctx.getContentResolver().insert(CONFIG_URI, copy);
-                    return true;
-                } catch (Throwable e) {
-                    Log.w(TAG, "sync state write attempt " + (i + 1) + " failed: " + e.getMessage());
-                }
-            }
-            if (i + 1 < attempts) sleep(delayMs);
-        }
-        return false;
+        return stateWriter.writeSynchronously(values, attempts, delayMs);
     }
 
     private SimConfig readConfig() {
-        Context ctx = currentContext();
-        if (ctx == null) return SimConfig.uninitialized();
-        boolean active = false, diagnostics = false;
-        String uid = null, action = "", status = "";
-        long generation = 0L, consumed = Long.MIN_VALUE, handled = Long.MIN_VALUE, controllerEpoch = 0L;
-        int commandPid = 0;
-        try (Cursor c = ctx.getContentResolver().query(CONFIG_URI, null, null, null, null)) {
-            if (c == null) return SimConfig.uninitialized();
-            while (c.moveToNext()) {
-                String key = c.getString(0), value = c.getString(1);
-                if ("simulation_enabled".equals(key)) active = Boolean.parseBoolean(value);
-                else if ("uid".equals(key)) uid = value;
-                else if ("diagnostic_logging_enabled".equals(key)) diagnostics = Boolean.parseBoolean(value);
-                else if ("command_generation".equals(key)) generation = parseLong(value, 0L);
-                else if ("command_consumed_generation".equals(key)) consumed = parseLong(value, Long.MIN_VALUE);
-                else if ("command_handled_generation".equals(key)) handled = parseLong(value, Long.MIN_VALUE);
-                else if ("command_action".equals(key)) action = value == null ? "" : value;
-                else if ("command_status".equals(key)) status = value == null ? "" : value;
-                else if ("command_pid".equals(key)) commandPid = (int) parseLong(value, 0L);
-                else if ("controller_epoch".equals(key)) controllerEpoch = parseLong(value, 0L);
-            }
-            if (action.isEmpty()) action = active ? "APPLY" : "STOP";
-            // Schema migration or first install may not have an epoch yet. Seed it without
-            // declaring RF success; subsequent verified writes will record this epoch.
-            if (controllerEpoch <= 0L) controllerEpoch = 1L;
-            return new SimConfig(true, active, uid, diagnostics, generation, consumed, handled, action, status, commandPid, controllerEpoch);
-        } catch (Throwable t) {
-            return SimConfig.uninitialized();
-        }
+        return configStore.read();
     }
 
 }
