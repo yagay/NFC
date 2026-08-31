@@ -9,14 +9,11 @@ import java.util.Map;
 
 /** Reads and decodes the durable command snapshot without owning command execution. */
 final class HookConfigStore {
-    private static final Uri CONFIG_URI =
-            Uri.parse("content://com.yagay.nfcdoorcard.config/settings");
-
     SimConfig read() {
         Context context = NfcHookUtils.currentContext();
         if (context == null) return SimConfig.uninitialized();
         Map<String, String> values = new HashMap<>();
-        try (Cursor cursor = context.getContentResolver().query(CONFIG_URI, null, null, null, null)) {
+        try (Cursor cursor = context.getContentResolver().query(configUri(), null, null, null, null)) {
             if (cursor == null) return SimConfig.uninitialized();
             while (cursor.moveToNext()) values.put(cursor.getString(0), cursor.getString(1));
             return decode(values);
@@ -46,5 +43,9 @@ final class HookConfigStore {
 
     private static String valueOrEmpty(String value) {
         return value == null ? "" : value;
+    }
+
+    private static Uri configUri() {
+        return Uri.parse("content://com.yagay.nfcdoorcard.config/settings");
     }
 }
