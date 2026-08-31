@@ -12,13 +12,14 @@ android {
         applicationId = "com.yagay.nfcdoorcard"
         minSdk = 31
         targetSdk = 35
-        versionCode = 56
-        versionName = "1.0.55"
+        versionCode = 57
+        versionName = "1.0.56"
 
-        // Runtime protocol v7; hook build 39; 1.0.55 finalizes recovery/replay separation, typed Provider commands, ReaderMode, isolated diagnostics collection, and bounded root probing.
-        // Historical cleanup is behavior-preserving: controller lifecycle/epoch, exact replay, reversible STOP and restart fallback remain intact.
+        // Runtime protocol v7; hook build 40; 1.0.56 separates UI/command/Provider boundaries
+        // and gives late exact RF replay one bounded chance before lifecycle failure publication.
+        // Controller lifecycle/epoch, verified native proof, reversible STOP and restart fallback remain intact.
         // Application ID, source namespace, Provider authority and LSPosed entry all use com.yagay.nfcdoorcard.
-        buildConfigField("int", "HOOK_BUILD", "39")
+        buildConfigField("int", "HOOK_BUILD", "40")
     }
 
     buildTypes {
