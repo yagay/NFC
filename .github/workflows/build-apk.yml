@@ -68,15 +68,26 @@ jobs:
 
       - name: Verify APK files and Xposed metadata
         run: |
+          set -euo pipefail
           DEBUG_APK=app/build/outputs/apk/debug/app-debug.apk
           RELEASE_APK=app/build/outputs/apk/release/app-release.apk
+          EXPECTED_VERSION_CODE=$(sed -nE 's/^[[:space:]]*versionCode = ([0-9]+)$/\1/p' app/build.gradle.kts)
+          EXPECTED_VERSION_NAME=$(sed -nE 's/^[[:space:]]*versionName = "([^"]+)"$/\1/p' app/build.gradle.kts)
+          test -n "$EXPECTED_VERSION_CODE"
+          test -n "$EXPECTED_VERSION_NAME"
           test -f "$DEBUG_APK"
           test -f "$RELEASE_APK"
           for apk in "$DEBUG_APK" "$RELEASE_APK"; do
-            unzip -l "$apk" | grep -q 'META-INF/xposed/java_init.list'
-            unzip -l "$apk" | grep -q 'META-INF/xposed/module.prop'
-            unzip -p "$apk" META-INF/xposed/java_init.list | grep -q 'com.yagay.nfcdoorcard.xposed.NfcInjectionModule'
-            "$ANDROID_HOME/build-tools/35.0.0/aapt2" dump badging "$apk" | grep -q "package: name='com.yagay.nfcdoorcard'"
+            CONTENTS=$(unzip -Z1 "$apk")
+            grep -Fxq 'META-INF/xposed/java_init.list' <<< "$CONTENTS"
+            grep -Fxq 'META-INF/xposed/module.prop' <<< "$CONTENTS"
+            grep -Fxq 'META-INF/xposed/scope.list' <<< "$CONTENTS"
+            test "$(unzip -p "$apk" META-INF/xposed/java_init.list)" = 'com.yagay.nfcdoorcard.xposed.NfcInjectionModule'
+            test "$(unzip -p "$apk" META-INF/xposed/scope.list)" = 'com.android.nfc'
+            BADGING=$("$ANDROID_HOME/build-tools/35.0.0/aapt2" dump badging "$apk")
+            grep -Fq "package: name='com.yagay.nfcdoorcard'" <<< "$BADGING"
+            grep -Fq "versionCode='$EXPECTED_VERSION_CODE'" <<< "$BADGING"
+            grep -Fq "versionName='$EXPECTED_VERSION_NAME'" <<< "$BADGING"
             "$ANDROID_HOME/build-tools/35.0.0/zipalign" -c -p 4 "$apk"
             "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose "$apk"
           done
