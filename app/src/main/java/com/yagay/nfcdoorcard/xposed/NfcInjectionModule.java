@@ -44,6 +44,7 @@ public class NfcInjectionModule extends XposedModule {
     private static final long LIFECYCLE_TRIGGER_WAIT_MS = 1_600L;
     private static final long LIFECYCLE_TOTAL_TIMEOUT_MS = 9_000L;
     private static final long LIFECYCLE_REPLAY_DELAY_MS = 600L;
+    private static final long LIFECYCLE_FINAL_REPLAY_GRACE_MS = 1_200L;
     private static final int LIFECYCLE_MAX_TRIGGER_ATTEMPTS = 3;
     private static final long EARLY_CONFIG_WAIT_MS = 200L;
     private static final long EARLY_CONFIG_RETRY_MS = 20L;
@@ -813,6 +814,7 @@ public class NfcInjectionModule extends XposedModule {
                                 LIFECYCLE_MAX_TRIGGER_ATTEMPTS));
 
                 if (action == RecoveryStateMachine.Action.NONE) return;
+                if (action == RecoveryStateMachine.Action.WAIT_FOR_REPLAY) break;
                 if (action == RecoveryStateMachine.Action.MARK_FAILED) break;
 
                 synchronized (this) { recoveryWriteArmed = true; }
@@ -842,7 +844,36 @@ public class NfcInjectionModule extends XposedModule {
                 synchronized (this) { recoveryWriteArmed = false; }
             }
 
-            if (!isLifecycleVerified(cfg.generation, pid, uidHex)) {
+            // A verified invocation snapshot can arrive just after the last vendor trigger. Give
+            // that exact replay path one bounded chance before publishing a user-visible failure.
+            // The observed native RF proof remains the only success condition.
+            if (!isLifecycleVerified(cfg.generation, pid, uidHex) && !replayAttempted &&
+                    awaitLateReplayAvailability(cfg.generation, pid)) {
+                SimConfig latest = readConfig();
+                boolean commandStillCurrent = latest.initialized && latest.active &&
+                        latest.generation == cfg.generation && latest.handledGeneration == latest.generation &&
+                        "SUCCESS".equals(latest.commandStatus);
+                if (!commandStillCurrent) return;
+                synchronized (this) { recoveryWriteArmed = true; }
+                replayAttempted = true;
+                boolean replayed = replayVerifiedRfInvocation(latest, uidHex);
+                lastFailure = replayed ?
+                        "Late exact RF replay invoked but no fresh native proof was observed" :
+                        "Late exact RF replay unavailable/failed";
+                if (replayed && waitForLifecycleVerified(
+                        cfg.generation, pid, uidHex, LIFECYCLE_TRIGGER_WAIT_MS)) {
+                    lifecycleFailureGeneration = Long.MIN_VALUE;
+                    lifecycleFailureControllerEpoch = Long.MIN_VALUE;
+                    return;
+                }
+            }
+
+            SimConfig finalConfig = readConfig();
+            boolean commandStillCurrent = finalConfig.initialized && finalConfig.active &&
+                    finalConfig.generation == cfg.generation &&
+                    finalConfig.handledGeneration == finalConfig.generation &&
+                    "SUCCESS".equals(finalConfig.commandStatus);
+            if (commandStillCurrent && !isLifecycleVerified(cfg.generation, pid, uidHex)) {
                 publishLifecycleFailure(cfg, uidHex,
                         "No verified RF_CONFIG_WRITE after controller READY; lastRecovery=" + lastFailure,
                         NativeOutcome.notInvoked());
@@ -851,6 +882,20 @@ public class NfcInjectionModule extends XposedModule {
             synchronized (this) { recoveryWriteArmed = false; }
             if (!isLifecycleVerified(cfg.generation, pid, uidHex)) finishLifecycleRecovery(cfg.generation);
         }
+    }
+
+    private boolean awaitLateReplayAvailability(long generation, int pid) {
+        long end = System.currentTimeMillis() + LIFECYCLE_FINAL_REPLAY_GRACE_MS;
+        while (System.currentTimeMillis() < end) {
+            if (hasVerifiedReplayForCurrentProcess()) return true;
+            SimConfig latest = readConfig();
+            boolean commandStillCurrent = latest.initialized && latest.active &&
+                    latest.generation == generation && latest.handledGeneration == generation &&
+                    "SUCCESS".equals(latest.commandStatus) && Process.myPid() == pid;
+            if (!commandStillCurrent) return false;
+            sleep(100L);
+        }
+        return hasVerifiedReplayForCurrentProcess();
     }
 
     private boolean waitForLifecycleVerified(long generation, int pid, String uid, long timeoutMs) {

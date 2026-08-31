@@ -12,6 +12,7 @@ public final class RecoveryStateMachine {
         NONE,
         EXACT_REPLAY,
         FALLBACK_TRIGGER,
+        WAIT_FOR_REPLAY,
         MARK_FAILED
     }
 
@@ -48,6 +49,7 @@ public final class RecoveryStateMachine {
         if (state.currentProofVerified) return Action.NONE;
         if (!state.exactReplayAttempted && state.exactReplayAvailable) return Action.EXACT_REPLAY;
         if (state.fallbackAttempts < state.maxFallbackAttempts) return Action.FALLBACK_TRIGGER;
+        if (!state.exactReplayAttempted) return Action.WAIT_FOR_REPLAY;
         return Action.MARK_FAILED;
     }
 }

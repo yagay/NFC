@@ -23,7 +23,13 @@ public class RecoveryStateMachineTest {
                         true, true, false, false, false, 0, 3)));
     }
 
-    @Test public void exhaustedFallbackMarksFailure() {
+    @Test public void exhaustedFallbackWaitsForLateExactReplay() {
+        assertEquals(RecoveryStateMachine.Action.WAIT_FOR_REPLAY,
+                RecoveryStateMachine.next(new RecoveryStateMachine.Snapshot(
+                        true, true, false, false, false, 3, 3)));
+    }
+
+    @Test public void exhaustedFallbackAfterReplayMarksFailure() {
         assertEquals(RecoveryStateMachine.Action.MARK_FAILED,
                 RecoveryStateMachine.next(new RecoveryStateMachine.Snapshot(
                         true, true, false, false, true, 3, 3)));
